@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#pragma once
+#include "gmock/gmock.h"
+#include "ray/common/ray_syncer/ray_syncer.h"
+#include "ray/common/ray_syncer/ray_syncer_bidi_reactor.h"
+#include "ray/common/ray_syncer/ray_syncer_bidi_reactor_base.h"
+
 namespace ray {
 namespace syncer {
 
@@ -43,10 +49,24 @@ class MockReceiverInterface : public ReceiverInterface {
 namespace ray {
 namespace syncer {
 
-class MockNodeSyncConnection : public NodeSyncConnection {
+class MockRaySyncerBidiReactor : public RaySyncerBidiReactor {
  public:
-  using NodeSyncConnection::NodeSyncConnection;
-  MOCK_METHOD(void, DoSend, (), (override));
+  using RaySyncerBidiReactor::RaySyncerBidiReactor;
+
+  MOCK_METHOD(void, DoDisconnect, (), (override));
+
+  MOCK_METHOD(bool,
+              PushToSendingQueue,
+              (std::shared_ptr<const RaySyncMessage>),
+              (override));
+};
+
+template <typename T>
+class MockRaySyncerBidiReactorBase : public RaySyncerBidiReactorBase<T> {
+ public:
+  using RaySyncerBidiReactorBase<T>::RaySyncerBidiReactorBase;
+
+  MOCK_METHOD(void, DoDisconnect, (), (override));
 };
 
 }  // namespace syncer

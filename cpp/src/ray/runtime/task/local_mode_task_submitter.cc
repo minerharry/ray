@@ -34,7 +34,7 @@ ObjectID LocalModeTaskSubmitter::Submit(InvocationSpec &invocation,
                                         const ActorCreationOptions &options) {
   /// TODO(SongGuyang): Make the information of TaskSpecification more reasonable
   /// We just reuse the TaskSpecification class and make the single process mode work.
-  /// Maybe some infomation of TaskSpecification are not reasonable or invalid.
+  /// Maybe some information of TaskSpecification are not reasonable or invalid.
   /// We will enhance this after implement the cluster mode.
   auto functionDescriptor = FunctionDescriptorBuilder::BuildCpp(
       invocation.remote_function_holder.function_name);
@@ -54,16 +54,22 @@ ObjectID LocalModeTaskSubmitter::Submit(InvocationSpec &invocation,
                             rpc::Language::CPP,
                             functionDescriptor,
                             local_mode_ray_tuntime_.GetCurrentJobID(),
+                            rpc::JobConfig(),
                             local_mode_ray_tuntime_.GetCurrentTaskId(),
                             0,
                             local_mode_ray_tuntime_.GetCurrentTaskId(),
                             address,
                             1,
                             /*returns_dynamic=*/false,
+                            /*is_streaming_generator*/ false,
+                            /*generator_backpressure_num_objects*/ -1,
                             required_resources,
                             required_placement_resources,
                             "",
-                            /*depth=*/0);
+                            /*depth=*/0,
+                            local_mode_ray_tuntime_.GetCurrentTaskId(),
+                            // Stacktrace is not available in local mode.
+                            /*call_site=*/"");
   if (invocation.task_type == TaskType::NORMAL_TASK) {
   } else if (invocation.task_type == TaskType::ACTOR_CREATION_TASK) {
     invocation.actor_id = local_mode_ray_tuntime_.GetNextActorID();
@@ -81,17 +87,21 @@ ObjectID LocalModeTaskSubmitter::Submit(InvocationSpec &invocation,
         TaskID::ForActorCreationTask(invocation.actor_id);
     const ObjectID actor_creation_dummy_object_id =
         ObjectID::FromIndex(actor_creation_task_id, 1);
+    // NOTE: Ray CPP doesn't support retries and retry_exceptions.
     builder.SetActorTaskSpec(invocation.actor_id,
                              actor_creation_dummy_object_id,
-                             ObjectID(),
-                             invocation.actor_counter);
+                             /*max_retries=*/0,
+                             /*retry_exceptions=*/false,
+                             /*serialized_retry_exception_allowlist=*/"",
+                             invocation.sequence_number);
   } else {
     throw RayException("unknown task type");
   }
   for (size_t i = 0; i < invocation.args.size(); i++) {
     builder.AddArg(*invocation.args[i]);
   }
-  auto task_specification = builder.Build();
+  auto task_specification = std::move(builder).ConsumeAndBuild();
+
   ObjectID return_object_id = task_specification.ReturnId(0);
 
   std::shared_ptr<msgpack::sbuffer> actor;

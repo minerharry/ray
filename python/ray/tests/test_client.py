@@ -2,14 +2,20 @@ import _thread
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
+from typing import Type
 
 import numpy as np
 import pytest
+from pydantic import BaseModel as BaseModelV2
+from pydantic.v1 import BaseModel as BaseModelV1
 
+import ray
+import ray.cloudpickle as cloudpickle
 import ray.util.client.server.server as ray_client_server
 from ray._private.client_mode_hook import (
     client_mode_should_convert,
@@ -24,6 +30,7 @@ from ray.tests.client_test_utils import (
 from ray.tests.conftest import call_ray_start_context
 from ray.util.client.common import OBJECT_TRANSFER_CHUNK_SIZE, ClientObjectRef
 from ray.util.client.ray_client_helpers import (
+    ray_start_client_server,
     ray_start_client_server_for_address,
 )
 
@@ -57,18 +64,16 @@ def call_ray_start_shared(request):
 
 @pytest.mark.parametrize("connect_to_client", [False, True])
 def test_client_context_manager(call_ray_start_shared, connect_to_client):
-    import ray
-
     if connect_to_client:
         with ray_start_client_server_for_address(
             call_ray_start_shared
         ), enable_client_mode():
             # Client mode is on.
-            assert client_mode_should_convert(auto_init=True)
+            assert client_mode_should_convert()
             # We're connected to Ray client.
             assert ray.util.client.ray.is_connected()
     else:
-        assert not client_mode_should_convert(auto_init=True)
+        assert not client_mode_should_convert()
         assert not ray.util.client.ray.is_connected()
 
 
@@ -107,20 +112,20 @@ def test_client_thread_safe(call_ray_start_shared):
 def test_client_mode_hook_thread_safe(call_ray_start_shared):
     with ray_start_client_server_for_address(call_ray_start_shared):
         with enable_client_mode():
-            assert client_mode_should_convert(auto_init=True)
+            assert client_mode_should_convert()
             lock = threading.Lock()
             lock.acquire()
             q = queue.Queue()
 
             def disable():
                 with disable_client_hook():
-                    q.put(client_mode_should_convert(auto_init=True))
+                    q.put(client_mode_should_convert())
                     lock.acquire()
-                q.put(client_mode_should_convert(auto_init=True))
+                q.put(client_mode_should_convert())
 
             t = threading.Thread(target=disable)
             t.start()
-            assert client_mode_should_convert(auto_init=True)
+            assert client_mode_should_convert()
             lock.release()
             t.join()
             assert q.get() is False, "Threaded disable_client_hook failed  to disable"
@@ -542,6 +547,21 @@ def test_create_remote_before_start(call_ray_start_shared):
         assert ray.get(a.doit.remote()) == "foo"
 
 
+# Regression test for https://github.com/ray-project/ray/pull/51683
+def test_runtime_env_py_executable(ray_start_regular):
+    """Test that Ray Client works with a custom py_executable."""
+
+    with ray_start_client_server(
+        ray_init_kwargs={"runtime_env": {"py_executable": sys.executable + " -q"}}
+    ) as ray:
+
+        @ray.remote
+        def f():
+            return "hi"
+
+        assert ray.get(f.remote()) == "hi"
+
+
 def test_basic_named_actor(call_ray_start_shared):
     """Test that ray.get_actor() can create and return a detached actor."""
     with ray_start_client_server_for_address(call_ray_start_shared) as ray:
@@ -667,8 +687,8 @@ def test_dataclient_server_drop(call_ray_start_shared):
     time.sleep(3)
 
 
-@patch.dict(os.environ, {"RAY_ENABLE_AUTO_CONNECT": "0"})
-def test_client_gpu_ids(call_ray_start_shared):
+@pytest.mark.parametrize("set_enable_auto_connect", [True], indirect=True)
+def test_client_gpu_ids(call_ray_start_shared, set_enable_auto_connect):
     import ray
 
     with enable_client_mode():
@@ -685,10 +705,9 @@ def test_client_gpu_ids(call_ray_start_shared):
             assert ray.get_gpu_ids() == []
 
 
-def test_client_serialize_addon(call_ray_start_shared):
-    import pydantic
-
-    class User(pydantic.BaseModel):
+@pytest.mark.parametrize("BaseModel", [BaseModelV1, BaseModelV2])
+def test_client_serialize_addon(call_ray_start_shared, BaseModel: Type):
+    class User(BaseModel):
         name: str
 
     with ray_start_client_server_for_address(call_ray_start_shared) as ray:
@@ -852,8 +871,97 @@ def test_ignore_reinit(call_ray_start_shared, shutdown_only):
     assert ctx1 == ctx2
 
 
+def test_client_actor_missing_field(call_ray_start_shared):
+    """
+    Tests that trying to access methods that don't exist for an actor
+    raises the correct exception.
+    """
+
+    class SomeSuperClass:
+        def parent_func(self):
+            return 24
+
+    with ray_start_client_server_for_address(call_ray_start_shared) as ray:
+
+        @ray.remote
+        class SomeClass(SomeSuperClass):
+            def child_func(self):
+                return 42
+
+        handle = SomeClass.remote()
+        assert ray.get(handle.parent_func.remote()) == 24
+        assert ray.get(handle.child_func.remote()) == 42
+        with pytest.raises(AttributeError):
+            # We should raise attribute error when accessing a non-existent func
+            _ = SomeClass.nonexistent_func
+
+
+def test_serialize_client_actor_handle(call_ray_start_shared):
+    """
+    Test that client actor handles can be serialized. This is needed since
+    some objects like datasets keep a handle to actors.
+
+    See https://github.com/ray-project/ray/issues/31581 for more context
+    """
+
+    with ray_start_client_server_for_address(call_ray_start_shared) as ray:
+
+        @ray.remote
+        class SomeClass:
+            def __init__(self, value):
+                self.value = value
+
+            def get_value(self):
+                return self.value
+
+        handle = SomeClass.remote(1234)
+        serialized = cloudpickle.dumps(handle)
+        deserialized = cloudpickle.loads(serialized)
+        assert ray.get(deserialized.get_value.remote()) == 1234
+
+
+def test_actor_streaming_returns_error_message(call_ray_start_shared):
+    """
+    num_returns="streaming" is not supported with Ray Client.
+    """
+
+    with ray_start_client_server_for_address(call_ray_start_shared) as ray:
+
+        @ray.remote
+        class Actor:
+            def stream(self):
+                yield "hi"
+
+        a = Actor.remote()
+        with pytest.raises(
+            RuntimeError,
+            match=re.escape(
+                'Streaming actor methods (num_returns="streaming") are '
+                "not currently supported when using Ray Client."
+            ),
+        ):
+            a.stream.options(num_returns="streaming").remote()
+
+
+def test_get_runtime_context_gcs_client(call_ray_start_shared):
+    """
+    Tests get_runtime_context gcs_client
+    """
+    with ray_start_client_server_for_address(call_ray_start_shared) as ray:
+        context = ray.get_runtime_context()
+        assert context.gcs_address, "gcs_address not set"
+
+
+def test_internal_kv_in_proxy_mode(call_ray_start_shared):
+    import ray
+
+    ray.init(SHARED_CLIENT_SERVER_ADDRESS)
+    client_api = ray.util.client.ray
+    client_api._internal_kv_put(b"key", b"val")
+    assert client_api._internal_kv_get(b"key") == b"val"
+    assert client_api._internal_kv_del(b"key") == 1
+    assert client_api._internal_kv_get(b"key") is None
+
+
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

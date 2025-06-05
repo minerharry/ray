@@ -17,6 +17,7 @@
 #include <ray/api/ray_exception.h>
 
 #include "../abstract_ray_runtime.h"
+#include "ray/common/ray_config.h"
 
 namespace ray {
 namespace internal {
@@ -27,7 +28,9 @@ using ray::core::TaskOptions;
 RayFunction BuildRayFunction(InvocationSpec &invocation) {
   if (invocation.remote_function_holder.lang_type == LangType::CPP) {
     auto function_descriptor = FunctionDescriptorBuilder::BuildCpp(
-        invocation.remote_function_holder.function_name);
+        invocation.remote_function_holder.function_name,
+        "",
+        invocation.remote_function_holder.class_name);
     return RayFunction(ray::Language::CPP, function_descriptor);
   } else if (invocation.remote_function_holder.lang_type == LangType::PYTHON) {
     auto function_descriptor = FunctionDescriptorBuilder::BuildPython(
@@ -64,11 +67,30 @@ ObjectID NativeTaskSubmitter::Submit(InvocationSpec &invocation,
   options.name = call_options.name;
   options.resources = call_options.resources;
   options.serialized_runtime_env_info = call_options.serialized_runtime_env_info;
-  std::optional<std::vector<rpc::ObjectReference>> return_refs;
+  options.generator_backpressure_num_objects = -1;
+  std::vector<rpc::ObjectReference> return_refs;
+
+  std::string call_site;
+  if (::RayConfig::instance().record_task_actor_creation_sites()) {
+    std::stringstream ss;
+    ss << ray::StackTrace();
+    call_site = ss.str();
+  }
   if (invocation.task_type == TaskType::ACTOR_TASK) {
-    return_refs = core_worker.SubmitActorTask(
-        invocation.actor_id, BuildRayFunction(invocation), invocation.args, options);
-    if (!return_refs.has_value()) {
+    // NOTE: Ray CPP doesn't support per-method max_retries and retry_exceptions
+    const auto native_actor_handle = core_worker.GetActorHandle(invocation.actor_id);
+    int max_retries = native_actor_handle->MaxTaskRetries();
+
+    auto status = core_worker.SubmitActorTask(invocation.actor_id,
+                                              BuildRayFunction(invocation),
+                                              invocation.args,
+                                              options,
+                                              max_retries,
+                                              /*retry_exceptions=*/false,
+                                              /*serialized_retry_exception_allowlist=*/"",
+                                              call_site,
+                                              return_refs);
+    if (!status.ok()) {
       return ObjectID::Nil();
     }
   } else {
@@ -90,13 +112,11 @@ ObjectID NativeTaskSubmitter::Submit(InvocationSpec &invocation,
                                          1,
                                          false,
                                          scheduling_strategy,
-                                         "");
+                                         "",
+                                         /*serialized_retry_exception_allowlist=*/"",
+                                         call_site);
   }
-  std::vector<ObjectID> return_ids;
-  for (const auto &ref : return_refs.value()) {
-    return_ids.push_back(ObjectID::FromBinary(ref.object_id()));
-  }
-  return return_ids[0];
+  return ObjectID::FromBinary(return_refs[0].object_id());
 }
 
 ObjectID NativeTaskSubmitter::SubmitTask(InvocationSpec &invocation,
@@ -121,6 +141,12 @@ ActorID NativeTaskSubmitter::CreateActor(InvocationSpec &invocation,
         bundle_id.second);
     placement_group_scheduling_strategy->set_placement_group_capture_child_tasks(false);
   }
+  std::string call_site;
+  if (::RayConfig::instance().record_task_actor_creation_sites()) {
+    std::stringstream ss;
+    ss << ray::StackTrace();
+    call_site = ss.str();
+  }
   ray::core::ActorCreationOptions actor_options{
       create_options.max_restarts,
       /*max_task_retries=*/0,
@@ -135,8 +161,12 @@ ActorID NativeTaskSubmitter::CreateActor(InvocationSpec &invocation,
       scheduling_strategy,
       create_options.serialized_runtime_env_info};
   ActorID actor_id;
-  auto status = core_worker.CreateActor(
-      BuildRayFunction(invocation), invocation.args, actor_options, "", &actor_id);
+  auto status = core_worker.CreateActor(BuildRayFunction(invocation),
+                                        invocation.args,
+                                        actor_options,
+                                        /*extension_data=*/"",
+                                        call_site,
+                                        &actor_id);
   if (!status.ok()) {
     throw RayException("Create actor error");
   }

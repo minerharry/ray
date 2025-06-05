@@ -16,6 +16,7 @@
 
 #include <map>
 #include <utility>
+#include <vector>
 
 #include "absl/container/btree_map.h"
 #include "absl/types/optional.h"
@@ -46,6 +47,10 @@ class OutofOrderActorSubmitQueue : public IActorSubmitQueue {
   void MarkDependencyFailed(uint64_t position) override;
   /// Make a task's dependency is resolved thus ready to send.
   void MarkDependencyResolved(uint64_t position) override;
+  // Mark a task has been canceled.
+  // If a task hasn't been sent yet, this API will guarantee a task won't be
+  // popped via PopNextTaskToSend.
+  void MarkTaskCanceled(uint64_t position) override;
   /// Clear the queue and returns all tasks ids that haven't been sent yet.
   std::vector<TaskID> ClearAllTasks() override;
   /// Find next task to send.
@@ -53,17 +58,8 @@ class OutofOrderActorSubmitQueue : public IActorSubmitQueue {
   ///   - nullopt if no task ready to send
   ///   - a pair of task and bool represents the task to be send and if the receiver
   ///     should SKIP THE SCHEDULING QUEUE while executing it.
-  absl::optional<std::pair<TaskSpecification, bool>> PopNextTaskToSend() override;
-  /// On client connect/reconnect, find all the TASK that's known to be
-  /// executed out of order. This ALWAYS RETURNS empty.
-  std::map<uint64_t, TaskSpecification> PopAllOutOfOrderCompletedTasks() override;
-  /// On client connected, noop.
-  void OnClientConnected() override;
-  /// Get the sequence number of the task to send.
-  /// This is ignored by the receivier but only for debugging purpose.
-  uint64_t GetSequenceNumber(const TaskSpecification &task_spec) const override;
-  /// Mark a task has been executed on the receiver side.
-  void MarkTaskCompleted(uint64_t position, const TaskSpecification &task_spec) override;
+  std::optional<std::pair<TaskSpecification, bool>> PopNextTaskToSend() override;
+  bool Empty() override;
 
  private:
   ActorID kActorId;

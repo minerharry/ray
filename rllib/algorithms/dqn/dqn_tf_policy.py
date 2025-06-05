@@ -1,13 +1,10 @@
-"""TensorFlow policy class used for DQN"""
-
 from typing import Dict
 
-import gym
+import gymnasium as gym
 import numpy as np
 
 import ray
 from ray.rllib.algorithms.dqn.distributional_q_tf_model import DistributionalQTFModel
-from ray.rllib.algorithms.simple_q.utils import Q_SCOPE, Q_TARGET_SCOPE
 from ray.rllib.evaluation.postprocessing import adjust_nstep
 from ray.rllib.models import ModelCatalog
 from ray.rllib.models.modelv2 import ModelV2
@@ -16,6 +13,7 @@ from ray.rllib.policy.policy import Policy
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy.tf_mixins import LearningRateSchedule, TargetNetworkMixin
 from ray.rllib.policy.tf_policy_template import build_tf_policy
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.error import UnsupportedSpaceException
 from ray.rllib.utils.exploration import ParameterNoise
 from ray.rllib.utils.framework import try_import_tf
@@ -33,8 +31,11 @@ tf1, tf, tfv = try_import_tf()
 
 # Importance sampling weights for prioritized replay
 PRIO_WEIGHTS = "weights"
+Q_SCOPE = "q_func"
+Q_TARGET_SCOPE = "target_q_func"
 
 
+@OldAPIStack
 class QLoss:
     def __init__(
         self,
@@ -115,6 +116,7 @@ class QLoss:
             }
 
 
+@OldAPIStack
 class ComputeTDErrorMixin:
     """Assign the `compute_td_error` method to the DQNTFPolicy
 
@@ -124,7 +126,7 @@ class ComputeTDErrorMixin:
     def __init__(self):
         @make_tf_callable(self.get_session(), dynamic_shape=True)
         def compute_td_error(
-            obs_t, act_t, rew_t, obs_tp1, done_mask, importance_weights
+            obs_t, act_t, rew_t, obs_tp1, terminateds_mask, importance_weights
         ):
             # Do forward pass on loss to update td error attribute
             build_q_losses(
@@ -136,7 +138,7 @@ class ComputeTDErrorMixin:
                     SampleBatch.ACTIONS: tf.convert_to_tensor(act_t),
                     SampleBatch.REWARDS: tf.convert_to_tensor(rew_t),
                     SampleBatch.NEXT_OBS: tf.convert_to_tensor(obs_tp1),
-                    SampleBatch.DONES: tf.convert_to_tensor(done_mask),
+                    SampleBatch.TERMINATEDS: tf.convert_to_tensor(terminateds_mask),
                     PRIO_WEIGHTS: tf.convert_to_tensor(importance_weights),
                 },
             )
@@ -146,6 +148,7 @@ class ComputeTDErrorMixin:
         self.compute_td_error = compute_td_error
 
 
+@OldAPIStack
 def build_q_model(
     policy: Policy,
     obs_space: gym.spaces.Space,
@@ -222,6 +225,7 @@ def build_q_model(
     return q_model
 
 
+@OldAPIStack
 def get_distribution_inputs_and_class(
     policy: Policy, model: ModelV2, input_dict: SampleBatch, *, explore=True, **kwargs
 ):
@@ -243,6 +247,7 @@ def get_distribution_inputs_and_class(
     )  # state-out
 
 
+@OldAPIStack
 def build_q_losses(policy: Policy, model, _, train_batch: SampleBatch) -> TensorType:
     """Constructs the loss for DQNTFPolicy.
 
@@ -324,7 +329,7 @@ def build_q_losses(policy: Policy, model, _, train_batch: SampleBatch) -> Tensor
         q_dist_tp1_best,
         train_batch[PRIO_WEIGHTS],
         tf.cast(train_batch[SampleBatch.REWARDS], tf.float32),
-        tf.cast(train_batch[SampleBatch.DONES], tf.float32),
+        tf.cast(train_batch[SampleBatch.TERMINATEDS], tf.float32),
         config["gamma"],
         config["n_step"],
         config["num_atoms"],
@@ -336,6 +341,7 @@ def build_q_losses(policy: Policy, model, _, train_batch: SampleBatch) -> Tensor
     return policy.q_loss.loss
 
 
+@OldAPIStack
 def adam_optimizer(
     policy: Policy, config: AlgorithmConfigDict
 ) -> "tf.keras.optimizers.Optimizer":
@@ -349,6 +355,7 @@ def adam_optimizer(
         )
 
 
+@OldAPIStack
 def clip_gradients(
     policy: Policy, optimizer: "tf.keras.optimizers.Optimizer", loss: TensorType
 ) -> ModelGradients:
@@ -363,6 +370,7 @@ def clip_gradients(
     )
 
 
+@OldAPIStack
 def build_q_stats(policy: Policy, batch) -> Dict[str, TensorType]:
     return dict(
         {
@@ -372,11 +380,13 @@ def build_q_stats(policy: Policy, batch) -> Dict[str, TensorType]:
     )
 
 
+@OldAPIStack
 def setup_mid_mixins(policy: Policy, obs_space, action_space, config) -> None:
     LearningRateSchedule.__init__(policy, config["lr"], config["lr_schedule"])
     ComputeTDErrorMixin.__init__(policy)
 
 
+@OldAPIStack
 def setup_late_mixins(
     policy: Policy,
     obs_space: gym.spaces.Space,
@@ -386,6 +396,7 @@ def setup_late_mixins(
     TargetNetworkMixin.__init__(policy)
 
 
+@OldAPIStack
 def compute_q_values(
     policy: Policy,
     model: ModelV2,
@@ -440,6 +451,7 @@ def compute_q_values(
     return value, logits, dist, state
 
 
+@OldAPIStack
 def postprocess_nstep_and_prio(
     policy: Policy, batch: SampleBatch, other_agent=None, episode=None
 ) -> SampleBatch:
@@ -461,7 +473,7 @@ def postprocess_nstep_and_prio(
             batch[SampleBatch.ACTIONS],
             batch[SampleBatch.REWARDS],
             batch[SampleBatch.NEXT_OBS],
-            batch[SampleBatch.DONES],
+            batch[SampleBatch.TERMINATEDS],
             batch[PRIO_WEIGHTS],
         )
         # Retain compatibility with old-style Replay args
@@ -479,7 +491,7 @@ def postprocess_nstep_and_prio(
 
 DQNTFPolicy = build_tf_policy(
     name="DQNTFPolicy",
-    get_default_config=lambda: ray.rllib.algorithms.dqn.dqn.DEFAULT_CONFIG,
+    get_default_config=lambda: ray.rllib.algorithms.dqn.dqn.DQNConfig(),
     make_model=build_q_model,
     action_distribution_fn=get_distribution_inputs_and_class,
     loss_fn=build_q_losses,

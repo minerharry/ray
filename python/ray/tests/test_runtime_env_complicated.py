@@ -1,13 +1,15 @@
 import os
-from pathlib import Path
-import pytest
+import platform
 import subprocess
 import sys
 import tempfile
 import time
+import yaml
+from pathlib import Path
 from typing import List
 from unittest import mock
-import yaml
+
+import pytest
 
 import ray
 from ray.runtime_env import RuntimeEnv
@@ -18,7 +20,11 @@ from ray._private.runtime_env.conda import (
     _current_py_version,
 )
 
-from ray._private.runtime_env.conda_utils import get_conda_env_list
+from ray._private.runtime_env.conda_utils import (
+    get_conda_env_list,
+    get_conda_info_json,
+    get_conda_envs,
+)
 from ray._private.test_utils import (
     run_string_as_driver,
     run_string_as_driver_nonblocking,
@@ -36,14 +42,14 @@ if not os.environ.get("CI"):
     # packages and fall back all the dependencies to current python's site.
     os.environ["RAY_RUNTIME_ENV_LOCAL_DEV_MODE"] = "1"
 
-REQUEST_VERSIONS = ["2.2.0", "2.3.0"]
+EMOJI_VERSIONS = ["2.1.0", "2.2.0"]
 
 _WIN32 = os.name == "nt"
 
 
 @pytest.fixture(scope="session")
 def conda_envs(tmp_path_factory):
-    """Creates two conda env with different requests versions."""
+    """Creates two conda env with different `emoji` package versions."""
     conda_path = get_conda_bin_executable("conda")
     init_cmd = f". {os.path.dirname(conda_path)}" f"/../etc/profile.d/conda.sh"
 
@@ -72,7 +78,7 @@ def conda_envs(tmp_path_factory):
 
         _inject_ray_to_conda_site(get_conda_env_dir(env_name))
         ray_deps: List[str] = _resolve_install_from_source_ray_dependencies()
-        ray_deps.append(f"requests=={package_version}")
+        ray_deps.append(f"emoji=={package_version}")
 
         reqs = tmp_path_factory.mktemp("reqs") / "requirements.txt"
         with reqs.open("wt") as fid:
@@ -105,30 +111,30 @@ def conda_envs(tmp_path_factory):
             print(proc.stderr.decode())
             assert False
 
-    for package_version in REQUEST_VERSIONS:
+    for package_version in EMOJI_VERSIONS:
         create_package_env(
             env_name=f"package-{package_version}", package_version=package_version
         )
 
     yield
 
-    for package_version in REQUEST_VERSIONS:
+    for package_version in EMOJI_VERSIONS:
         delete_env(env_name=f"package-{package_version}")
 
 
 @ray.remote
-def get_requests_version():
-    import requests  # noqa: E811
+def get_emoji_version():
+    import emoji  # noqa: E811
 
-    return requests.__version__
+    return emoji.__version__
 
 
 @ray.remote
 class VersionActor:
-    def get_requests_version(self):
-        import requests  # noqa: E811
+    def get_emoji_version(self):
+        import emoji  # noqa: E811
 
-        return requests.__version__
+        return emoji.__version__
 
 
 check_remote_client_conda = """
@@ -138,8 +144,8 @@ context = (ray.client("localhost:24001")
               .connect())
 @ray.remote
 def get_package_version():
-    import requests
-    return requests.__version__
+    import emoji
+    return emoji.__version__
 
 assert ray.get(get_package_version.remote()) == "{package_version}"
 context.disconnect()
@@ -160,18 +166,16 @@ context.disconnect()
     indirect=True,
 )
 def test_client_tasks_and_actors_inherit_from_driver(conda_envs, call_ray_start):
-    for i, package_version in enumerate(REQUEST_VERSIONS):
+    for i, package_version in enumerate(EMOJI_VERSIONS):
         runtime_env = {"conda": f"package-{package_version}"}
         with ray.client("localhost:24001").env(runtime_env).connect():
-            assert ray.get(get_requests_version.remote()) == package_version
+            assert ray.get(get_emoji_version.remote()) == package_version
             actor_handle = VersionActor.remote()
-            assert (
-                ray.get(actor_handle.get_requests_version.remote()) == package_version
-            )
+            assert ray.get(actor_handle.get_emoji_version.remote()) == package_version
 
             # Ensure that we can have a second client connect using the other
             # conda environment.
-            other_package_version = REQUEST_VERSIONS[(i + 1) % 2]
+            other_package_version = EMOJI_VERSIONS[(i + 1) % 2]
             run_string_as_driver(
                 check_remote_client_conda.format(package_version=other_package_version)
             )
@@ -185,26 +189,26 @@ def test_task_actor_conda_env(conda_envs, shutdown_only):
     ray.init()
 
     # Basic conda runtime env
-    for package_version in REQUEST_VERSIONS:
+    for package_version in EMOJI_VERSIONS:
         runtime_env = {"conda": f"package-{package_version}"}
 
-        task = get_requests_version.options(runtime_env=runtime_env)
+        task = get_emoji_version.options(runtime_env=runtime_env)
         assert ray.get(task.remote()) == package_version
 
         actor = VersionActor.options(runtime_env=runtime_env).remote()
-        assert ray.get(actor.get_requests_version.remote()) == package_version
+        assert ray.get(actor.get_emoji_version.remote()) == package_version
 
     # Runtime env should inherit to nested task
     @ray.remote
     def wrapped_version():
-        return ray.get(get_requests_version.remote())
+        return ray.get(get_emoji_version.remote())
 
     @ray.remote
     class Wrapper:
         def wrapped_version(self):
-            return ray.get(get_requests_version.remote())
+            return ray.get(get_emoji_version.remote())
 
-    for package_version in REQUEST_VERSIONS:
+    for package_version in EMOJI_VERSIONS:
         runtime_env = {"conda": f"package-{package_version}"}
 
         task = wrapped_version.options(runtime_env=runtime_env)
@@ -218,11 +222,115 @@ def test_task_actor_conda_env(conda_envs, shutdown_only):
     os.environ.get("CONDA_DEFAULT_ENV") is None,
     reason="must be run from within a conda environment",
 )
+def test_base_full_path(conda_envs, shutdown_only):
+    """
+    Test that `base` and its absolute path prefix can both work.
+    """
+    ray.init()
+
+    conda_info = get_conda_info_json()
+    prefix = conda_info["conda_prefix"]
+
+    test_conda_envs = ["base", prefix]
+
+    @ray.remote
+    def get_conda_env_name():
+        return os.environ.get("CONDA_DEFAULT_ENV")
+
+    # Basic conda runtime env
+    for conda_env in test_conda_envs:
+        runtime_env = {"conda": conda_env}
+
+        task = get_conda_env_name.options(runtime_env=runtime_env)
+        assert ray.get(task.remote()) == "base"
+
+
+@pytest.mark.skipif(
+    os.environ.get("CONDA_DEFAULT_ENV") is None,
+    reason="must be run from within a conda environment",
+)
+def test_task_actor_conda_env_full_path(conda_envs, shutdown_only):
+    ray.init()
+
+    conda_info = get_conda_info_json()
+    prefix = conda_info["conda_prefix"]
+
+    test_conda_envs = {
+        package_version: f"{prefix}/envs/package-{package_version}"
+        for package_version in EMOJI_VERSIONS
+    }
+
+    # Basic conda runtime env
+    for package_version, conda_full_path in test_conda_envs.items():
+        runtime_env = {"conda": conda_full_path}
+        print(f"Testing {package_version}, runtime env: {runtime_env}")
+
+        task = get_emoji_version.options(runtime_env=runtime_env)
+        assert ray.get(task.remote()) == package_version
+
+        actor = VersionActor.options(runtime_env=runtime_env).remote()
+        assert ray.get(actor.get_emoji_version.remote()) == package_version
+
+    # Runtime env should inherit to nested task
+    @ray.remote
+    def wrapped_version():
+        return ray.get(get_emoji_version.remote())
+
+    @ray.remote
+    class Wrapper:
+        def wrapped_version(self):
+            return ray.get(get_emoji_version.remote())
+
+    for package_version, conda_full_path in test_conda_envs.items():
+        runtime_env = {"conda": conda_full_path}
+
+        task = wrapped_version.options(runtime_env=runtime_env)
+        assert ray.get(task.remote()) == package_version
+
+        actor = Wrapper.options(runtime_env=runtime_env).remote()
+        assert ray.get(actor.wrapped_version.remote()) == package_version
+
+
+@pytest.mark.skipif(
+    os.environ.get("CONDA_DEFAULT_ENV") is None,
+    reason="must be run from within a conda environment",
+)
+def test_task_conda_env_validation_cached(conda_envs, shutdown_only):
+    """Verify that when a task is running with the same conda env
+    it doesn't validate if env exists.
+    """
+    # The first run would be slower because we need to validate
+    # if the package exists.
+    ray.init()
+    version = EMOJI_VERSIONS[0]
+    runtime_env = {"conda": f"package-{version}"}
+    task = get_emoji_version.options(runtime_env=runtime_env)
+    s = time.time()
+    ray.get(task.remote())
+    first_run = time.time() - s
+    # Typically takes 1~2 seconds.
+    print("First run took", first_run)
+
+    # We should verify this doesn't happen
+    # from the second run.
+    s = time.time()
+    for _ in range(10):
+        ray.get(task.remote())
+    second_10_runs = time.time() - s
+    # Typicall takes less than 100ms.
+    print("second 10 runs took", second_10_runs)
+    assert second_10_runs < first_run
+
+
+@pytest.mark.skipif(
+    os.environ.get("CONDA_DEFAULT_ENV") is None,
+    reason="must be run from within a conda environment",
+)
 def test_job_config_conda_env(conda_envs, shutdown_only):
-    for package_version in REQUEST_VERSIONS:
+    for package_version in EMOJI_VERSIONS:
         runtime_env = {"conda": f"package-{package_version}"}
         ray.init(runtime_env=runtime_env)
-        assert ray.get(get_requests_version.remote()) == package_version
+        assert ray.get(get_emoji_version.remote()) == package_version
         ray.shutdown()
 
 
@@ -297,6 +405,22 @@ def test_get_conda_env_dir(tmp_path):
         # Env tf2 still should exist.
         env_dir = get_conda_env_dir("tf2")
         assert env_dir == str(tmp_path / "envs" / "tf2")
+
+
+@pytest.mark.skipif(
+    os.environ.get("CONDA_DEFAULT_ENV") is None,
+    reason="must be run from within a conda environment",
+)
+def test_get_conda_envs(conda_envs):
+    """
+    Tests that we can at least find 3 conda envs: base, and two envs we created.
+    """
+    conda_info = get_conda_info_json()
+    envs = get_conda_envs(conda_info)
+    prefix = conda_info["conda_prefix"]
+    assert ("base", prefix) in envs
+    assert ("package-2.1.0", prefix + "/envs/package-2.1.0") in envs
+    assert ("package-2.2.0", prefix + "/envs/package-2.2.0") in envs
 
 
 @pytest.mark.skipif(
@@ -464,10 +588,10 @@ def test_pip_task(shutdown_only, pip_as_str, tmp_path):
     reason="This test is only run on linux CI machines.",
 )
 @pytest.mark.parametrize("option", ["conda", "pip"])
-def test_conda_pip_extras_ray_serve(shutdown_only, option):
+def test_conda_pip_extras_ray_default(shutdown_only, option):
     """Tests that ray[extras] can be included as a conda/pip dependency."""
     ray.init()
-    pip = ["pip-install-test==0.5", "ray[serve]"]
+    pip = ["pip-install-test==0.5", "ray[default]"]
     if option == "conda":
         runtime_env = {"conda": {"dependencies": ["pip", {"pip": pip}]}}
     elif option == "pip":
@@ -522,52 +646,6 @@ def test_pip_job_config(shutdown_only, pip_as_str, tmp_path):
         # Ensure pip-install-test is not installed on the test machine
         import pip_install_test  # noqa
     assert ray.get(f.remote())
-
-
-@pytest.mark.skipif(
-    os.environ.get("CI") and sys.platform == "win32",
-    reason="dirname(__file__) returns an invalid path",
-)
-def test_experimental_package(shutdown_only):
-    ray.init(num_cpus=2)
-    pkg = ray.experimental.load_package(
-        os.path.join(
-            os.path.dirname(__file__),
-            "../experimental/packaging/example_pkg/ray_pkg.yaml",
-        )
-    )
-    a = pkg.MyActor.remote()
-    assert ray.get(a.f.remote()) == "hello world"
-    assert ray.get(pkg.my_func.remote()) == "hello world"
-
-
-@pytest.mark.skipif(
-    os.environ.get("CI") and sys.platform == "win32",
-    reason="dirname(__file__) returns an invalid path",
-)
-def test_experimental_package_lazy(shutdown_only):
-    pkg = ray.experimental.load_package(
-        os.path.join(
-            os.path.dirname(__file__),
-            "../experimental/packaging/example_pkg/ray_pkg.yaml",
-        )
-    )
-    ray.init(num_cpus=2)
-    a = pkg.MyActor.remote()
-    assert ray.get(a.f.remote()) == "hello world"
-    assert ray.get(pkg.my_func.remote()) == "hello world"
-
-
-@pytest.mark.skipif(_WIN32, reason="requires tar cli command")
-def test_experimental_package_github(shutdown_only):
-    ray.init(num_cpus=2)
-    pkg = ray.experimental.load_package(
-        "http://raw.githubusercontent.com/ray-project/ray/master/"
-        "python/ray/experimental/packaging/example_pkg/ray_pkg.yaml"
-    )
-    a = pkg.MyActor.remote()
-    assert ray.get(a.f.remote()) == "hello world"
-    assert ray.get(pkg.my_func.remote()) == "hello world"
 
 
 @pytest.mark.skipif(_WIN32, reason="Fails on windows")
@@ -752,23 +830,23 @@ def test_simultaneous_install(shutdown_only):
             self.key = key
 
         def get(self):
-            import requests
+            import emoji
 
-            return (self.key, requests.__version__)
+            return (self.key, emoji.__version__)
 
     # Before we used a global lock on conda installs, these two envs would be
     # installed concurrently, leading to errors:
     # https://github.com/ray-project/ray/issues/17086
     # Now we use a global lock, so the envs are installed sequentially.
     worker_1 = VersionWorker.options(
-        runtime_env={"pip": {"packages": ["requests==2.2.0"], "pip_check": False}}
+        runtime_env={"pip": {"packages": ["emoji==2.1.0"], "pip_check": False}}
     ).remote(key=1)
     worker_2 = VersionWorker.options(
-        runtime_env={"pip": {"packages": ["requests==2.3.0"], "pip_check": False}}
+        runtime_env={"pip": {"packages": ["emoji==2.2.0"], "pip_check": False}}
     ).remote(key=2)
 
-    assert ray.get(worker_1.get.remote()) == (1, "2.2.0")
-    assert ray.get(worker_2.get.remote()) == (2, "2.3.0")
+    assert ray.get(worker_1.get.remote()) == (1, "2.1.0")
+    assert ray.get(worker_2.get.remote()) == (2, "2.2.0")
 
 
 CLIENT_SERVER_PORT = 24001
@@ -778,6 +856,12 @@ CLIENT_SERVER_PORT = 24001
 @pytest.mark.skipif(
     os.environ.get("CI") and sys.platform != "linux",
     reason="This test is only run on linux CI machines.",
+)
+# Skip on Linux ARM64 as the test times out. This is probably because some
+# dependencies may not be available for arm64 and must be compiled from source.
+@pytest.mark.skipif(
+    sys.platform == "linux" and platform.processor() == "aarch64",
+    reason="This test is currently not supported on Linux ARM64",
 )
 @pytest.mark.parametrize(
     "call_ray_start",
@@ -789,9 +873,8 @@ def test_e2e_complex(call_ray_start, tmp_path):
 
     1.  Run a Ray Client job with both working_dir and pip specified. Check the
         environment using imports and file reads in tasks and actors.
-    2.  On the same cluster, run a job as above but using the Ray Summit
-        2021 demo's pip requirements.txt.  Also, check that per-task and
-        per-actor pip requirements work, all using the job's working_dir.
+    2.  On the same cluster, run another job with a requirements.txt file and
+        overriding per-actor and per-task pip requirements.
     """
     # Create a file to use to test working_dir
     specific_path = tmp_path / "test"
@@ -829,23 +912,22 @@ def test_e2e_complex(call_ray_start, tmp_path):
         a = TestActor.remote()
         assert ray.get(a.test.remote()) == "Hello"
 
-    # pip requirements file from Ray Summit 2021 demo.
+    pandas_version = "1.5.3"
+    if sys.version_info.major >= 3 and sys.version_info.minor >= 11:
+        pandas_version = "2.2.3"
     requirement_path = tmp_path / "requirements.txt"
     requirement_path.write_text(
         "\n".join(
             [
-                "ray[serve, tune]",
-                "texthero",
                 "PyGithub",
-                "xgboost_ray",  # has Ray as a dependency
-                "pandas==1.1",  # pandas 1.2.4 in the demo, but not supported on py36
+                f"pandas=={pandas_version}",
                 "typer",
                 "aiofiles",
             ]
         )
     )
 
-    # Start a new job on the same cluster using the Summit 2021 requirements.
+    # Start a new job on the same cluster using the requirements file.
     with ray.client(f"localhost:{CLIENT_SERVER_PORT}").env(
         {"working_dir": str(tmp_path), "pip": str(requirement_path)}
     ).connect():
@@ -860,10 +942,7 @@ def test_e2e_complex(call_ray_start, tmp_path):
         @ray.remote
         def test_import():
             import ray  # noqa
-            from ray import serve  # noqa
-            from ray import tune  # noqa
             import typer  # noqa
-            import xgboost_ray  # noqa
 
             return Path("./test").read_text()
 
@@ -874,10 +953,7 @@ def test_e2e_complex(call_ray_start, tmp_path):
         class TestActor:
             def test(self):
                 import ray  # noqa
-                from ray import serve  # noqa
-                from ray import tune  # noqa
                 import typer  # noqa
-                import xgboost_ray  # noqa
 
                 return Path("./test").read_text()
 
@@ -980,13 +1056,22 @@ def test_runtime_env_override(call_ray_start):
     reason="This test is only run on linux CI machines.",
 )
 def test_pip_with_env_vars(start_cluster, tmp_path):
-
+    """
+    The file structure:
+        $tmp_path/
+        │
+        ├── setup.py
+        ├── dist/ # the tar.gz file will be generated here
+        └── test_package/
+            └── test.py
+    """
     with chdir(tmp_path):
         TEST_ENV_NAME = "TEST_ENV_VARS"
         TEST_ENV_VALUE = "TEST"
         package_name = "test_package"
-        package_dir = os.path.join(tmp_path, package_name)
-        try_to_create_directory(package_dir)
+        package_version = "0.0.1"
+        package_dir = tmp_path
+        try_to_create_directory(os.path.join(package_dir, package_name))
 
         setup_filename = os.path.join(package_dir, "setup.py")
         setup_code = """import os
@@ -997,28 +1082,37 @@ class InstallTestPackage(install):
     # this function will be called when pip install this package
     def run(self):
         assert os.environ.get('{TEST_ENV_NAME}') == '{TEST_ENV_VALUE}'
+        super().run()
 
 setup(
-    name='test_package',
-    version='0.0.1',
+    name='{package_name}',
+    version='{package_version}',
     packages=find_packages(),
     cmdclass=dict(install=InstallTestPackage),
     license="MIT",
     zip_safe=False,
 )
 """.format(
-            TEST_ENV_NAME=TEST_ENV_NAME, TEST_ENV_VALUE=TEST_ENV_VALUE
+            TEST_ENV_NAME=TEST_ENV_NAME,
+            TEST_ENV_VALUE=TEST_ENV_VALUE,
+            package_name=package_name,
+            package_version=package_version,
         )
-        with open(setup_filename, "wt") as f:
+
+        with open(setup_filename, "w+") as f:
             f.writelines(setup_code)
 
-        python_filename = os.path.join(package_dir, "test.py")
+        python_filename = os.path.join(package_dir, package_name, "test.py")
         python_code = "import os; print(os.environ)"
-        with open(python_filename, "wt") as f:
+        with open(python_filename, "w+") as f:
             f.writelines(python_code)
 
-        gz_filename = os.path.join(tmp_path, package_name + ".tar.gz")
-        subprocess.check_call(["tar", "-zcvf", gz_filename, package_name])
+        gz_filename = os.path.join(
+            tmp_path,
+            "dist",
+            "{name}-{ver}.tar.gz".format(name=package_name, ver=package_version),
+        )
+        subprocess.check_call(["python", "setup.py", "sdist"])
 
         with pytest.raises(ray.exceptions.RuntimeEnvSetupError):
 
@@ -1046,9 +1140,4 @@ setup(
 
 
 if __name__ == "__main__":
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

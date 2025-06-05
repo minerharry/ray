@@ -6,17 +6,17 @@ import tree  # dm_tree
 from ray.rllib.connectors.connector import (
     AgentConnector,
     ConnectorContext,
-    register_connector,
 )
+from ray.rllib.connectors.registry import register_connector
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils.typing import (
     AgentConnectorDataType,
     AgentConnectorsOutput,
 )
-from ray.util.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 def register_lambda_agent_connector(
     name: str, fn: Callable[[Any], Any]
 ) -> Type[AgentConnector]:
@@ -54,7 +54,7 @@ def register_lambda_agent_connector(
     return LambdaAgentConnector
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 def flatten_data(data: AgentConnectorsOutput):
     assert isinstance(
         data, AgentConnectorsOutput
@@ -81,6 +81,6 @@ def flatten_data(data: AgentConnectorsOutput):
 
 # Agent connector to build and return a flattened observation SampleBatch
 # in addition to the original input dict.
-FlattenDataAgentConnector = PublicAPI(stability="alpha")(
+FlattenDataAgentConnector = OldAPIStack(
     register_lambda_agent_connector("FlattenDataAgentConnector", flatten_data)
 )

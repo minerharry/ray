@@ -1,5 +1,3 @@
-import json
-import os
 import re
 import time
 import subprocess
@@ -10,6 +8,7 @@ import requests
 import ray
 from ray import serve
 from ray.cluster_utils import Cluster
+from ray._private.test_utils import safe_write_to_results_json
 
 # Global variables / constants appear only right after imports.
 # Ray serve deployment setup constants
@@ -17,8 +16,6 @@ NUM_REPLICAS = 7
 MAX_BATCH_SIZE = 16
 
 # Cluster setup constants
-NUM_REDIS_SHARDS = 1
-REDIS_MAX_MEMORY = 10**8
 OBJECT_STORE_MEMORY = 10**8
 NUM_NODES = 4
 
@@ -36,24 +33,18 @@ def update_progress(result):
     anyscale product runs in each releaser test
     """
     result["last_update"] = time.time()
-    test_output_json = os.environ.get(
-        "TEST_OUTPUT_JSON", "/tmp/release_test_output.json"
-    )
-    with open(test_output_json, "wt") as f:
-        json.dump(result, f)
+    safe_write_to_results_json(result)
 
 
 cluster = Cluster()
 for i in range(NUM_NODES):
     cluster.add_node(
         redis_port=6379 if i == 0 else None,
-        num_redis_shards=NUM_REDIS_SHARDS if i == 0 else None,
         dashboard_agent_listen_port=(52365 + i),
         num_cpus=8,
         num_gpus=0,
         resources={str(i): 2},
         object_store_memory=OBJECT_STORE_MEMORY,
-        redis_max_memory=REDIS_MAX_MEMORY,
         dashboard_host="0.0.0.0",
     )
 
@@ -72,7 +63,7 @@ class Echo:
         return await self.handle_batch(request)
 
 
-Echo.deploy()
+serve.run(Echo.bind(), route_prefix="/echo")
 
 print("Warming up")
 for _ in range(5):

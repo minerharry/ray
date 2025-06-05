@@ -14,9 +14,11 @@
 
 #include "ray/stats/metric_defs.h"
 
-namespace ray {
+#include "ray/util/size_literals.h"
 
-namespace stats {
+using namespace ray::literals;
+
+namespace ray::stats {
 
 /// The definitions of metrics that you can use everywhere.
 ///
@@ -31,6 +33,10 @@ namespace stats {
 /// NOTE: When adding a new metric, add the metric name to the _METRICS list in
 /// python/ray/tests/test_metrics_agent.py to ensure that its existence is tested.
 
+/// ===============================================================================
+/// =========== PUBLIC METRICS; keep in sync with ray-metrics.rst =================
+/// ===============================================================================
+
 /// Tracks tasks by state, including pending, running, and finished tasks.
 /// This metric may be recorded from multiple components processing the task in Ray,
 /// including the submitting core worker, executor core worker, and pull manager.
@@ -43,7 +49,8 @@ DEFINE_stats(
     // State: the task state, as described by rpc::TaskState proto in common.proto.
     // Name: the name of the function called.
     // Source: component reporting, e.g., "core_worker", "executor", or "pull_manager".
-    ("State", "Name", "Source"),
+    // IsRetry: whether this task is a retry.
+    ("State", "Name", "Source", "IsRetry", "JobId"),
     (),
     ray::stats::GAUGE);
 
@@ -54,10 +61,97 @@ DEFINE_stats(
 DEFINE_stats(actors,
              "Current number of actors currently in a particular state.",
              // State: the actor state, which is from rpc::ActorTableData::ActorState,
-             // but can also be RUNNING_TASK, RUNNING_IN_RAY_GET, and RUNNING_IN_RAY_WAIT.
+             // For ALIVE actor the sub-state can be IDLE, RUNNING_TASK,
+             // RUNNING_IN_RAY_GET, and RUNNING_IN_RAY_WAIT.
              // Name: the name of actor class.
              // Source: component reporting, e.g., "gcs" or "executor".
-             ("State", "Name", "Source"),
+             ("State", "Name", "Source", "JobId"),
+             (),
+             ray::stats::GAUGE);
+
+/// Job related stats.
+DEFINE_stats(running_jobs,
+             "Number of jobs currently running.",
+             /*tags=*/(),
+             /*buckets=*/(),
+             ray::stats::GAUGE);
+
+DEFINE_stats(finished_jobs,
+             "Number of jobs finished.",
+             // TODO(hjiang): Consider adding task completion status, for example, failed,
+             // completed in tags.
+             /*tags=*/(),
+             /*buckets=*/(),
+             ray::stats::COUNT);
+
+DEFINE_stats(job_duration_s,
+             "Duration of jobs finished in seconds.",
+             ("JobId"),
+             (),
+             ray::stats::GAUGE);
+
+/// Logical resource usage reported by raylets.
+DEFINE_stats(resources,
+             // TODO(sang): Support placement_group_reserved_available | used
+             "Logical Ray resources broken per state {AVAILABLE, USED}",
+             ("Name", "State"),
+             (),
+             ray::stats::GAUGE);
+
+/// Object store memory usage.
+DEFINE_stats(
+    object_store_memory,
+    "Object store memory by various sub-kinds on this node",
+    /// Location:
+    ///    - MMAP_SHM: currently in shared memory(e.g. /dev/shm).
+    ///    - MMAP_DISK: memory that's fallback allocated on mmapped disk,
+    ///      e.g. /tmp.
+    ///    - WORKER_HEAP: ray objects smaller than ('max_direct_call_object_size',
+    ///      default 100KiB) stored in process memory, i.e. inlined return
+    ///      values, placeholders for objects stored in plasma store.
+    ///    - SPILLED: current number of bytes from objects spilled
+    ///      to external storage. Note this might be smaller than
+    ///      the physical storage incurred on the external storage because
+    ///      Ray might fuse spilled objects into a single file, so a deleted
+    ///      spill object might still exist in the spilled file. Check
+    ///      spilled object fusing for more details.
+    /// ObjectState:
+    ///    - SEALED: sealed objects bytes (could be MMAP_SHM or MMAP_DISK)
+    ///    - UNSEALED: unsealed objects bytes (could be MMAP_SHM or MMAP_DISK)
+    (ray::stats::LocationKey.name(), ray::stats::ObjectStateKey.name()),
+    (),
+    ray::stats::GAUGE);
+
+DEFINE_stats(object_store_dist,
+             "The distribution of object size in bytes",
+             ("Source"),
+             ({32_MiB,
+               64_MiB,
+               128_MiB,
+               256_MiB,
+               512_MiB,
+               1024_MiB,
+               2048_MiB,
+               4096_MiB,
+               8192_MiB,
+               16384_MiB}),
+             ray::stats::HISTOGRAM);
+
+/// Placement group metrics from the GCS.
+DEFINE_stats(placement_groups,
+             "Number of placement groups broken down by state.",
+             // State: from rpc::PlacementGroupData::PlacementGroupState.
+             ("State"),
+             (),
+             ray::stats::GAUGE);
+
+/// ===============================================================================
+/// ===================== INTERNAL SYSTEM METRICS =================================
+/// ===============================================================================
+
+DEFINE_stats(io_context_event_loop_lag_ms,
+             "Latency of a task from post to execution",
+             ("Name"),  // Name of the instrumented_io_context.
              (),
              ray::stats::GAUGE);
 
@@ -77,8 +171,8 @@ DEFINE_stats(operation_active_count,
 DEFINE_stats(grpc_server_req_process_time_ms,
              "Request latency in grpc server",
              ("Method"),
-             (),
-             ray::stats::GAUGE);
+             ({0.1, 1, 10, 100, 1000, 10000}, ),
+             ray::stats::HISTOGRAM);
 DEFINE_stats(grpc_server_req_new,
              "New request number in grpc server",
              ("Method"),
@@ -91,6 +185,24 @@ DEFINE_stats(grpc_server_req_handling,
              ray::stats::COUNT);
 DEFINE_stats(grpc_server_req_finished,
              "Finished request number in grpc server",
+             ("Method"),
+             (),
+             ray::stats::COUNT);
+DEFINE_stats(grpc_server_req_succeeded,
+             "Succeeded request count in grpc server",
+             ("Method"),
+             (),
+             ray::stats::COUNT);
+DEFINE_stats(grpc_server_req_failed,
+             "Failed request count in grpc server",
+             ("Method"),
+             (),
+             ray::stats::COUNT);
+
+/// Number of failures observed from gRPC client(s).
+/// A failure is an RPC whose response status was not `OK`.
+DEFINE_stats(grpc_client_req_failed,
+             "Number of gRPC client failures (non-OK response statuses).",
              ("Method"),
              (),
              ray::stats::COUNT);
@@ -150,8 +262,8 @@ DEFINE_stats(pull_manager_object_request_time_ms,
              ray::stats::HISTOGRAM);
 
 /// Push Manager
-DEFINE_stats(push_manager_in_flight_pushes,
-             "Number of in flight object push requests.",
+DEFINE_stats(push_manager_num_pushes_remaining,
+             "Number of pushes not completed.",
              (),
              (),
              ray::stats::GAUGE);
@@ -183,14 +295,13 @@ DEFINE_stats(scheduler_failed_worker_startup_total,
              ("Reason"),
              (),
              ray::stats::GAUGE);
-
-/// Raylet Resource Manager
-DEFINE_stats(resources,
-             // TODO(sang): Support placement_group_reserved_available | used
-             "Logical Ray resources broken per state {AVAILABLE, USED}",
-             ("Name", "State"),
-             (),
-             ray::stats::GAUGE);
+DEFINE_stats(scheduler_placement_time_s,
+             "The time it takes for a worklod (task, actor, placement group) to "
+             "be placed. This is the time from when the tasks dependencies are "
+             "resolved to when it actually reserves resources on a node to run.",
+             ("WorkloadType"),
+             ({0.1, 1, 10, 100, 1000, 10000}, ),
+             ray::stats::HISTOGRAM);
 
 /// Local Object Manager
 DEFINE_stats(
@@ -227,26 +338,6 @@ DEFINE_stats(gcs_storage_operation_count,
              (),
              ray::stats::COUNT);
 
-/// Object store
-DEFINE_stats(object_store_memory,
-             "Object store memory by various sub-kinds on this node",
-             /// Location:
-             ///    - MMAP_SHM: currently in shared memory(e.g. /dev/shm).
-             ///    - MMAP_DISK: memory that's fallback allocated on mmapped disk,
-             ///      e.g. /tmp.
-             ///    - SPILLED: current number of bytes from objects spilled
-             ///      to external storage. Note this might be smaller than
-             ///      the physical storage incurred on the external storage because
-             ///      Ray might fuse spilled objects into a single file, so a deleted
-             ///      spill object might still exist in the spilled file. Check
-             ///      spilled object fusing for more details.
-             /// ObjectState:
-             ///    - SEALED: sealed objects bytes (could be MMAP_SHM or MMAP_DISK)
-             ///    - UNSEALED: unsealed objects bytes (could be MMAP_SHM or MMAP_DISK)
-             (ray::stats::LocationKey.name(), ray::stats::ObjectStateKey.name()),
-             (),
-             ray::stats::GAUGE);
-
 /// Placement Group
 // The end to end placement group creation latency.
 // The time from placement group creation request has received
@@ -278,12 +369,44 @@ DEFINE_stats(gcs_actors_count,
              (),
              ray::stats::GAUGE);
 
-/// Memory Manager
-DEFINE_stats(memory_manager_worker_eviction_total,
-             "Total worker eviction events broken per work type {Actor, Task}",
+/// GCS Task Manager
+DEFINE_stats(gcs_task_manager_task_events_reported,
+             "Number of all task events reported to gcs.",
+             (),
+             (),
+             ray::stats::GAUGE);
+
+DEFINE_stats(gcs_task_manager_task_events_dropped,
+             /// Type:
+             ///     - PROFILE_EVENT: number of profile task events dropped from both
+             ///     workers and GCS.
+             ///     - STATUS_EVENT: number of task status updates events dropped from
+             ///     both workers and GCS.
+             "Number of task events dropped per type {PROFILE_EVENT, STATUS_EVENT}",
              ("Type"),
              (),
-             ray::stats::COUNT);
-}  // namespace stats
+             ray::stats::GAUGE);
 
-}  // namespace ray
+DEFINE_stats(gcs_task_manager_task_events_stored,
+             "Number of task events stored in GCS.",
+             (),
+             (),
+             ray::stats::GAUGE);
+
+/// Memory Manager
+DEFINE_stats(
+    memory_manager_worker_eviction_total,
+    "Total worker eviction events broken per work type {Actor, Task, Driver} and name.",
+    ("Type", "Name"),
+    (),
+    ray::stats::COUNT);
+
+/// Core Worker Task Manager
+DEFINE_stats(
+    total_lineage_bytes,
+    "Total amount of memory used to store task specs for lineage reconstruction.",
+    (),
+    (),
+    ray::stats::GAUGE);
+
+}  // namespace ray::stats

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 import grpc
 
-import ray._private.utils
+import ray._private.tls_utils
 import ray.cloudpickle as cloudpickle
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
@@ -176,7 +176,7 @@ class Worker:
                     server_cert_chain,
                     private_key,
                     ca_cert,
-                ) = ray._private.utils.load_certs_from_env()
+                ) = ray._private.tls_utils.load_certs_from_env()
                 credentials = grpc.ssl_channel_credentials(
                     certificate_chain=server_cert_chain,
                     private_key=private_key,
@@ -361,7 +361,7 @@ class Worker:
         from being replayed on the server side in the event that the client
         must retry a requsest.
         Args:
-            metadata - the gRPC metadata to append the IDs to
+            metadata: the gRPC metadata to append the IDs to
         """
         if not self._reconnect_enabled:
             # IDs not needed if the reconnects are disabled
@@ -388,7 +388,6 @@ class Worker:
             "python_version": data.python_version,
             "ray_version": data.ray_version,
             "ray_commit": data.ray_commit,
-            "protocol_version": data.protocol_version,
         }
 
     def register_callback(
@@ -556,17 +555,29 @@ class Worker:
         task = instance._prepare_client_task()
         # data is serialized tuple of (args, kwargs)
         task.data = dumps_from_client((args, kwargs), self._client_id)
-        return self._call_schedule_for_task(task, instance._num_returns())
+        num_returns = instance._num_returns()
+        if num_returns == "dynamic":
+            num_returns = -1
+        if num_returns == "streaming":
+            raise RuntimeError(
+                'Streaming actor methods (num_returns="streaming") '
+                "are not currently supported when using Ray Client."
+            )
+
+        return self._call_schedule_for_task(task, num_returns)
 
     def _call_schedule_for_task(
-        self, task: ray_client_pb2.ClientTask, num_returns: int
+        self, task: ray_client_pb2.ClientTask, num_returns: Optional[int]
     ) -> List[Future]:
         logger.debug(f"Scheduling task {task.name} {task.type} {task.payload_id}")
         task.client_id = self._client_id
         if num_returns is None:
             num_returns = 1
 
-        id_futures = [Future() for _ in range(num_returns)]
+        num_return_refs = num_returns
+        if num_return_refs == -1:
+            num_return_refs = 1
+        id_futures = [Future() for _ in range(num_return_refs)]
 
         def populate_ids(resp: Union[ray_client_pb2.DataResponse, Exception]) -> None:
             if isinstance(resp, Exception):
@@ -586,9 +597,9 @@ class Worker:
                     future.set_exception(ex)
                 return
 
-            if len(ticket.return_ids) != num_returns:
+            if len(ticket.return_ids) != num_return_refs:
                 exc = ValueError(
-                    f"Expected {num_returns} returns but received "
+                    f"Expected {num_return_refs} returns but received "
                     f"{len(ticket.return_ids)}"
                 )
                 for future, raw_id in zip(id_futures, ticket.return_ids):
@@ -661,7 +672,7 @@ class Worker:
         task.data = dumps_from_client(([], {}), self._client_id)
         futures = self._call_schedule_for_task(task, 1)
         assert len(futures) == 1
-        handle = ClientActorHandle(ClientActorRef(futures[0]))
+        handle = ClientActorHandle(ClientActorRef(futures[0], weak_ref=True))
         # `actor_ref.is_nil()` waits until the underlying ID is resolved.
         # This is needed because `get_actor` is often used to check the
         # existence of an actor.
@@ -713,7 +724,7 @@ class Worker:
         resp = self.server.ClusterInfo(req, timeout=timeout, metadata=self.metadata)
         if resp.WhichOneof("response_type") == "resource_table":
             # translate from a proto map to a python dict
-            output_dict = {k: v for k, v in resp.resource_table.table.items()}
+            output_dict = dict(resp.resource_table.table)
             return output_dict
         elif resp.WhichOneof("response_type") == "runtime_context":
             return resp.runtime_context
@@ -888,7 +899,7 @@ def make_client_id() -> str:
 def decode_exception(e: grpc.RpcError) -> Exception:
     if e.code() != grpc.StatusCode.ABORTED:
         # The ABORTED status code is used by the server when an application
-        # error is serialized into the the exception details. If the code
+        # error is serialized into the exception details. If the code
         # isn't ABORTED, then return the original error since there's no
         # serialized error to decode.
         # See server.py::return_exception_in_context for details

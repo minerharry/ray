@@ -1,13 +1,13 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+
+from ray.air.util.data_batch_conversion import BatchFormat
 from ray.data import Dataset
 from ray.data.preprocessor import Preprocessor
-from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
     from ray.air.data_batch_type import DataBatchType
 
 
-@PublicAPI(stability="alpha")
 class Chain(Preprocessor):
     """Combine multiple preprocessors into a single :py:class:`Preprocessor`.
 
@@ -28,7 +28,7 @@ class Chain(Preprocessor):
         >>>
         >>> preprocessor = Chain(
         ...     StandardScaler(columns=["X0", "X1"]),
-        ...     Concatenator(include=["X0", "X1"], output_column_name="X"),
+        ...     Concatenator(columns=["X0", "X1"], output_column_name="X"),
         ...     LabelEncoder(label_column="Y")
         ... )
         >>> preprocessor.fit_transform(ds).to_pandas()  # doctest: +SKIP
@@ -45,16 +45,13 @@ class Chain(Preprocessor):
         fittable_count = 0
         fitted_count = 0
         for p in self.preprocessors:
-            # AIR does not support a chain of chained preprocessors at this point.
-            # Assert to explicitly call this out.
-            # This can be revisited if compelling use cases emerge.
-            assert not isinstance(
-                p, Chain
-            ), "A chain preprocessor should not contain another chain preprocessor."
             if p.fit_status() == Preprocessor.FitStatus.FITTED:
                 fittable_count += 1
                 fitted_count += 1
-            elif p.fit_status() == Preprocessor.FitStatus.NOT_FITTED:
+            elif p.fit_status() in (
+                Preprocessor.FitStatus.NOT_FITTED,
+                Preprocessor.FitStatus.PARTIALLY_FITTED,
+            ):
                 fittable_count += 1
             else:
                 assert p.fit_status() == Preprocessor.FitStatus.NOT_FITTABLE
@@ -80,13 +77,24 @@ class Chain(Preprocessor):
     def fit_transform(self, ds: Dataset) -> Dataset:
         for preprocessor in self.preprocessors:
             ds = preprocessor.fit_transform(ds)
-        self._transform_stats = preprocessor.transform_stats()
         return ds
 
-    def _transform(self, ds: Dataset) -> Dataset:
+    def _transform(
+        self,
+        ds: Dataset,
+        batch_size: Optional[int],
+        num_cpus: Optional[float] = None,
+        memory: Optional[float] = None,
+        concurrency: Optional[int] = None,
+    ) -> Dataset:
         for preprocessor in self.preprocessors:
-            ds = preprocessor.transform(ds)
-        self._transform_stats = preprocessor.transform_stats()
+            ds = preprocessor.transform(
+                ds,
+                batch_size=batch_size,
+                num_cpus=num_cpus,
+                memory=memory,
+                concurrency=concurrency,
+            )
         return ds
 
     def _transform_batch(self, df: "DataBatchType") -> "DataBatchType":
@@ -97,3 +105,10 @@ class Chain(Preprocessor):
     def __repr__(self):
         arguments = ", ".join(repr(preprocessor) for preprocessor in self.preprocessors)
         return f"{self.__class__.__name__}({arguments})"
+
+    def _determine_transform_to_use(self) -> BatchFormat:
+        # This is relevant for BatchPrediction.
+        # For Chain preprocessor, we picked the first one as entry point.
+        # TODO (jiaodong): We should revisit if our Chain preprocessor is
+        # still optimal with context of lazy execution.
+        return self.preprocessors[0]._determine_transform_to_use()

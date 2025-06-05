@@ -14,10 +14,15 @@
 
 #include "ray/object_manager/pull_manager.h"
 
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "ray/common/common_protocol.h"
-#include "ray/common/test_util.h"
 
 namespace ray {
 
@@ -25,7 +30,7 @@ using ::testing::ElementsAre;
 
 class PullManagerTestWithCapacity {
  public:
-  PullManagerTestWithCapacity(size_t num_available_bytes)
+  explicit PullManagerTestWithCapacity(size_t num_available_bytes)
       : self_node_id_(NodeID::FromRandom()),
         object_is_local_(false),
         num_send_pull_request_calls_(0),
@@ -148,7 +153,7 @@ TEST_P(PullManagerTest, TestStaleSubscription) {
   auto oid = ObjectRefsToIds(refs)[0];
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -190,10 +195,10 @@ TEST_P(PullManagerWithAdmissionControlTest, TestPullObjectPendingCreation) {
   auto refs_2 = CreateObjectRefs(1);
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id_1 = pull_manager_.Pull(refs_1, prio, "", &objects_to_locate);
+  auto req_id_1 = pull_manager_.Pull(refs_1, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs_1));
   objects_to_locate.clear();
-  auto req_id_2 = pull_manager_.Pull(refs_2, prio, "", &objects_to_locate);
+  auto req_id_2 = pull_manager_.Pull(refs_2, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs_2));
   AssertNumActiveRequestsEquals(0);
 
@@ -260,10 +265,10 @@ TEST_P(PullManagerWithAdmissionControlTest, TestPullOrder) {
   auto refs_2 = CreateObjectRefs(1);
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id_1 = pull_manager_.Pull(refs_1, prio, "", &objects_to_locate);
+  auto req_id_1 = pull_manager_.Pull(refs_1, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs_1));
   objects_to_locate.clear();
-  auto req_id_2 = pull_manager_.Pull(refs_2, prio, "", &objects_to_locate);
+  auto req_id_2 = pull_manager_.Pull(refs_2, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs_2));
   AssertNumActiveRequestsEquals(0);
 
@@ -294,7 +299,7 @@ TEST_P(PullManagerWithAdmissionControlTest, TestPullOrder) {
   auto req_id_3 =
       pull_manager_.Pull(std::vector<rpc::ObjectReference>{refs_1[0], refs_2[0]},
                          prio,
-                         "",
+                         {"", false},
                          &objects_to_locate);
   ASSERT_TRUE(objects_to_locate.empty());
   AssertNumActiveBundlesEquals(3);
@@ -314,7 +319,7 @@ TEST_P(PullManagerTest, TestRestoreSpilledObjectRemote) {
   rpc::Address addr1;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -374,7 +379,7 @@ TEST_P(PullManagerTest, TestRestoreSpilledObjectLocal) {
   rpc::Address addr1;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -408,24 +413,26 @@ TEST_P(PullManagerTest, TestRestoreSpilledObjectLocal) {
   ASSERT_EQ(num_send_pull_request_calls_, 0);
   ASSERT_EQ(num_restore_spilled_object_calls_, 2);
 
-  ASSERT_TRUE(num_abort_calls_.empty());
+  // Abort create obj1 before try to restore it.
+  ASSERT_EQ(num_abort_calls_[obj1], num_restore_spilled_object_calls_);
+  ASSERT_EQ(num_abort_calls_.size(), 1);
   ASSERT_TRUE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_id));
   auto objects_to_cancel = pull_manager_.CancelPull(req_id);
   ASSERT_EQ(objects_to_cancel, ObjectRefsToIds(refs));
-  ASSERT_EQ(num_abort_calls_[obj1], 1);
+  ASSERT_EQ(num_abort_calls_[obj1], num_restore_spilled_object_calls_ + 1);
 
   AssertNoLeaks();
 }
 
 TEST_P(PullManagerTest, TestRestoreSpilledObjectOnLocalStorage) {
-  /// Test the scneario where the object is spilled to local storage, like filesystems.
+  /// Test the scenario where the object is spilled to local storage, like filesystems.
   BundlePriority prio = GetParam();
   auto refs = CreateObjectRefs(1);
   auto obj1 = ObjectRefsToIds(refs)[0];
   rpc::Address addr1;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -453,24 +460,26 @@ TEST_P(PullManagerTest, TestRestoreSpilledObjectOnLocalStorage) {
   ASSERT_EQ(num_send_pull_request_calls_, 0);
   ASSERT_EQ(num_restore_spilled_object_calls_, 2);
 
-  ASSERT_TRUE(num_abort_calls_.empty());
+  // Abort create obj1 before try to restore it.
+  ASSERT_EQ(num_abort_calls_[obj1], num_restore_spilled_object_calls_);
+  ASSERT_EQ(num_abort_calls_.size(), 1);
   ASSERT_TRUE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_id));
   auto objects_to_cancel = pull_manager_.CancelPull(req_id);
   ASSERT_EQ(objects_to_cancel, ObjectRefsToIds(refs));
-  ASSERT_EQ(num_abort_calls_[obj1], 1);
+  ASSERT_EQ(num_abort_calls_[obj1], num_restore_spilled_object_calls_ + 1);
 
   AssertNoLeaks();
 }
 
 TEST_P(PullManagerTest, TestRestoreSpilledObjectOnExternalStorage) {
-  /// Test the scneario where the object is spilled to external storages, such as S3.
+  /// Test the scenario where the object is spilled to external storages, such as S3.
   BundlePriority prio = GetParam();
   auto refs = CreateObjectRefs(1);
   auto obj1 = ObjectRefsToIds(refs)[0];
   rpc::Address addr1;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -507,11 +516,13 @@ TEST_P(PullManagerTest, TestRestoreSpilledObjectOnExternalStorage) {
   ASSERT_EQ(num_send_pull_request_calls_, 0);
   ASSERT_EQ(num_restore_spilled_object_calls_, 2);
 
-  ASSERT_TRUE(num_abort_calls_.empty());
+  // Abort create obj1 before try to restore it.
+  ASSERT_EQ(num_abort_calls_[obj1], num_restore_spilled_object_calls_);
+  ASSERT_EQ(num_abort_calls_.size(), 1);
   ASSERT_TRUE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_id));
   auto objects_to_cancel = pull_manager_.CancelPull(req_id);
   ASSERT_EQ(objects_to_cancel, ObjectRefsToIds(refs));
-  ASSERT_EQ(num_abort_calls_[obj1], 1);
+  ASSERT_EQ(num_abort_calls_[obj1], num_restore_spilled_object_calls_ + 1);
 
   AssertNoLeaks();
 }
@@ -526,7 +537,7 @@ TEST_P(PullManagerTest, TestLoadBalancingRestorationRequest) {
   rpc::Address addr1;
   ASSERT_EQ(pull_manager_.NumObjectPullRequests(), 0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
   ASSERT_EQ(pull_manager_.NumObjectPullRequests(), 1);
 
@@ -554,7 +565,7 @@ TEST_P(PullManagerTest, TestManyUpdates) {
   rpc::Address addr1;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -585,7 +596,7 @@ TEST_P(PullManagerTest, TestRetryTimer) {
   rpc::Address addr1;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), ObjectRefsToIds(refs));
 
   std::unordered_set<NodeID> client_ids;
@@ -635,7 +646,7 @@ TEST_P(PullManagerTest, TestBasic) {
   auto oids = ObjectRefsToIds(refs);
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
   ASSERT_TRUE(pull_manager_.HasPullsQueued());
 
@@ -692,7 +703,7 @@ TEST_P(PullManagerTest, TestPinActiveObjects) {
   auto oids = ObjectRefsToIds(refs);
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
 
   std::unordered_set<NodeID> client_ids;
@@ -724,8 +735,8 @@ TEST_P(PullManagerTest, TestPinActiveObjects) {
   // Check do not pin objects belonging to inactive bundles.
   auto refs2 = CreateObjectRefs(1);
   auto oids2 = ObjectRefsToIds(refs2);
-  auto req_id2 =
-      pull_manager_.Pull(refs2, BundlePriority::TASK_ARGS, "", &objects_to_locate);
+  auto req_id2 = pull_manager_.Pull(
+      refs2, BundlePriority::TASK_ARGS, {"", false}, &objects_to_locate);
   for (size_t i = 0; i < oids2.size(); i++) {
     ASSERT_FALSE(pull_manager_.IsObjectActive(oids2[i]));
     pull_manager_.OnLocationChange(oids2[i], client_ids, "", NodeID::Nil(), false, 1000);
@@ -750,11 +761,11 @@ TEST_P(PullManagerTest, TestDeduplicateBundles) {
   auto oids = ObjectRefsToIds(refs);
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id1 = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id1 = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
 
   objects_to_locate.clear();
-  auto req_id2 = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id2 = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_TRUE(objects_to_locate.empty());
 
   std::unordered_set<NodeID> client_ids;
@@ -814,10 +825,10 @@ TEST_P(PullManagerTest, TestDuplicateObjectsInDuplicateRequests) {
   refs.push_back(refs[0]);
   auto oids = ObjectRefsToIds(refs);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id1 = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id1 = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   // One object is duplicate, so there are only two requests total.
   objects_to_locate.clear();
-  auto req_id2 = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id2 = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_TRUE(objects_to_locate.empty());
 
   // Cancel one request. It should not check fail.
@@ -840,7 +851,7 @@ TEST_P(PullManagerTest, TestDuplicateObjectsAreActivatedAndCleanedUp) {
   auto oids = ObjectRefsToIds(refs);
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
 
   std::unordered_set<NodeID> client_ids;
   client_ids.insert(NodeID::FromRandom());
@@ -863,7 +874,7 @@ TEST_P(PullManagerWithAdmissionControlTest, TestBasic) {
   size_t object_size = 2;
   AssertNumActiveRequestsEquals(0);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
   ASSERT_TRUE(pull_manager_.HasPullsQueued());
 
@@ -925,7 +936,7 @@ TEST_P(PullManagerWithAdmissionControlTest, TestQueue) {
     auto refs = CreateObjectRefs(num_oids_per_request);
     auto oids = ObjectRefsToIds(refs);
     std::vector<rpc::ObjectReference> objects_to_locate;
-    auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+    auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
     ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
 
     bundles.push_back(oids);
@@ -959,7 +970,7 @@ TEST_P(PullManagerWithAdmissionControlTest, TestQueue) {
     }
     // Check that OOM was triggered.
     for (size_t i = 0; i < req_ids.size(); i++) {
-      if ((int)i < num_requests_expected) {
+      if (static_cast<int>(i) < num_requests_expected) {
         ASSERT_TRUE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_ids[i]));
       } else {
         ASSERT_FALSE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_ids[i]));
@@ -992,7 +1003,7 @@ TEST_P(PullManagerWithAdmissionControlTest, TestCancel) {
     std::vector<int64_t> req_ids;
     for (auto &ref : refs) {
       std::vector<rpc::ObjectReference> objects_to_locate;
-      auto req_id = pull_manager_.Pull({ref}, prio, "", &objects_to_locate);
+      auto req_id = pull_manager_.Pull({ref}, prio, {"", false}, &objects_to_locate);
       req_ids.push_back(req_id);
     }
     for (size_t i = 0; i < object_sizes.size(); i++) {
@@ -1061,13 +1072,13 @@ TEST_F(PullManagerWithAdmissionControlTest, TestPrioritizeWorkerRequests) {
   // First submit two task args requests that can be pulled at the same time.
   std::vector<rpc::ObjectReference> objects_to_locate;
   auto refs = CreateObjectRefs(1);
-  auto task_req_id1 =
-      pull_manager_.Pull(refs, BundlePriority::TASK_ARGS, "", &objects_to_locate);
+  auto task_req_id1 = pull_manager_.Pull(
+      refs, BundlePriority::TASK_ARGS, {"", false}, &objects_to_locate);
   task_oids.push_back(ObjectRefsToIds(refs)[0]);
 
   refs = CreateObjectRefs(1);
-  auto task_req_id2 =
-      pull_manager_.Pull(refs, BundlePriority::TASK_ARGS, "", &objects_to_locate);
+  auto task_req_id2 = pull_manager_.Pull(
+      refs, BundlePriority::TASK_ARGS, {"", false}, &objects_to_locate);
   task_oids.push_back(ObjectRefsToIds(refs)[0]);
 
   std::unordered_set<NodeID> client_ids;
@@ -1085,8 +1096,8 @@ TEST_F(PullManagerWithAdmissionControlTest, TestPrioritizeWorkerRequests) {
 
   // A wait request comes in. It takes priority over the task requests.
   refs = CreateObjectRefs(1);
-  auto wait_req_id =
-      pull_manager_.Pull(refs, BundlePriority::WAIT_REQUEST, "", &objects_to_locate);
+  auto wait_req_id = pull_manager_.Pull(
+      refs, BundlePriority::WAIT_REQUEST, {"", false}, &objects_to_locate);
   wait_oids.push_back(ObjectRefsToIds(refs)[0]);
   pull_manager_.OnLocationChange(
       wait_oids[0], client_ids, "", NodeID::Nil(), false, object_size);
@@ -1097,8 +1108,8 @@ TEST_F(PullManagerWithAdmissionControlTest, TestPrioritizeWorkerRequests) {
 
   // A worker request comes in.
   refs = CreateObjectRefs(1);
-  auto get_req_id1 =
-      pull_manager_.Pull(refs, BundlePriority::GET_REQUEST, "", &objects_to_locate);
+  auto get_req_id1 = pull_manager_.Pull(
+      refs, BundlePriority::GET_REQUEST, {"", false}, &objects_to_locate);
   get_oids.push_back(ObjectRefsToIds(refs)[0]);
   // Nothing has changed yet because the size information for the worker's
   // request is not available.
@@ -1121,8 +1132,8 @@ TEST_F(PullManagerWithAdmissionControlTest, TestPrioritizeWorkerRequests) {
   // Another worker request comes in. It takes priority over the wait request
   // once its size is available.
   refs = CreateObjectRefs(1);
-  auto get_req_id2 =
-      pull_manager_.Pull(refs, BundlePriority::GET_REQUEST, "", &objects_to_locate);
+  auto get_req_id2 = pull_manager_.Pull(
+      refs, BundlePriority::GET_REQUEST, {"", false}, &objects_to_locate);
   get_oids.push_back(ObjectRefsToIds(refs)[0]);
   AssertNumActiveRequestsEquals(2);
   ASSERT_TRUE(pull_manager_.IsObjectActive(get_oids[0]));
@@ -1185,7 +1196,7 @@ TEST_P(PullManagerTest, TestTimeOut) {
   auto refs = CreateObjectRefs(1);
   auto oids = ObjectRefsToIds(refs);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
   ASSERT_TRUE(pull_manager_.HasPullsQueued());
 
@@ -1205,7 +1216,7 @@ TEST_P(PullManagerTest, TestTimeOut) {
   timed_out_objects_.clear();
   RAY_UNUSED(pull_manager_.CancelPull(req_id));
 
-  req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   pull_manager_.OnLocationChange(oids[0], client_ids, "", NodeID::Nil(), false, 0);
   ASSERT_TRUE(pull_manager_.IsObjectActive(oids[0]));
   // Object has no locations now but it is pending execution.
@@ -1232,7 +1243,7 @@ TEST_P(PullManagerTest, TestTimeOutAfterFailedPull) {
   auto refs = CreateObjectRefs(1);
   auto oids = ObjectRefsToIds(refs);
   std::vector<rpc::ObjectReference> objects_to_locate;
-  auto req_id = pull_manager_.Pull(refs, prio, "", &objects_to_locate);
+  auto req_id = pull_manager_.Pull(refs, prio, {"", false}, &objects_to_locate);
   ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
   ASSERT_TRUE(pull_manager_.HasPullsQueued());
 

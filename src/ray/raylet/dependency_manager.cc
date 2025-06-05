@@ -14,6 +14,11 @@
 
 #include "ray/raylet/dependency_manager.h"
 
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 namespace ray {
 
 namespace raylet {
@@ -77,7 +82,7 @@ void DependencyManager::StartOrUpdateWaitRequest(
       it->second.dependent_wait_requests.insert(worker_id);
       if (it->second.wait_request_id == 0) {
         it->second.wait_request_id =
-            object_manager_.Pull({ref}, BundlePriority::WAIT_REQUEST, "");
+            object_manager_.Pull({ref}, BundlePriority::WAIT_REQUEST, {"", false});
         RAY_LOG(DEBUG) << "Started pull for wait request for object " << obj_id
                        << " request: " << it->second.wait_request_id;
       }
@@ -92,19 +97,19 @@ void DependencyManager::StartOrUpdateWaitRequest(
 
 void DependencyManager::CancelWaitRequest(const WorkerID &worker_id) {
   RAY_LOG(DEBUG) << "Canceling wait request for worker " << worker_id;
-  auto it = wait_requests_.find(worker_id);
-  if (it == wait_requests_.end()) {
+  auto req_iter = wait_requests_.find(worker_id);
+  if (req_iter == wait_requests_.end()) {
     return;
   }
 
-  for (const auto &obj_id : it->second) {
-    auto it = required_objects_.find(obj_id);
-    RAY_CHECK(it != required_objects_.end());
-    it->second.dependent_wait_requests.erase(worker_id);
-    RemoveObjectIfNotNeeded(it);
+  for (const auto &obj_id : req_iter->second) {
+    auto obj_iter = required_objects_.find(obj_id);
+    RAY_CHECK(obj_iter != required_objects_.end());
+    obj_iter->second.dependent_wait_requests.erase(worker_id);
+    RemoveObjectIfNotNeeded(obj_iter);
   }
 
-  wait_requests_.erase(it);
+  wait_requests_.erase(req_iter);
 }
 
 void DependencyManager::StartOrUpdateGetRequest(
@@ -132,7 +137,8 @@ void DependencyManager::StartOrUpdateGetRequest(
     }
     // Pull the new dependencies before canceling the old request, in case some
     // of the old dependencies are still being fetched.
-    uint64_t new_request_id = object_manager_.Pull(refs, BundlePriority::GET_REQUEST, "");
+    uint64_t new_request_id =
+        object_manager_.Pull(refs, BundlePriority::GET_REQUEST, {"", false});
     if (get_request.second != 0) {
       RAY_LOG(DEBUG) << "Canceling pull for get request from worker " << worker_id
                      << " request: " << get_request.second;
@@ -146,30 +152,30 @@ void DependencyManager::StartOrUpdateGetRequest(
 
 void DependencyManager::CancelGetRequest(const WorkerID &worker_id) {
   RAY_LOG(DEBUG) << "Canceling get request for worker " << worker_id;
-  auto it = get_requests_.find(worker_id);
-  if (it == get_requests_.end()) {
+  auto req_iter = get_requests_.find(worker_id);
+  if (req_iter == get_requests_.end()) {
     return;
   }
 
   RAY_LOG(DEBUG) << "Canceling pull for get request from worker " << worker_id
-                 << " request: " << it->second.second;
-  object_manager_.CancelPull(it->second.second);
+                 << " request: " << req_iter->second.second;
+  object_manager_.CancelPull(req_iter->second.second);
 
-  for (const auto &obj_id : it->second.first) {
-    auto it = required_objects_.find(obj_id);
-    RAY_CHECK(it != required_objects_.end());
-    it->second.dependent_get_requests.erase(worker_id);
-    RemoveObjectIfNotNeeded(it);
+  for (const auto &obj_id : req_iter->second.first) {
+    auto obj_iter = required_objects_.find(obj_id);
+    RAY_CHECK(obj_iter != required_objects_.end());
+    obj_iter->second.dependent_get_requests.erase(worker_id);
+    RemoveObjectIfNotNeeded(obj_iter);
   }
 
-  get_requests_.erase(it);
+  get_requests_.erase(req_iter);
 }
 
 /// Request dependencies for a queued task.
 bool DependencyManager::RequestTaskDependencies(
     const TaskID &task_id,
     const std::vector<rpc::ObjectReference> &required_objects,
-    const std::string &task_name) {
+    const TaskMetricsKey &task_key) {
   RAY_LOG(DEBUG) << "Adding dependencies for task " << task_id
                  << ". Required objects length: " << required_objects.size();
 
@@ -178,7 +184,7 @@ bool DependencyManager::RequestTaskDependencies(
   auto inserted = queued_task_requests_.emplace(
       task_id,
       std::make_unique<TaskDependencies>(
-          std::move(deduped_ids), waiting_tasks_counter_, task_name));
+          std::move(deduped_ids), waiting_tasks_counter_, task_key));
   RAY_CHECK(inserted.second) << "Task depedencies can be requested only once per task. "
                              << task_id;
   auto &task_entry = inserted.first->second;
@@ -199,7 +205,7 @@ bool DependencyManager::RequestTaskDependencies(
 
   if (!required_objects.empty()) {
     task_entry->pull_request_id =
-        object_manager_.Pull(required_objects, BundlePriority::TASK_ARGS, task_name);
+        object_manager_.Pull(required_objects, BundlePriority::TASK_ARGS, task_key);
     RAY_LOG(DEBUG) << "Started pull for dependencies of task " << task_id
                    << " request: " << task_entry->pull_request_id;
   }

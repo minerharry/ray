@@ -300,10 +300,24 @@ def test_environment_variables_env_caching(shutdown_only):
     assert pid7 == pid1
 
 
-if __name__ == "__main__":
-    import pytest
+def test_appendable_environ(ray_start_regular):
+    @ray.remote
+    def get_env(key):
+        return os.environ.get(key)
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    custom_env = os.path.pathsep + "/usr/local/bin"
+    remote_env = ray.get(
+        get_env.options(
+            runtime_env={
+                "env_vars": {
+                    "PATH": "${PATH}" + custom_env,
+                }
+            }
+        ).remote("PATH")
+    )
+    assert remote_env.endswith(custom_env)
+    assert len(remote_env) > len(custom_env)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

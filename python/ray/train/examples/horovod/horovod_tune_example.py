@@ -1,13 +1,13 @@
-import numpy as np
 import time
+
+import numpy as np
 import torch
 
 import ray
-from ray import tune
-from ray.air import session
 import ray.train.torch
+from ray import train, tune
+from ray.train import ScalingConfig
 from ray.train.horovod import HorovodTrainer
-from ray.air.config import ScalingConfig
 from ray.tune.tune_config import TuneConfig
 from ray.tune.tuner import Tuner
 
@@ -49,8 +49,8 @@ class Net(torch.nn.Module):
 
 
 def train_loop_per_worker(config):
-    import torch
     import horovod.torch as hvd
+    import torch
 
     hvd.init()
     device = ray.train.torch.get_device()
@@ -85,7 +85,7 @@ def train_loop_per_worker(config):
 
         optimizer.step()
         time.sleep(0.1)
-        session.report(dict(loss=loss.item()))
+        train.report(dict(loss=loss.item()))
     total = time.time() - start
     print(f"Took {total:0.3f} s. Avg: {total / num_steps:0.3f} s.")
 
@@ -125,22 +125,10 @@ if __name__ == "__main__":
         "--smoke-test", action="store_true", help=("Finish quickly for testing.")
     )
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
     args, _ = parser.parse_known_args()
 
     if args.smoke_test:
         ray.init(num_cpus=3)
-    elif args.server_address:
-        ray.init(f"ray://{args.server_address}")
-
-    # import ray
-    # ray.init(address="auto")  # assumes ray is started with ray up
 
     tune_horovod(
         num_workers=args.num_workers,

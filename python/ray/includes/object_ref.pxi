@@ -8,9 +8,7 @@ import threading
 from typing import Callable, Any, Union
 
 import ray
-import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import cython
-import ray.util.client as client
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +71,7 @@ cdef class ObjectRef(BaseID):
                 pass
 
     cdef CObjectID native(self):
-        return self.data
+        return <CObjectID>self.data
 
     def binary(self):
         return self.data.Binary()

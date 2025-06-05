@@ -7,36 +7,34 @@ Requires the HyperOpt library to be installed (`pip install hyperopt`).
 For an example of using a Tune search space, see
 :doc:`/tune/examples/hyperopt_example`.
 """
+
 import time
+
+from hyperopt import hp
 
 import ray
 from ray import tune
-from ray.air import session
-from ray.tune.search import ConcurrencyLimiter
 from ray.tune.schedulers import AsyncHyperBandScheduler
+from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.hyperopt import HyperOptSearch
-from hyperopt import hp
 
 
 def f_unpack_dict(dct):
-    """
-    Unpacks all sub-dictionaries in given dictionary recursively.
+    """Unpacks all sub-dictionaries in given dictionary recursively.
     There should be no duplicated keys across all nested
     subdictionaries, or some instances will be lost without warning
 
     Source: https://www.kaggle.com/fanvacoolt/tutorial-on-hyperopt
 
-    Parameters:
-    ----------------
-    dct : dictionary to unpack
+    Args:
+        dct: dictionary to unpack
 
     Returns:
-    ----------------
-    : unpacked dictionary
+        dict: unpacked dictionary
     """
 
     res = {}
-    for (k, v) in dct.items():
+    for k, v in dct.items():
         if isinstance(v, dict):
             res = {**res, **f_unpack_dict(v)}
         else:
@@ -59,7 +57,7 @@ def easy_objective(config_in):
         # Iterative training function - can be any arbitrary training procedure
         intermediate_score = evaluation_fn(step, width, height, mult)
         # Feed the score back back to Tune.
-        session.report({"iterations": step, "mean_loss": intermediate_score})
+        tune.report({"iterations": step, "mean_loss": intermediate_score})
         time.sleep(0.1)
 
 
@@ -102,17 +100,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smoke-test", action="store_true", help="Finish quickly for testing"
     )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
     args, _ = parser.parse_known_args()
-    if args.server_address is not None:
-        ray.util.connect(args.server_address)
-    else:
-        ray.init(configure_logging=False)
+
+    ray.init(configure_logging=False)
 
     run_hyperopt_tune(smoke_test=args.smoke_test)

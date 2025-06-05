@@ -1,9 +1,11 @@
 .. _ray-job-rest-api:
 
-REST API
-^^^^^^^^
+Ray Jobs REST API
+^^^^^^^^^^^^^^^^^
 
 Under the hood, both the Python SDK and the CLI make HTTP calls to the job server running on the Ray head node. You can also directly send requests to the corresponding endpoints via HTTP if needed:
+
+Continue on for examples, or jump to the :ref:`OpenAPI specification <ray-job-rest-api-spec>`.
 
 **Submit Job**
 
@@ -14,7 +16,7 @@ Under the hood, both the Python SDK and the CLI make HTTP calls to the job serve
     import time
 
     resp = requests.post(
-        "http://127.0.0.1:8265/api/jobs/",
+        "http://127.0.0.1:8265/api/jobs/", # Don't forget the trailing slash!
         json={
             "entrypoint": "echo hello",
             "runtime_env": {},
@@ -62,3 +64,28 @@ Under the hood, both the Python SDK and the CLI make HTTP calls to the job serve
     )
     print(resp.json())
     # {"job_id": {"metadata": ..., "status": ..., "message": ...}, ...}
+
+**Stop a Job**
+
+.. code-block:: python
+
+    import json
+    import time
+    import requests
+
+    resp = requests.post(
+        "http://127.0.0.1:8265/api/jobs/{job_or_submission_id}/stop",
+    )
+    rst = json.loads(resp.text)
+    json = rst.json()
+    stopped = json["stopped"]
+    print(stopped)
+
+.. _ray-job-rest-api-spec:
+
+OpenAPI Documentation (Beta)
+----------------------------
+
+We provide an OpenAPI specification for the Ray Job API. You can use this to generate client libraries for other languages.
+
+View the `Ray Jobs REST API OpenAPI documentation <api.html>`_.

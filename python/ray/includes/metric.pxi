@@ -6,6 +6,7 @@ from ray.includes.metric cimport (
     CSum,
     CMetric,
 )
+from libcpp.utility cimport move
 from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string as c_string
 from libcpp.unordered_map cimport unordered_map
@@ -30,12 +31,11 @@ cdef class Metric:
     """
     cdef:
         unique_ptr[CMetric] metric
-        c_vector[CTagKey] c_tag_keys
+        c_vector[c_string] c_tag_keys
 
     def __init__(self, tag_keys):
         for tag_key in tag_keys:
-            self.c_tag_keys.push_back(
-                CTagKey.Register(tag_key.encode("ascii")))
+            self.c_tag_keys.push_back(tag_key.encode("ascii"))
 
     def record(self, value, tags=None):
         """Record a measurement of metric.
@@ -54,7 +54,7 @@ cdef class Metric:
                     c_tags[tag_k.encode("ascii")] = tag_v.encode("ascii")
         c_value = value
         with nogil:
-            self.metric.get().Record(c_value, c_tags)
+            self.metric.get().Record(c_value, move(c_tags))
 
     def get_name(self):
         return self.metric.get().GetName()

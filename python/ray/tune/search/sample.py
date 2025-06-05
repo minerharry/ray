@@ -1,4 +1,5 @@
 import logging
+import warnings
 from copy import copy
 from inspect import signature
 from math import isclose
@@ -7,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 import numpy as np
 
 # Backwards compatibility
-from ray.util.annotations import DeveloperAPI, PublicAPI
+from ray.util.annotations import DeveloperAPI, PublicAPI, RayDeprecationWarning
 
 try:
     # Added in numpy>=1.17 but we require numpy>=1.16
@@ -21,6 +22,20 @@ except AttributeError:
     LEGACY_RNG = True
 
 logger = logging.getLogger(__name__)
+
+
+_MISSING = object()  # Sentinel for missing parameters.
+
+
+def _warn_for_base() -> None:
+    warnings.warn(
+        (
+            "The `base` argument is deprecated. "
+            "Please remove it as it is not actually needed in this method."
+        ),
+        RayDeprecationWarning,
+        stacklevel=2,
+    )
 
 
 class _BackwardsCompatibleNumpyRng:
@@ -108,14 +123,14 @@ class Domain:
 
     def sample(
         self,
-        spec: Optional[Union[List[Dict], Dict]] = None,
+        config: Optional[Union[List[Dict], Dict]] = None,
         size: int = 1,
         random_state: "RandomState" = None,
     ):
         if not isinstance(random_state, _BackwardsCompatibleNumpyRng):
             random_state = _BackwardsCompatibleNumpyRng(random_state)
         sampler = self.get_sampler()
-        return sampler.sample(self, spec=spec, size=size, random_state=random_state)
+        return sampler.sample(self, config=config, size=size, random_state=random_state)
 
     def is_grid(self):
         return isinstance(self.sampler, Grid)
@@ -137,7 +152,7 @@ class Sampler:
     def sample(
         self,
         domain: Domain,
-        spec: Optional[Union[List[Dict], Dict]] = None,
+        config: Optional[Union[List[Dict], Dict]] = None,
         size: int = 1,
         random_state: "RandomState" = None,
     ):
@@ -158,9 +173,9 @@ class Uniform(Sampler):
 
 @DeveloperAPI
 class LogUniform(Sampler):
-    def __init__(self, base: float = 10):
-        self.base = base
-        assert self.base > 0, "Base has to be strictly greater than 0"
+    def __init__(self, base: object = _MISSING):
+        if base is not _MISSING:
+            _warn_for_base()
 
     def __str__(self):
         return "LogUniform"
@@ -185,7 +200,7 @@ class Grid(Sampler):
     def sample(
         self,
         domain: Domain,
-        spec: Optional[Union[List[Dict], Dict]] = None,
+        config: Optional[Union[List[Dict], Dict]] = None,
         size: int = 1,
         random_state: "RandomState" = None,
     ):
@@ -198,7 +213,7 @@ class Float(Domain):
         def sample(
             self,
             domain: "Float",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
@@ -213,7 +228,7 @@ class Float(Domain):
         def sample(
             self,
             domain: "Float",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
@@ -223,17 +238,17 @@ class Float(Domain):
             assert (
                 0 < domain.upper < float("inf")
             ), "LogUniform needs a upper bound greater than 0"
-            logmin = np.log(domain.lower) / np.log(self.base)
-            logmax = np.log(domain.upper) / np.log(self.base)
+            logmin = np.log(domain.lower)
+            logmax = np.log(domain.upper)
 
-            items = self.base ** (random_state.uniform(logmin, logmax, size=size))
+            items = np.exp(random_state.uniform(logmin, logmax, size=size))
             return items if len(items) > 1 else domain.cast(items[0])
 
     class _Normal(Normal):
         def sample(
             self,
             domain: "Float",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
@@ -273,7 +288,9 @@ class Float(Domain):
         new.set_sampler(self._Uniform())
         return new
 
-    def loguniform(self, base: float = 10):
+    def loguniform(self, base: object = _MISSING):
+        if base is not _MISSING:
+            _warn_for_base()
         if not self.lower > 0:
             raise ValueError(
                 "LogUniform requires a lower bound greater than 0."
@@ -289,7 +306,7 @@ class Float(Domain):
                 "instead."
             )
         new = copy(self)
-        new.set_sampler(self._LogUniform(base))
+        new.set_sampler(self._LogUniform())
         return new
 
     def normal(self, mean=0.0, sd=1.0):
@@ -331,7 +348,7 @@ class Integer(Domain):
         def sample(
             self,
             domain: "Integer",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
@@ -344,7 +361,7 @@ class Integer(Domain):
         def sample(
             self,
             domain: "Integer",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
@@ -354,10 +371,10 @@ class Integer(Domain):
             assert (
                 0 < domain.upper < float("inf")
             ), "LogUniform needs a upper bound greater than 0"
-            logmin = np.log(domain.lower) / np.log(self.base)
-            logmax = np.log(domain.upper) / np.log(self.base)
+            logmin = np.log(domain.lower)
+            logmax = np.log(domain.upper)
 
-            items = self.base ** (random_state.uniform(logmin, logmax, size=size))
+            items = np.exp(random_state.uniform(logmin, logmax, size=size))
             items = np.floor(items).astype(int)
             return items if len(items) > 1 else domain.cast(items[0])
 
@@ -380,7 +397,9 @@ class Integer(Domain):
         new.set_sampler(self._Uniform())
         return new
 
-    def loguniform(self, base: float = 10):
+    def loguniform(self, base: object = _MISSING):
+        if base is not _MISSING:
+            _warn_for_base()
         if not self.lower > 0:
             raise ValueError(
                 "LogUniform requires a lower bound greater than 0."
@@ -396,7 +415,7 @@ class Integer(Domain):
                 "instead."
             )
         new = copy(self)
-        new.set_sampler(self._LogUniform(base))
+        new.set_sampler(self._LogUniform())
         return new
 
     def is_valid(self, value: int):
@@ -413,7 +432,7 @@ class Categorical(Domain):
         def sample(
             self,
             domain: "Categorical",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
@@ -459,18 +478,36 @@ class Categorical(Domain):
 @DeveloperAPI
 class Function(Domain):
     class _CallSampler(BaseSampler):
+        def __try_fn(self, domain: "Function", config: Dict[str, Any]):
+            try:
+                return domain.func(config)
+            except (AttributeError, KeyError):
+                from ray.tune.search.variant_generator import _UnresolvedAccessGuard
+
+                r = domain.func(_UnresolvedAccessGuard({"config": config}))
+                logger.warning(
+                    "sample_from functions that take a spec dict are "
+                    "deprecated. Please update your function to work with "
+                    "the config dict directly."
+                )
+                return r
+
         def sample(
             self,
             domain: "Function",
-            spec: Optional[Union[List[Dict], Dict]] = None,
+            config: Optional[Union[List[Dict], Dict]] = None,
             size: int = 1,
             random_state: "RandomState" = None,
         ):
             if not isinstance(random_state, _BackwardsCompatibleNumpyRng):
                 random_state = _BackwardsCompatibleNumpyRng(random_state)
-            if domain.pass_spec:
+            if domain.pass_config:
                 items = [
-                    domain.func(spec[i] if isinstance(spec, list) else spec)
+                    (
+                        self.__try_fn(domain, config[i])
+                        if isinstance(config, list)
+                        else self.__try_fn(domain, config)
+                    )
                     for i in range(size)
                 ]
             else:
@@ -483,13 +520,13 @@ class Function(Domain):
     def __init__(self, func: Callable):
         sig = signature(func)
 
-        pass_spec = True  # whether we should pass `spec` when calling `func`
+        pass_config = True  # whether we should pass `config` when calling `func`
         try:
             sig.bind({})
         except TypeError:
-            pass_spec = False
+            pass_config = False
 
-        if not pass_spec:
+        if not pass_config:
             try:
                 sig.bind()
             except TypeError as exc:
@@ -498,7 +535,7 @@ class Function(Domain):
                     "callable with either 0 or 1 parameters."
                 ) from exc
 
-        self.pass_spec = pass_spec
+        self.pass_config = pass_config
         self.func = func
 
     def is_function(self):
@@ -526,7 +563,7 @@ class Quantized(Sampler):
     def sample(
         self,
         domain: Domain,
-        spec: Optional[Union[List[Dict], Dict]] = None,
+        config: Optional[Union[List[Dict], Dict]] = None,
         size: int = 1,
         random_state: "RandomState" = None,
     ):
@@ -534,13 +571,13 @@ class Quantized(Sampler):
             random_state = _BackwardsCompatibleNumpyRng(random_state)
 
         if self.q == 1:
-            return self.sampler.sample(domain, spec, size, random_state=random_state)
+            return self.sampler.sample(domain, config, size, random_state=random_state)
 
         quantized_domain = copy(domain)
         quantized_domain.lower = np.ceil(domain.lower / self.q) * self.q
         quantized_domain.upper = np.floor(domain.upper / self.q) * self.q
         values = self.sampler.sample(
-            quantized_domain, spec, size, random_state=random_state
+            quantized_domain, config, size, random_state=random_state
         )
         quantized = np.round(np.divide(values, self.q)) * self.q
 
@@ -585,20 +622,21 @@ def quniform(lower: float, upper: float, q: float):
 
 
 @PublicAPI
-def loguniform(lower: float, upper: float, base: float = 10):
+def loguniform(lower: float, upper: float, base: object = _MISSING):
     """Sugar for sampling in different orders of magnitude.
 
     Args:
         lower: Lower boundary of the output interval (e.g. 1e-4)
         upper: Upper boundary of the output interval (e.g. 1e-2)
-        base: Base of the log. Defaults to 10.
 
     """
-    return Float(lower, upper).loguniform(base)
+    if base is not _MISSING:
+        _warn_for_base()
+    return Float(lower, upper).loguniform()
 
 
 @PublicAPI
-def qloguniform(lower: float, upper: float, q: float, base: float = 10):
+def qloguniform(lower: float, upper: float, q: float, base: object = _MISSING):
     """Sugar for sampling in different orders of magnitude.
 
     The value will be quantized, i.e. rounded to an integer increment of ``q``.
@@ -610,10 +648,11 @@ def qloguniform(lower: float, upper: float, q: float, base: float = 10):
         upper: Upper boundary of the output interval (e.g. 1e-2)
         q: Quantization number. The result will be rounded to an
             integer increment of this value.
-        base: Base of the log. Defaults to 10.
 
     """
-    return Float(lower, upper).loguniform(base).quantized(q)
+    if base is not _MISSING:
+        _warn_for_base()
+    return Float(lower, upper).loguniform().quantized(q)
 
 
 @PublicAPI
@@ -646,9 +685,8 @@ def randint(lower: int, upper: int):
 
 
 @PublicAPI
-def lograndint(lower: int, upper: int, base: float = 10):
-    """Sample an integer value log-uniformly between ``lower`` and ``upper``,
-    with ``base`` being the base of logarithm.
+def lograndint(lower: int, upper: int, base: object = _MISSING):
+    """Sample an integer value log-uniformly between ``lower`` and ``upper``.
 
     ``lower`` is inclusive, ``upper`` is exclusive.
 
@@ -658,7 +696,9 @@ def lograndint(lower: int, upper: int, base: float = 10):
         the bounds stated in the docstring above.
 
     """
-    return Integer(lower, upper).loguniform(base)
+    if base is not _MISSING:
+        _warn_for_base()
+    return Integer(lower, upper).loguniform()
 
 
 @PublicAPI
@@ -680,9 +720,8 @@ def qrandint(lower: int, upper: int, q: int = 1):
 
 
 @PublicAPI
-def qlograndint(lower: int, upper: int, q: int, base: float = 10):
-    """Sample an integer value log-uniformly between ``lower`` and ``upper``,
-    with ``base`` being the base of logarithm.
+def qlograndint(lower: int, upper: int, q: int, base: object = _MISSING):
+    """Sample an integer value log-uniformly between ``lower`` and ``upper``.
 
     ``lower`` is inclusive, ``upper`` is also inclusive (!).
 
@@ -695,7 +734,9 @@ def qlograndint(lower: int, upper: int, q: int, base: float = 10):
         the bounds stated in the docstring above.
 
     """
-    return Integer(lower, upper).loguniform(base).quantized(q)
+    if base is not _MISSING:
+        _warn_for_base()
+    return Integer(lower, upper).loguniform().quantized(q)
 
 
 @PublicAPI

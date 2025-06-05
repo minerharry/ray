@@ -14,9 +14,9 @@ import io.ray.runtime.context.NativeWorkerContext;
 import io.ray.runtime.functionmanager.FunctionManager;
 import io.ray.runtime.gcs.GcsClient;
 import io.ray.runtime.gcs.GcsClientOptions;
+import io.ray.runtime.generated.Common.JobConfig;
 import io.ray.runtime.generated.Common.WorkerType;
 import io.ray.runtime.generated.Gcs.GcsNodeInfo;
-import io.ray.runtime.generated.Gcs.JobConfig;
 import io.ray.runtime.object.NativeObjectStore;
 import io.ray.runtime.runner.RunManager;
 import io.ray.runtime.task.NativeTaskExecutor;
@@ -218,7 +218,11 @@ public final class RayNativeRuntime extends AbstractRayRuntime {
     if (gcsClient == null) {
       synchronized (this) {
         if (gcsClient == null) {
-          gcsClient = new GcsClient(rayConfig.getBootstrapAddress(), rayConfig.redisPassword);
+          gcsClient =
+              new GcsClient(
+                  rayConfig.getBootstrapAddress(),
+                  rayConfig.redisUsername,
+                  rayConfig.redisPassword);
         }
       }
     }

@@ -3,18 +3,15 @@ from typing import Any
 from ray.rllib.connectors.connector import (
     AgentConnector,
     ConnectorContext,
-    register_connector,
 )
-from ray.rllib.models.preprocessors import get_preprocessor
+from ray.rllib.connectors.registry import register_connector
+from ray.rllib.models.preprocessors import get_preprocessor, NoPreprocessor
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils.typing import AgentConnectorDataType
-from ray.util.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 
 
-# Bridging between current obs preprocessors and connector.
-# We should not introduce any new preprocessors.
-# TODO(jungong) : migrate and implement preprocessor library in Connector framework.
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class ObsPreprocessorConnector(AgentConnector):
     """A connector that wraps around existing RLlib observation preprocessors.
 
@@ -41,9 +38,13 @@ class ObsPreprocessorConnector(AgentConnector):
             obs_space, ctx.config.get("model", {})
         )
 
+    def is_identity(self):
+        """Returns whether this preprocessor connector is a no-op preprocessor."""
+        return isinstance(self._preprocessor, NoPreprocessor)
+
     def transform(self, ac_data: AgentConnectorDataType) -> AgentConnectorDataType:
         d = ac_data.data
-        assert type(d) == dict, (
+        assert type(d) is dict, (
             "Single agent data must be of type Dict[str, TensorStructType] but is of "
             "type {}".format(type(d))
         )

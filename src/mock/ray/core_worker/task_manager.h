@@ -39,7 +39,8 @@ class MockTaskFinisherInterface : public TaskFinisherInterface {
                rpc::ErrorType error_type,
                const Status *status,
                const rpc::RayErrorInfo *ray_error_info,
-               bool mark_task_object_failed),
+               bool mark_task_object_failed,
+               bool fail_immediately),
               (override));
   MOCK_METHOD(void,
               OnTaskDependenciesInlined,
@@ -47,33 +48,20 @@ class MockTaskFinisherInterface : public TaskFinisherInterface {
                const std::vector<ObjectID> &contained_ids),
               (override));
   MOCK_METHOD(bool, MarkTaskCanceled, (const TaskID &task_id), (override));
-  MOCK_METHOD(absl::optional<TaskSpecification>,
+  MOCK_METHOD(std::optional<TaskSpecification>,
               GetTaskSpec,
               (const TaskID &task_id),
               (const, override));
   MOCK_METHOD(bool,
               RetryTaskIfPossible,
-              (const TaskID &task_id, bool task_failed_due_to_oom),
+              (const TaskID &task_id, const rpc::RayErrorInfo &error_info),
               (override));
   MOCK_METHOD(void, MarkDependenciesResolved, (const TaskID &task_id), (override));
   MOCK_METHOD(void,
               MarkTaskWaitingForExecution,
-              (const TaskID &task_id, const NodeID &node_id),
+              (const TaskID &task_id, const NodeID &node_id, const WorkerID &worker_id),
               (override));
-};
-
-}  // namespace core
-}  // namespace ray
-
-namespace ray {
-namespace core {
-
-class MockTaskResubmissionInterface : public TaskResubmissionInterface {
- public:
-  MOCK_METHOD(bool,
-              ResubmitTask,
-              (const TaskID &task_id, std::vector<ObjectID> *task_deps),
-              (override));
+  MOCK_METHOD(bool, IsTaskPending, (const TaskID &task_id), (const, override));
 };
 
 }  // namespace core

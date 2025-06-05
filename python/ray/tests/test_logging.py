@@ -7,28 +7,49 @@ import tempfile
 import time
 import logging
 from collections import Counter, defaultdict
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Dict, List, Tuple
+from unittest.mock import Mock, MagicMock, patch
 
+import colorama
 import pytest
 
 import ray
 from ray._private import ray_constants
+from ray._private.ray_constants import (
+    PROCESS_TYPE_DASHBOARD,
+    PROCESS_TYPE_DASHBOARD_AGENT,
+    PROCESS_TYPE_GCS_SERVER,
+    PROCESS_TYPE_LOG_MONITOR,
+    PROCESS_TYPE_MONITOR,
+    PROCESS_TYPE_PYTHON_CORE_WORKER,
+    PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER,
+    PROCESS_TYPE_RAYLET,
+    PROCESS_TYPE_RAY_CLIENT_SERVER,
+    PROCESS_TYPE_REAPER,
+    PROCESS_TYPE_REDIS_SERVER,
+    PROCESS_TYPE_RUNTIME_ENV_AGENT,
+    PROCESS_TYPE_WORKER,
+)
 from ray._private.log_monitor import (
     LOG_NAME_UPDATE_INTERVAL_S,
     RAY_LOG_MONITOR_MANY_FILES_THRESHOLD,
     LogFileInfo,
     LogMonitor,
+    is_proc_alive,
 )
 from ray._private.test_utils import (
     get_log_batch,
     get_log_message,
+    get_log_data,
     init_log_pubsub,
     run_string_as_driver,
     wait_for_condition,
 )
 from ray.cross_language import java_actor_class
+from ray.autoscaler._private.cli_logger import cli_logger
+from ray._private.worker import print_worker_logs
 
 
 def set_logging_config(monkeypatch, max_bytes, backup_count):
@@ -79,6 +100,29 @@ def test_reopen_changed_inode(tmp_path):
     assert file_info.file_handle.tell() == orig_file_pos
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Fails on windows")
+def test_deleted_file_does_not_throw_error(tmp_path):
+    filename = tmp_path / "file"
+
+    Path(filename).touch()
+
+    file_info = LogFileInfo(
+        filename=filename,
+        size_when_last_opened=0,
+        file_position=0,
+        file_handle=None,
+        is_err_file=False,
+        job_id=None,
+        worker_pid=None,
+    )
+
+    file_info.reopen_if_necessary()
+
+    os.remove(filename)
+
+    file_info.reopen_if_necessary()
+
+
 def test_log_rotation_config(ray_start_cluster, monkeypatch):
     cluster = ray_start_cluster
     max_bytes = 100
@@ -100,26 +144,89 @@ def test_log_rotation_config(ray_start_cluster, monkeypatch):
     assert config["log_rotation_backup_count"] == 0
 
 
-def test_log_rotation(shutdown_only, monkeypatch):
-    max_bytes = 1
-    backup_count = 3
+def test_log_files_exist(shutdown_only):
+    """Verify all log files exist as specified in
+    https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#logging-directory-structure # noqa
+    """
+    ray.init(num_cpus=1)
+    session_dir = ray._private.worker.global_worker.node.address_info["session_dir"]
+    session_path = Path(session_dir)
+    log_dir_path = session_path / "logs"
+
+    # Run a no-op task to ensure all logs are created.
+    # Use a runtime_env to ensure that the agents are alive.
+    @ray.remote(runtime_env={"env_vars": {"FOO": "BAR"}})
+    def f() -> Tuple[str, int]:
+        return ray.get_runtime_context().get_worker_id(), os.getpid()
+
+    driver_id, driver_pid = (ray.get_runtime_context().get_worker_id(), os.getpid())
+    worker_id, worker_pid = ray.get(f.remote())
+
+    python_core_driver_filename = (
+        PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER + f"-{driver_id}_{driver_pid}"
+    )
+    python_core_worker_filename = (
+        PROCESS_TYPE_PYTHON_CORE_WORKER + f"-{worker_id}_{worker_pid}"
+    )
+    job_id = ray.get_runtime_context().get_job_id()
+    worker_filename = PROCESS_TYPE_WORKER + f"-{worker_id}-{job_id}-{worker_pid}"
+
+    component_to_extensions = [
+        (PROCESS_TYPE_DASHBOARD, [".log", ".out", ".err"]),
+        (PROCESS_TYPE_DASHBOARD_AGENT, [".log"]),
+        (PROCESS_TYPE_GCS_SERVER, [".out", ".err"]),
+        (PROCESS_TYPE_LOG_MONITOR, [".log", ".err"]),
+        (PROCESS_TYPE_MONITOR, [".log", ".out", ".err"]),
+        (PROCESS_TYPE_RAYLET, [".out", ".err"]),
+        (PROCESS_TYPE_RUNTIME_ENV_AGENT, [".log", ".out", ".err"]),
+        (python_core_driver_filename, [".log"]),
+        (python_core_worker_filename, [".log"]),
+        (worker_filename, [".out", ".err"]),
+    ]
+
+    paths = list(log_dir_path.iterdir())
+
+    def _assert_component_logs_exist(
+        paths: List[str], component_name: str, extensions: List[str]
+    ):
+        extensions_to_find = set(extensions)
+        for path in paths:
+            if path.stem != component_name:
+                continue
+
+            if path.suffix in extensions_to_find:
+                extensions_to_find.remove(path.suffix)
+
+        assert len(extensions_to_find) == 0, (
+            f"Missing extensions {(extensions_to_find)} for component '{component_name}'. "
+            f"All paths: {paths}."
+        )
+
+    for (component_name, extensions) in component_to_extensions:
+        _assert_component_logs_exist(paths, component_name, extensions)
+
+
+# Rotation is disable in the unit test.
+def test_log_rotation_disable_rotation_params(shutdown_only, monkeypatch):
+    max_bytes = 0
+    backup_count = 1
     set_logging_config(monkeypatch, max_bytes, backup_count)
     ray.init(num_cpus=1)
     session_dir = ray._private.worker.global_worker.node.address_info["session_dir"]
     session_path = Path(session_dir)
     log_dir_path = session_path / "logs"
 
-    log_rotating_component = [
-        ray_constants.PROCESS_TYPE_DASHBOARD,
-        ray_constants.PROCESS_TYPE_DASHBOARD_AGENT,
-        ray_constants.PROCESS_TYPE_LOG_MONITOR,
-        ray_constants.PROCESS_TYPE_MONITOR,
-        ray_constants.PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER,
-        ray_constants.PROCESS_TYPE_PYTHON_CORE_WORKER,
-        # Below components are not log rotating now.
-        # ray_constants.PROCESS_TYPE_RAYLET,
-        # ray_constants.PROCESS_TYPE_GCS_SERVER,
-        # ray_constants.PROCESS_TYPE_WORKER,
+    # NOTE: There's no PROCESS_TYPE_WORKER because "worker" is a
+    # substring of "python-core-worker".
+    log_rotating_components = [
+        PROCESS_TYPE_DASHBOARD,
+        PROCESS_TYPE_DASHBOARD_AGENT,
+        PROCESS_TYPE_LOG_MONITOR,
+        PROCESS_TYPE_MONITOR,
+        PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER,
+        PROCESS_TYPE_PYTHON_CORE_WORKER,
+        PROCESS_TYPE_RAYLET,
+        PROCESS_TYPE_GCS_SERVER,
     ]
 
     # Run the basic workload.
@@ -131,9 +238,109 @@ def test_log_rotation(shutdown_only, monkeypatch):
     # Create a runtime env to make sure dashboard agent is alive.
     ray.get(f.options(runtime_env={"env_vars": {"A": "a", "B": "b"}}).remote())
 
-    paths = list(log_dir_path.iterdir())
+    # Filter out only paths that end in .log, .log.1, (which is produced by python
+    # rotating log handler) and .out.1 and so on (which is produced by C++ spdlog
+    # rotation handler) . etc. These paths are handled by the logger; the others (.err)
+    # are not.
+    paths = []
+    for path in log_dir_path.iterdir():
+        # Match all rotated files, which suffixes with `log.x` or `log.x.out`.
+        if re.search(r".*\.log(\.\d+)?", str(path)):
+            paths.append(path)
+        elif re.search(r".*\.out(\.\d+)?", str(path)):
+            paths.append(path)
 
     def component_exist(component, paths):
+        """Return whether there's at least one log file path is for the given
+        [component]."""
+        for path in paths:
+            filename = path.stem
+            if component in filename:
+                return True
+        return False
+
+    for component in log_rotating_components:
+        assert component_exist(component, paths), paths
+
+    # Check if the backup count is respected.
+    file_cnts = defaultdict(int)
+    for path in paths:
+        filename = path.name
+        parts = filename.split(".")
+        if len(parts) == 3:
+            filename_without_suffix = parts[0]
+            file_type = parts[1]  # eg. err, log, out
+            file_cnts[f"{filename_without_suffix}.{file_type}"] += 1
+    for filename, file_cnt in file_cnts.items():
+        assert file_cnt == backup_count, (
+            f"{filename} has files that are more than "
+            f"backup count {backup_count}, file count: {file_cnt}"
+        )
+
+    # Test application log, which starts with `worker-`.
+    # Should be tested separately with other components since "worker" is a substring of "python-core-worker".
+    #
+    # Check file count.
+    application_stdout_paths = []
+    for path in paths:
+        if (
+            path.stem.startswith("worker-")
+            and re.search(r".*\.out(\.\d+)?", str(path))
+            and path.stat().st_size > 0
+        ):
+            application_stdout_paths.append(path)
+    assert len(application_stdout_paths) == 1, application_stdout_paths
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Log rotation is disable on windows platform."
+)
+def test_log_rotation(shutdown_only, monkeypatch):
+    max_bytes = 1
+    backup_count = 3
+    set_logging_config(monkeypatch, max_bytes, backup_count)
+    ray.init(num_cpus=1)
+    session_dir = ray._private.worker.global_worker.node.address_info["session_dir"]
+    session_path = Path(session_dir)
+    log_dir_path = session_path / "logs"
+
+    # NOTE: There's no PROCESS_TYPE_WORKER because "worker" is a
+    # substring of "python-core-worker".
+    log_rotating_components = [
+        PROCESS_TYPE_DASHBOARD,
+        PROCESS_TYPE_DASHBOARD_AGENT,
+        PROCESS_TYPE_LOG_MONITOR,
+        PROCESS_TYPE_MONITOR,
+        PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER,
+        PROCESS_TYPE_PYTHON_CORE_WORKER,
+        PROCESS_TYPE_RAYLET,
+        PROCESS_TYPE_GCS_SERVER,
+    ]
+
+    # Run the basic workload.
+    @ray.remote
+    def f():
+        for i in range(10):
+            print(f"test {i}")
+
+    # Create a runtime env to make sure dashboard agent is alive.
+    ray.get(f.options(runtime_env={"env_vars": {"A": "a", "B": "b"}}).remote())
+
+    # Filter out only paths that end in .log, .log.1, (which is produced by python
+    # rotating log handler) and .out.1 and so on (which is produced by C++ spdlog
+    # rotation handler) . etc. These paths are handled by the logger; the others (.err)
+    # are not.
+    paths = []
+    for path in log_dir_path.iterdir():
+        # Match all rotated files, which suffixes with `log.x` or `log.x.out`.
+        if re.search(r".*\.log(\.\d+)?", str(path)):
+            paths.append(path)
+        elif re.search(r".*\.out(\.\d+)?", str(path)):
+            paths.append(path)
+
+    def component_exist(component, paths):
+        """Return whether there's at least one log file path is for the given
+        [component]."""
         for path in paths:
             filename = path.stem
             if component in filename:
@@ -157,7 +364,7 @@ def test_log_rotation(shutdown_only, monkeypatch):
                         found = True
         return True
 
-    for component in log_rotating_component:
+    for component in log_rotating_components:
         assert component_exist(component, paths), paths
         assert component_file_only_one_log_entry(component)
 
@@ -168,12 +375,33 @@ def test_log_rotation(shutdown_only, monkeypatch):
         parts = filename.split(".")
         if len(parts) == 3:
             filename_without_suffix = parts[0]
-            file_cnts[filename_without_suffix] += 1
+            file_type = parts[1]  # eg. err, log, out
+            file_cnts[f"{filename_without_suffix}.{file_type}"] += 1
     for filename, file_cnt in file_cnts.items():
         assert file_cnt <= backup_count, (
             f"{filename} has files that are more than "
             f"backup count {backup_count}, file count: {file_cnt}"
         )
+
+    # Test application log, which starts with `worker-`.
+    # Should be tested separately with other components since "worker" is a substring of "python-core-worker".
+    #
+    # Check file count.
+    application_stdout_paths = []
+    for path in paths:
+        if (
+            path.stem.startswith("worker-")
+            and re.search(r".*\.out(\.\d+)?", str(path))
+            and path.stat().st_size > 0
+        ):
+            application_stdout_paths.append(path)
+    assert len(application_stdout_paths) == 4, application_stdout_paths
+
+    # Check file content, each file should have one line.
+    for cur_path in application_stdout_paths:
+        with cur_path.open() as f:
+            lines = f.readlines()
+            assert len(lines) == 1, lines
 
 
 def test_periodic_event_stats(shutdown_only):
@@ -230,7 +458,7 @@ def test_worker_id_names(shutdown_only):
     ray.get(f.remote())
 
     paths = list(log_dir_path.iterdir())
-
+    worker_log_files = list()
     ids = []
     for path in paths:
         if "python-core-worker" in str(path):
@@ -240,12 +468,13 @@ def test_worker_id_names(shutdown_only):
         else:
             continue
         worker_id = re.match(pattern, str(path)).group(1)
+        worker_log_files.append(str(paths))
         ids.append(worker_id)
     counts = Counter(ids).values()
     for count in counts:
-        # There should be a "python-core-.*.log", "worker-.*.out",
-        # and "worker-.*.err"
-        assert count == 3
+        # For each worker, there should be a "python-core-.*.log", "worker-.*.out",
+        # and "worker-.*.err".
+        assert count == 3, worker_log_files
 
 
 def test_log_pid_with_hex_job_id(ray_start_cluster):
@@ -291,36 +520,32 @@ def test_ignore_windows_access_violation(ray_start_regular_shared):
     p = init_log_pubsub()
     print_after.remote(print_msg.remote())
     msgs = get_log_message(
-        p, num=3, timeout=1, job_id=ray.get_runtime_context().job_id.hex()
+        p, num=6, timeout=10, job_id=ray.get_runtime_context().get_job_id()
     )
 
     assert len(msgs) == 1, msgs
     assert msgs[0][0] == "done"
 
 
-def test_log_redirect_to_stderr(shutdown_only, capfd):
-
+def test_log_redirect_to_stderr(shutdown_only):
     log_components = {
-        ray_constants.PROCESS_TYPE_DASHBOARD: "Dashboard head grpc address",
-        ray_constants.PROCESS_TYPE_DASHBOARD_AGENT: "Dashboard agent grpc address",
-        ray_constants.PROCESS_TYPE_GCS_SERVER: "Loading job table data",
+        PROCESS_TYPE_DASHBOARD: "Starting dashboard metrics server on port",
+        PROCESS_TYPE_DASHBOARD_AGENT: "Dashboard agent grpc address",
+        PROCESS_TYPE_RUNTIME_ENV_AGENT: "Starting runtime env agent",
+        PROCESS_TYPE_GCS_SERVER: "Loading job table data",
         # No log monitor output if all components are writing to stderr.
-        ray_constants.PROCESS_TYPE_LOG_MONITOR: "",
-        ray_constants.PROCESS_TYPE_MONITOR: "Starting monitor using ray installation",
-        ray_constants.PROCESS_TYPE_PYTHON_CORE_WORKER: "worker server started",
-        ray_constants.PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER: "driver server started",
+        PROCESS_TYPE_LOG_MONITOR: "",
+        PROCESS_TYPE_MONITOR: "Starting monitor using ray installation",
+        PROCESS_TYPE_PYTHON_CORE_WORKER: "worker server started",
+        PROCESS_TYPE_PYTHON_CORE_WORKER_DRIVER: "driver server started",
         # TODO(Clark): Add coverage for Ray Client.
-        # ray_constants.PROCESS_TYPE_RAY_CLIENT_SERVER: "Starting Ray Client server",
-        ray_constants.PROCESS_TYPE_RAY_CLIENT_SERVER: "",
-        ray_constants.PROCESS_TYPE_RAYLET: "Starting object store with directory",
+        # PROCESS_TYPE_RAY_CLIENT_SERVER: "Starting Ray Client server",
+        PROCESS_TYPE_RAY_CLIENT_SERVER: "",
+        PROCESS_TYPE_RAYLET: "Starting object store with directory",
         # No reaper process run (kernel fate-sharing).
-        ray_constants.PROCESS_TYPE_REAPER: "",
-        # No reporter process run.
-        ray_constants.PROCESS_TYPE_REPORTER: "",
-        # No web UI process run.
-        ray_constants.PROCESS_TYPE_WEB_UI: "",
+        PROCESS_TYPE_REAPER: "",
         # Unused.
-        ray_constants.PROCESS_TYPE_WORKER: "",
+        PROCESS_TYPE_WORKER: "",
     }
 
     script = """
@@ -356,13 +581,12 @@ assert set(log_component_names).isdisjoint(set(paths)), paths
 
     # Make sure that the expected startup log records for each of the
     # components appears in the stderr stream.
-    # stderr = capfd.readouterr().err
     for component, canonical_record in log_components.items():
         if not canonical_record:
             # Process not run or doesn't generate logs; skip.
             continue
         assert canonical_record in stderr, stderr
-        if component == ray_constants.PROCESS_TYPE_REDIS_SERVER:
+        if component == PROCESS_TYPE_REDIS_SERVER:
             # Redis doesn't expose hooks for custom log formats, so we aren't able to
             # inject the Redis server component name into the log records.
             continue
@@ -370,6 +594,15 @@ assert set(log_component_names).isdisjoint(set(paths)), paths
         # parentheses since some components, like the core driver and worker, add a
         # unique ID suffix.
         assert f"({component}" in stderr, stderr
+
+
+def test_custom_logging_format(shutdown_only):
+    script = """
+import ray
+ray.init(logging_format='custom logging format - %(message)s')
+"""
+    stderr = run_string_as_driver(script)
+    assert "custom logging format - " in stderr
 
 
 def test_segfault_stack_trace(ray_start_cluster, capsys):
@@ -441,25 +674,31 @@ def create_file(dir, filename, content):
     f.write_text(content)
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Failing on Windows",
-)
-def test_log_monitor(tmp_path):
+@pytest.fixture
+def live_dead_pids():
+    p1 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(6000)"])
+    p2 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(6000)"])
+    p2.kill()
+    # avoid zombie processes
+    p2.wait()
+    yield p1.pid, p2.pid
+    p1.kill()
+    p1.wait()
+
+
+def test_log_monitor(tmp_path, live_dead_pids):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     # Create an old dir.
     (log_dir / "old").mkdir()
     worker_id = "6df6d5dd8ca5215658e4a8f9a569a9d98e27094f9cc35a4ca43d272c"
     job_id = "01000000"
-    dead_pid = "47660"
-    alive_pid = "12345"
-
-    def proc_alive(pid):
-        return pid != int(dead_pid)
+    alive_pid, dead_pid = live_dead_pids
 
     mock_publisher = MagicMock()
-    log_monitor = LogMonitor(str(log_dir), mock_publisher, proc_alive, max_files_open=5)
+    log_monitor = LogMonitor(
+        "127.0.0.1", str(log_dir), mock_publisher, is_proc_alive, max_files_open=5
+    )
 
     # files
     worker_out_log_file = f"worker-{worker_id}-{job_id}-{dead_pid}.out"
@@ -523,8 +762,8 @@ def test_log_monitor(tmp_path):
     assert not worker_out_log_file_info.is_err_file
     assert worker_err_log_file_info.is_err_file
 
-    assert worker_out_log_file_info.job_id == job_id
-    assert worker_err_log_file_info.job_id == job_id
+    assert worker_out_log_file_info.job_id is None
+    assert worker_err_log_file_info.job_id is None
     assert worker_out_log_file_info.worker_pid == int(dead_pid)
     assert worker_out_log_file_info.worker_pid == int(dead_pid)
 
@@ -604,11 +843,35 @@ def test_log_monitor(tmp_path):
     assert len(list((log_dir / "old").iterdir())) == 2
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Failing on Windows",
-)
-def test_log_monitor_actor_task_name(tmp_path):
+def test_tpu_logs(tmp_path):
+    # Create the log directories. tpu_logs would be a symlink to the
+    # /tmp/tpu_logs directory created in Node _init_temp.
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    tpu_log_dir = log_dir / "tpu_logs"
+    tpu_log_dir.mkdir()
+    # Create TPU device log file in tpu_logs directory.
+    tpu_device_log_file = "tpu-device.log"
+    first_line = "First line\n"
+    create_file(tpu_log_dir, tpu_device_log_file, first_line)
+
+    mock_publisher = MagicMock()
+    log_monitor = LogMonitor(
+        "127.0.0.1",
+        str(log_dir),
+        mock_publisher,
+        is_proc_alive,
+        max_files_open=5,
+    )
+    # Verify TPU logs are ingested by LogMonitor.
+    log_monitor.update_log_filenames()
+    log_monitor.open_closed_files()
+    assert len(log_monitor.open_file_infos) == 1
+    file_info = log_monitor.open_file_infos[0]
+    assert Path(file_info.filename) == tpu_log_dir / tpu_device_log_file
+
+
+def test_log_monitor_actor_task_name_and_job_id(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     worker_id = "6df6d5dd8ca5215658e4a8f9a569a9d98e27094f9cc35a4ca43d272c"
@@ -617,7 +880,7 @@ def test_log_monitor_actor_task_name(tmp_path):
 
     mock_publisher = MagicMock()
     log_monitor = LogMonitor(
-        str(log_dir), mock_publisher, lambda _: True, max_files_open=5
+        "127.0.0.1", str(log_dir), mock_publisher, lambda _: True, max_files_open=5
     )
     worker_out_log_file = f"worker-{worker_id}-{job_id}-{pid}.out"
     first_line = "First line\n"
@@ -669,6 +932,26 @@ def test_log_monitor_actor_task_name(tmp_path):
         }
     )
 
+    # Test the job_id is updated.
+    job_id = "01000000"
+    with open(file_info.filename, "a") as f:
+        # Write 150 more lines.
+        f.write(f"{ray_constants.LOG_PREFIX_JOB_ID}{job_id}\n")
+        f.write("line2")
+    log_monitor.check_log_files_and_publish_updates()
+    assert file_info.job_id == job_id
+    mock_publisher.publish_logs.assert_any_call(
+        {
+            "ip": log_monitor.ip,
+            "pid": file_info.worker_pid,
+            "job": file_info.job_id,
+            "is_err": file_info.is_err_file,
+            "lines": ["line2"],
+            "actor_name": actor_name,
+            "task_name": None,
+        }
+    )
+
 
 @pytest.fixture
 def mock_timer():
@@ -678,16 +961,12 @@ def mock_timer():
     time.time = f
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="Failing on Windows",
-)
 def test_log_monitor_update_backpressure(tmp_path, mock_timer):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     mock_publisher = MagicMock()
     log_monitor = LogMonitor(
-        str(log_dir), mock_publisher, lambda _: True, max_files_open=5
+        "127.0.0.1", str(log_dir), mock_publisher, lambda _: True, max_files_open=5
     )
 
     current = 0
@@ -711,16 +990,16 @@ def test_log_monitor_update_backpressure(tmp_path, mock_timer):
     assert log_monitor.should_update_filenames(current)
 
 
-def test_repr_inheritance():
+def test_repr_inheritance(shutdown_only):
     """Tests that a subclass's repr is used in logging."""
     logger = logging.getLogger(__name__)
 
     class MyClass:
         def __repr__(self) -> str:
-            return "ThisIsMyCustomActorName"
+            return "ThisIsMyCustomActorName" + ray_constants.TESTING_NEVER_DEDUP_TOKEN
 
         def do(self):
-            logger.warning("text")
+            logger.warning("text" + ray_constants.TESTING_NEVER_DEDUP_TOKEN)
 
     class MySubclass(MyClass):
         pass
@@ -750,13 +1029,227 @@ def test_repr_inheritance():
         assert "ThisIsMyCustomActorName" in f2 and "MySubclass" not in f2
 
 
-if __name__ == "__main__":
-    import sys
+def test_ray_does_not_break_makeRecord():
+    """Importing Ray used to cause `logging.makeRecord` to use the default record
+    factory, rather than the factory set by `logging.setRecordFactory`.
 
+    This tests validates that this bug is fixed.
+    """
+    # Make a call with the cli logger to be sure that invoking the
+    # cli logger does not mess up logging.makeRecord.
+    with redirect_stdout(None):
+        cli_logger.info("Cli logger invoked.")
+
+    mockRecordFactory = Mock()
+    try:
+        logging.setLogRecordFactory(mockRecordFactory)
+        # makeRecord needs 7 positional args. What the args are isn't consequential.
+        makeRecord_args = [None] * 7
+        logging.Logger("").makeRecord(*makeRecord_args)
+        # makeRecord called the expected factory.
+        mockRecordFactory.assert_called_once()
+    finally:
+        # Set it back to the default factory.
+        logging.setLogRecordFactory(logging.LogRecord)
+
+
+@pytest.mark.parametrize(
+    "logger_name,logger_level",
+    (
+        ("ray", logging.INFO),
+        ("ray.air", logging.INFO),
+        ("ray.data", logging.INFO),
+        ("ray.rllib", logging.WARNING),
+        ("ray.serve", logging.INFO),
+        ("ray.train", logging.INFO),
+        ("ray.tune", logging.INFO),
+        ("ray.workflow", logging.INFO),
+    ),
+)
+@pytest.mark.parametrize(
+    "test_level",
+    (
+        logging.NOTSET,
+        logging.DEBUG,
+        logging.INFO,
+        logging.WARNING,
+        logging.ERROR,
+        logging.CRITICAL,
+    ),
+)
+def test_log_level_settings(
+    propagate_logs, caplog, logger_name, logger_level, test_level
+):
+    """Test that logs of lower level than the ray subpackage is
+    configured for are rejected.
+    """
+    logger = logging.getLogger(logger_name)
+
+    logger.log(test_level, "Test!")
+
+    if test_level >= logger_level:
+        assert caplog.records, "Log message missing where one is expected."
+        assert caplog.records[-1].levelno == test_level, "Log message level mismatch."
+    else:
+        assert len(caplog.records) == 0, "Log message found where none are expected."
+
+
+def test_log_with_import():
+    logger = logging.getLogger(__name__)
+    assert not logger.disabled
+    ray.log.logger_initialized = False
+    ray.log.generate_logging_config()
+    assert not logger.disabled
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Only works on linux.")
+def test_log_monitor_ip_correct(ray_start_cluster):
+    cluster = ray_start_cluster
+    # add first node
+    cluster.add_node(
+        node_ip_address="127.0.0.2",
+        resources={"pin_task": 1},
+    )
+    address = cluster.address
+    ray.init(address)
+    # add second node
+    cluster.add_node(node_ip_address="127.0.0.3")
+
+    @ray.remote(resources={"pin_task": 1})
+    def print_msg():
+        print("abc")
+
+    p = init_log_pubsub()
+    ray.get(print_msg.remote())
+    data = get_log_data(
+        p, num=6, timeout=10, job_id=ray.get_runtime_context().get_job_id()
+    )
+    assert data[0]["ip"] == "127.0.0.2"
+
+
+def get_print_worker_logs_output(data: Dict[str, str]) -> str:
+    """
+    Helper function that returns the output of `print_worker_logs` as a str.
+    """
+    out = io.StringIO()
+    print_worker_logs(data, out)
+    out.seek(0)
+    return out.readline()
+
+
+def test_print_worker_logs_default_color() -> None:
+    # Test multiple since pid may affect color
+    for pid in (0, 1):
+        data = dict(
+            ip="10.0.0.1",
+            localhost="172.0.0.1",
+            pid=str(pid),
+            task_name="my_task",
+            lines=["is running"],
+        )
+        output = get_print_worker_logs_output(data)
+        assert output == (
+            f"{colorama.Fore.CYAN}(my_task pid={pid}, ip=10.0.0.1)"
+            + f"{colorama.Style.RESET_ALL} is running\n"
+        )
+
+    # Special case
+    raylet = dict(
+        ip="10.0.0.1",
+        localhost="172.0.0.1",
+        pid="raylet",
+        task_name="my_task",
+        lines=["Warning: uh oh"],
+    )
+    output = get_print_worker_logs_output(raylet)
+    assert output == (
+        f"{colorama.Fore.YELLOW}(raylet, ip=10.0.0.1){colorama.Style.RESET_ALL} "
+        + "Warning: uh oh\n"
+    )
+
+
+@patch.dict(os.environ, {"RAY_COLOR_PREFIX": "0"})
+def test_print_worker_logs_no_color() -> None:
+    for pid in (0, 1):
+        data = dict(
+            ip="10.0.0.1",
+            localhost="172.0.0.1",
+            pid=str(pid),
+            task_name="my_task",
+            lines=["is running"],
+        )
+        output = get_print_worker_logs_output(data)
+        assert output == f"(my_task pid={pid}, ip=10.0.0.1) is running\n"
+
+    raylet = dict(
+        ip="10.0.0.1",
+        localhost="172.0.0.1",
+        pid="raylet",
+        task_name="my_task",
+        lines=["Warning: uh oh"],
+    )
+    output = get_print_worker_logs_output(raylet)
+    assert output == "(raylet, ip=10.0.0.1) Warning: uh oh\n"
+
+
+@patch.dict(os.environ, {"RAY_COLOR_PREFIX": "1"})
+def test_print_worker_logs_multi_color() -> None:
+    data_pid_0 = dict(
+        ip="10.0.0.1",
+        localhost="172.0.0.1",
+        pid="0",
+        task_name="my_task",
+        lines=["is running"],
+    )
+    output = get_print_worker_logs_output(data_pid_0)
+    assert output == (
+        f"{colorama.Fore.MAGENTA}(my_task pid=0, ip=10.0.0.1)"
+        + f"{colorama.Style.RESET_ALL} is running\n"
+    )
+
+    data_pid_2 = dict(
+        ip="10.0.0.1",
+        localhost="172.0.0.1",
+        pid="2",
+        task_name="my_task",
+        lines=["is running"],
+    )
+    output = get_print_worker_logs_output(data_pid_2)
+    assert output == (
+        f"{colorama.Fore.GREEN}(my_task pid=2, ip=10.0.0.1){colorama.Style.RESET_ALL} "
+        + "is running\n"
+    )
+
+
+class TestSetupLogRecordFactory:
+    def test_setup_log_record_factory_directly(self):
+        # Reset the log record factory to the default.
+        logging.setLogRecordFactory(logging.LogRecord)
+        record_old = logging.makeLogRecord({})
+
+        # Set up the log record factory with _setup_log_record_factory().
+        ray.log._setup_log_record_factory()
+        record_new = logging.makeLogRecord({})
+
+        assert "_ray_timestamp_ns" not in record_old.__dict__
+        assert "_ray_timestamp_ns" in record_new.__dict__
+
+    def test_setup_log_record_factory_in_generate_logging_config(self):
+        # Reset the log record factory to the default.
+        logging.setLogRecordFactory(logging.LogRecord)
+        record_old = logging.makeLogRecord({})
+
+        # generate_logging_config() also setup the log record factory.
+        ray.log.logger_initialized = False
+        ray.log.generate_logging_config()
+        record_new = logging.makeLogRecord({})
+
+        assert "_ray_timestamp_ns" not in record_old.__dict__
+        assert "_ray_timestamp_ns" in record_new.__dict__
+
+
+if __name__ == "__main__":
     # Make subprocess happy in bazel.
     os.environ["LC_ALL"] = "en_US.UTF-8"
     os.environ["LANG"] = "en_US.UTF-8"
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

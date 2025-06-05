@@ -1,5 +1,5 @@
 from functools import partial
-from gym.spaces import Box, Dict, Discrete, Tuple
+from gymnasium.spaces import Box, Dict, Discrete, Tuple
 import numpy as np
 import unittest
 
@@ -143,9 +143,6 @@ class TestModelCatalog(unittest.TestCase):
                 img_input_case,
                 flat_complex_input_case,
                 nested_complex_input_case,
-            ],
-            "jax": [
-                flat_input_case,
             ],
         }
 

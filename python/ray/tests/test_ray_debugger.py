@@ -1,11 +1,13 @@
 import json
 import os
-import platform
 import subprocess
 import sys
-from telnetlib import Telnet
-
+import unittest
 import pexpect
+from pexpect.popen_spawn import PopenSpawn
+from telnetlib import Telnet
+from typing import Union
+
 import pytest
 
 import ray
@@ -14,8 +16,18 @@ from ray._private.test_utils import run_string_as_driver, wait_for_condition
 from ray.cluster_utils import Cluster, cluster_not_supported
 
 
+def _pexpect_spawn(cmd: str) -> Union["pexpect.spawn", PopenSpawn]:
+    """Handles compatibility for pexpect on Windows."""
+    if sys.platform == "win32":
+        p = PopenSpawn(cmd, encoding="utf-8")
+    else:
+        p = pexpect.spawn(cmd)
+
+    return p
+
+
 def test_ray_debugger_breakpoint(shutdown_only):
-    ray.init(num_cpus=1)
+    ray.init(num_cpus=1, runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
 
     @ray.remote
     def f():
@@ -53,9 +65,8 @@ def test_ray_debugger_breakpoint(shutdown_only):
     ray.get(result)
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="Failing on Windows.")
 def test_ray_debugger_commands(shutdown_only):
-    ray.init(num_cpus=2)
+    ray.init(num_cpus=2, runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
 
     @ray.remote
     def f():
@@ -76,7 +87,7 @@ def test_ray_debugger_commands(shutdown_only):
 
     # Make sure that calling "continue" in the debugger
     # gives back control to the debugger loop:
-    p = pexpect.spawn("ray debug")
+    p = _pexpect_spawn("ray debug")
     p.expect("Enter breakpoint index or press enter to refresh: ")
     p.sendline("0")
     p.expect("-> ray.util.pdb.set_trace()")
@@ -93,9 +104,9 @@ def test_ray_debugger_commands(shutdown_only):
     ray.get([result1, result2])
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="Failing on Windows.")
 def test_ray_debugger_stepping(shutdown_only):
-    ray.init(num_cpus=1)
+    os.environ["RAY_DEBUG"] = "legacy"
+    ray.init(num_cpus=1, runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
 
     @ray.remote
     def g():
@@ -109,7 +120,16 @@ def test_ray_debugger_stepping(shutdown_only):
 
     result = f.remote()
 
-    p = pexpect.spawn("ray debug")
+    wait_for_condition(
+        lambda: len(
+            ray.experimental.internal_kv._internal_kv_list(
+                "RAY_PDB_", namespace=ray_constants.KV_NAMESPACE_PDB
+            )
+        )
+        > 0
+    )
+
+    p = _pexpect_spawn("ray debug")
     p.expect("Enter breakpoint index or press enter to refresh: ")
     p.sendline("0")
     p.expect("-> x = g.remote()")
@@ -123,9 +143,9 @@ def test_ray_debugger_stepping(shutdown_only):
     ray.get(result)
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="Failing on Windows.")
 def test_ray_debugger_recursive(shutdown_only):
-    ray.init(num_cpus=1)
+    os.environ["RAY_DEBUG"] = "legacy"
+    ray.init(num_cpus=1, runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
 
     @ray.remote
     def fact(n):
@@ -137,7 +157,16 @@ def test_ray_debugger_recursive(shutdown_only):
 
     result = fact.remote(5)
 
-    p = pexpect.spawn("ray debug")
+    wait_for_condition(
+        lambda: len(
+            ray.experimental.internal_kv._internal_kv_list(
+                "RAY_PDB_", namespace=ray_constants.KV_NAMESPACE_PDB
+            )
+        )
+        > 0
+    )
+
+    p = _pexpect_spawn("ray debug")
     p.expect("Enter breakpoint index or press enter to refresh: ")
     p.sendline("0")
     p.expect("(Pdb)")
@@ -156,7 +185,6 @@ def test_ray_debugger_recursive(shutdown_only):
     ray.get(result)
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="Failing on Windows.")
 def test_job_exit_cleanup(ray_start_regular):
     address = ray_start_regular["address"]
 
@@ -164,7 +192,7 @@ def test_job_exit_cleanup(ray_start_regular):
 import time
 
 import ray
-ray.init(address="{}")
+ray.init(address="{}", runtime_env={{"env_vars": {{"RAY_DEBUG": "legacy"}}}})
 
 @ray.remote
 def f():
@@ -196,7 +224,7 @@ time.sleep(5)
 
     # Start the debugger. This should clean up any existing sessions that
     # belong to dead jobs.
-    p = pexpect.spawn("ray debug")  # noqa:F841
+    _ = _pexpect_spawn("ray debug")
 
     def no_active_sessions():
         return not len(
@@ -208,7 +236,9 @@ time.sleep(5)
     wait_for_condition(no_active_sessions)
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="Failing on Windows.")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not print '--address' on init"
+)
 @pytest.mark.parametrize("ray_debugger_external", [False, True])
 def test_ray_debugger_public(shutdown_only, call_ray_stop_only, ray_debugger_external):
     redis_substring_prefix = "--address='"
@@ -224,7 +254,7 @@ def test_ray_debugger_public(shutdown_only, call_ray_stop_only, ray_debugger_ext
     address = out[address_location:]
     address = address.split("'")[0]
 
-    ray.init(address=address)
+    ray.init(address=address, runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
 
     @ray.remote
     def f():
@@ -271,7 +301,7 @@ def test_ray_debugger_public(shutdown_only, call_ray_stop_only, ray_debugger_ext
 def test_ray_debugger_public_multi_node(shutdown_only, ray_debugger_external):
     c = Cluster(
         initialize_head=True,
-        connect=True,
+        connect=False,
         head_node_args={
             "num_cpus": 0,
             "num_gpus": 1,
@@ -279,6 +309,8 @@ def test_ray_debugger_public_multi_node(shutdown_only, ray_debugger_external):
         },
     )
     c.add_node(num_cpus=1, ray_debugger_external=ray_debugger_external)
+
+    ray.init(runtime_env={"env_vars": {"RAY_DEBUG": "legacy"}})
 
     @ray.remote
     def f():
@@ -338,13 +370,26 @@ def test_ray_debugger_public_multi_node(shutdown_only, ray_debugger_external):
     ray.get([head_node_result, worker_node_result])
 
 
-if __name__ == "__main__":
-    import pytest
+def test_env_var_enables_ray_debugger():
+    with unittest.mock.patch.dict(os.environ):
+        os.environ["RAY_DEBUG_POST_MORTEM"] = "1"
+        assert ray.util.pdb._is_ray_debugger_post_mortem_enabled(), (
+            "Expected post-mortem Debugger to be enabled when "
+            "RAY_DEBUG_POST_MORTEM env var is present."
+        )
 
+    with unittest.mock.patch.dict(os.environ):
+        if "RAY_DEBUG_POST_MORTEM" in os.environ:
+            del os.environ["RAY_DEBUG_POST_MORTEM"]
+
+        assert not ray.util.pdb._is_ray_debugger_post_mortem_enabled(), (
+            "Expected post-mortem Debugger to be disabled when "
+            "RAY_DEBUG_POST_MORTEM env var is absent."
+        )
+
+
+if __name__ == "__main__":
     # Make subprocess happy in bazel.
     os.environ["LC_ALL"] = "en_US.UTF-8"
     os.environ["LANG"] = "en_US.UTF-8"
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

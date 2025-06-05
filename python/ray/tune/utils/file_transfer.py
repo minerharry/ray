@@ -3,14 +3,12 @@ import io
 import os
 import shutil
 import tarfile
-
-from typing import Optional, Tuple, Dict, Generator, Union, List
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import ray
-from ray.util.annotations import DeveloperAPI
 from ray.air._internal.filelock import TempFileLock
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
+from ray.air.util.node import _force_on_node, _get_node_id_from_node_ip
+from ray.util.annotations import DeveloperAPI
 
 _DEFAULT_CHUNK_SIZE_BYTES = 500 * 1024 * 1024  # 500 MiB
 _DEFAULT_MAX_SIZE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
@@ -114,11 +112,10 @@ def _sync_dir_on_same_node(
         None, or future of the copy task.
 
     """
-    copy_on_node = _remote_copy_dir.options(
-        num_cpus=0,
-        resources={f"node:{ip}": 0.01},
-        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=None),
-    )
+
+    node_id = _get_node_id_from_node_ip(ip)
+
+    copy_on_node = _remote_copy_dir.options(num_cpus=0, **_force_on_node(node_id))
     copy_future = copy_on_node.remote(
         source_dir=source_path, target_dir=target_path, exclude=exclude
     )
@@ -165,24 +162,22 @@ def _sync_dir_between_different_nodes(
         None, or Tuple of unpack future, pack actor, and files_stats future.
 
     """
+
+    source_node_id = _get_node_id_from_node_ip(source_ip)
+    target_node_id = _get_node_id_from_node_ip(target_ip)
+
     pack_actor_on_source_node = _PackActor.options(
-        num_cpus=0,
-        resources={f"node:{source_ip}": 0.01},
-        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=None),
+        num_cpus=0, **_force_on_node(source_node_id)
     )
     unpack_on_target_node = _unpack_from_actor.options(
-        num_cpus=0,
-        resources={f"node:{target_ip}": 0.01},
-        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=None),
+        num_cpus=0, **_force_on_node(target_node_id)
     )
 
     if force_all:
         files_stats = None
     else:
         files_stats = _remote_get_recursive_files_and_stats.options(
-            num_cpus=0,
-            resources={f"node:{target_ip}": 0.01},
-            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=None),
+            num_cpus=0, **_force_on_node(target_node_id)
         ).remote(target_path)
 
     pack_actor = pack_actor_on_source_node.remote(
@@ -198,36 +193,6 @@ def _sync_dir_between_different_nodes(
         return unpack_future, pack_actor, files_stats
 
     return ray.get(unpack_future)
-
-
-@DeveloperAPI
-def delete_on_node(
-    node_ip: str, path: str, return_future: bool = False
-) -> Union[bool, ray.ObjectRef]:
-    """Delete path on node.
-
-    Args:
-        node_ip: IP of node to delete path on.
-        path: Path to delete on remote node.
-        return_future: If True, returns the delete future. Otherwise, blocks until
-            the task finished and returns True if the path was deleted or False if not
-            (e.g. if the path does not exist on the remote node).
-
-    Returns:
-        Boolean indicating if deletion succeeded, or Ray future
-        for scheduled delete task.
-    """
-    delete_task = _remote_delete_path.options(
-        num_cpus=0,
-        resources={f"node:{node_ip}": 0.01},
-        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=None),
-    )
-    future = delete_task.remote(path)
-
-    if return_future:
-        return future
-
-    return ray.get(future)
 
 
 def _get_recursive_files_and_stats(path: str) -> Dict[str, Tuple[float, int]]:
@@ -466,7 +431,7 @@ def _copy_dir(
         with TempFileLock(f"{target_dir}.lock", timeout=0):
             _delete_path_unsafe(target_dir)
 
-            _ignore = None
+            _ignore_func = None
             if exclude:
 
                 def _ignore(path, names):
@@ -480,7 +445,9 @@ def _copy_dir(
                                 break
                     return ignored_names
 
-            shutil.copytree(source_dir, target_dir, ignore=_ignore)
+                _ignore_func = _ignore
+
+            shutil.copytree(source_dir, target_dir, ignore=_ignore_func)
     except TimeoutError:
         # wait, but do not do anything
         with TempFileLock(f"{target_dir}.lock"):
@@ -503,13 +470,6 @@ def _copy_dir(
 _remote_copy_dir = ray.remote(_copy_dir)
 
 
-def _delete_path(target_path: str) -> bool:
-    """Delete path (files and directories)"""
-    target_path = os.path.normpath(target_path)
-    with TempFileLock(f"{target_path}.lock"):
-        return _delete_path_unsafe(target_path)
-
-
 def _delete_path_unsafe(target_path: str):
     """Delete path (files and directories). No filelock."""
     if os.path.exists(target_path):
@@ -519,7 +479,3 @@ def _delete_path_unsafe(target_path: str):
             os.remove(target_path)
         return True
     return False
-
-
-# Only export once
-_remote_delete_path = ray.remote(_delete_path)

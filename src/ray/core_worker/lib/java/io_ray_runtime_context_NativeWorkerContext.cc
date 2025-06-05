@@ -16,7 +16,9 @@
 
 #include <jni.h>
 
-#include "jni_utils.h"
+#include <string>
+
+#include "jni_utils.h"  // NOLINT(build/include_subdir)
 #include "ray/common/id.h"
 #include "ray/core_worker/context.h"
 #include "ray/core_worker/core_worker.h"
@@ -41,12 +43,12 @@ Java_io_ray_runtime_context_NativeWorkerContext_nativeGetCurrentTaskId(JNIEnv *e
   return IdToJavaByteBuffer<TaskID>(env, task_id);
 }
 
-JNIEXPORT jobject JNICALL
+JNIEXPORT jbyteArray JNICALL
 Java_io_ray_runtime_context_NativeWorkerContext_nativeGetCurrentJobId(JNIEnv *env,
                                                                       jclass) {
-  const auto &job_id =
+  const auto job_id =
       CoreWorkerProcess::GetCoreWorker().GetWorkerContext().GetCurrentJobID();
-  return IdToJavaByteBuffer<JobID>(env, job_id);
+  return IdToJavaByteArray<JobID>(env, job_id);
 }
 
 JNIEXPORT jobject JNICALL

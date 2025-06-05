@@ -1,5 +1,5 @@
-import gym
-from gym.spaces import Box, Discrete
+import gymnasium as gym
+from gymnasium.spaces import Box, Discrete
 import numpy as np
 import tree  # pip install dm_tree
 from typing import Dict, List, Optional
@@ -79,13 +79,13 @@ class SACTorchModel(TorchModelV2, nn.Module):
             self.discrete = True
             action_outs = q_outs = self.action_dim
         elif isinstance(action_space, Box):
-            self.action_dim = np.product(action_space.shape)
+            self.action_dim = np.prod(action_space.shape)
             self.discrete = False
             action_outs = 2 * self.action_dim
             q_outs = 1
         else:
             assert isinstance(action_space, Simplex)
-            self.action_dim = np.product(action_space.shape)
+            self.action_dim = np.prod(action_space.shape)
             self.discrete = False
             action_outs = self.action_dim
             q_outs = 1

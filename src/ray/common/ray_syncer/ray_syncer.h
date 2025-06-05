@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #pragma once
+
 #include <grpcpp/server.h>
 #include <gtest/gtest_prod.h>
 
@@ -22,21 +23,15 @@
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/asio/periodical_runner.h"
 #include "ray/common/id.h"
+#include "ray/common/ray_syncer/common.h"
 #include "src/ray/protobuf/ray_syncer.grpc.pb.h"
 
-namespace ray {
-namespace syncer {
+namespace ray::syncer {
 
-using ray::rpc::syncer::DummyRequest;
-using ray::rpc::syncer::DummyResponse;
+using ray::rpc::syncer::CommandsSyncMessage;
 using ray::rpc::syncer::MessageType;
 using ray::rpc::syncer::RaySyncMessage;
-using ray::rpc::syncer::RaySyncMessages;
-using ray::rpc::syncer::StartSyncRequest;
-using ray::rpc::syncer::StartSyncResponse;
-
-static constexpr size_t kComponentArraySize =
-    static_cast<size_t>(ray::rpc::syncer::MessageType_ARRAYSIZE);
+using ray::rpc::syncer::ResourceViewSyncMessage;
 
 /// The interface for a reporter. Reporter is defined to be a local module which would
 /// like to let the other nodes know its state. For example, local cluster resource
@@ -73,7 +68,7 @@ struct ReceiverInterface {
 
 // Forward declaration of internal structures
 class NodeState;
-class NodeSyncConnection;
+class RaySyncerBidiReactor;
 
 /// RaySyncer is an embedding service for component synchronization.
 /// All operations in this class needs to be finished GetIOContext()
@@ -81,9 +76,9 @@ class NodeSyncConnection;
 /// RaySyncer is the control plane to make sure all connections eventually
 /// have the latest view of the cluster components registered.
 /// RaySyncer has two components:
-///    1. NodeSyncConnection: keeps track of the sending and receiving information
+///    1. RaySyncerBidiReactor: keeps track of the sending and receiving information
 ///       and make sure not sending the information the remote node knows.
-///    2. NodeState: keeps track of the local status, similar to NodeSyncConnection,
+///    2. NodeState: keeps track of the local status, similar to RaySyncerBidiReactor,
 //        but it's for local node.
 class RaySyncer {
  public:
@@ -91,24 +86,31 @@ class RaySyncer {
   ///
   /// \param io_context The io context for this component.
   /// \param node_id The id of current node.
-  RaySyncer(instrumented_io_context &io_context, const std::string &node_id);
+  /// \param on_rpc_completion A callback which invokes after a sync rpc succeeds.
+  RaySyncer(instrumented_io_context &io_context,
+            const std::string &node_id,
+            RpcCompletionCallback on_rpc_completion = {});
   ~RaySyncer();
 
   /// Connect to a node.
   /// TODO (iycheng): Introduce grpc channel pool and use node_id
   /// for the connection.
   ///
-  /// \param connection The connection to the remote node.
-  void Connect(std::unique_ptr<NodeSyncConnection> connection);
-
-  /// Connect to a node.
-  /// TODO (iycheng): Introduce grpc channel pool and use node_id
-  /// for the connection.
-  ///
-  /// \param connection The connection to the remote node.
-  void Connect(std::shared_ptr<grpc::Channel> channel);
+  /// \param node_id The id of the node connect to.
+  /// \param channel The gRPC channel.
+  void Connect(const std::string &node_id, std::shared_ptr<grpc::Channel> channel);
 
   void Disconnect(const std::string &node_id);
+
+  /// Get the latest sync message sent from a specific node.
+  ///
+  /// \param node_id The node id where the message comes from.
+  /// \param message_type The message type of the component.
+  ///
+  /// \return The latest sync message sent from the node. If the node doesn't
+  /// have one, nullptr will be returned.
+  std::shared_ptr<const RaySyncMessage> GetSyncMessage(const std::string &node_id,
+                                                       MessageType message_type) const;
 
   /// Register the components to the syncer module. Syncer will make sure eventually
   /// it'll have a global view of the cluster.
@@ -121,7 +123,7 @@ class RaySyncer {
   /// \param pull_from_reporter_interval_ms The frequence to pull a message. 0 means
   /// never pull a message in syncer.
   /// from reporter and push it to sending queue.
-  bool Register(MessageType message_type,
+  void Register(MessageType message_type,
                 const ReporterInterface *reporter,
                 ReceiverInterface *receiver,
                 int64_t pull_from_reporter_interval_ms = 100);
@@ -137,36 +139,22 @@ class RaySyncer {
   /// version of message, false will be returned.
   bool OnDemandBroadcasting(MessageType message_type);
 
-  /// Request trigger a broadcasting for a constructed message immediately instead of
-  /// waiting for ray syncer to poll the message.
-  ///
-  /// \param message The message to be broadcasted.
-  void BroadcastRaySyncMessage(std::shared_ptr<const RaySyncMessage> message);
-
- private:
-  /// Get the io_context used by RaySyncer.
-  instrumented_io_context &GetIOContext() { return io_context_; }
-
-  /// Get the SyncConnection of a node.
-  ///
-  /// \param node_id The node id to lookup.
-  ///
-  /// \return nullptr if it doesn't exist, otherwise, the connection associated with the
-  /// node.
-  NodeSyncConnection *GetSyncConnection(const std::string &node_id) const {
-    auto iter = sync_connections_.find(node_id);
-    if (iter == sync_connections_.end()) {
-      return nullptr;
-    }
-    return iter->second.get();
-  }
-
   /// Function to broadcast the messages to other nodes.
   /// A message will be sent to a node if that node doesn't have this message.
   /// The message can be generated by local reporter or received by the other node.
   ///
   /// \param message The message to be broadcasted.
   void BroadcastMessage(std::shared_ptr<const RaySyncMessage> message);
+
+  std::vector<std::string> GetAllConnectedNodeIDs() const;
+
+ private:
+  void Connect(RaySyncerBidiReactor *connection);
+
+  std::shared_ptr<bool> stopped_;
+
+  /// Get the io_context used by RaySyncer.
+  instrumented_io_context &GetIOContext() { return io_context_; }
 
   /// io_context for this thread
   instrumented_io_context &io_context_;
@@ -175,28 +163,17 @@ class RaySyncer {
   const std::string local_node_id_;
 
   /// Manage connections. Here the key is the NodeID in binary form.
-  absl::flat_hash_map<std::string, std::unique_ptr<NodeSyncConnection>> sync_connections_;
-
-  /// Upward connections. These are connections initialized not by the local node.
-  absl::flat_hash_set<NodeSyncConnection *> upward_connections_;
+  absl::flat_hash_map<std::string, RaySyncerBidiReactor *> sync_reactors_;
 
   /// The local node state
   std::unique_ptr<NodeState> node_state_;
 
-  /// Context of a rpc call.
-  struct StartSyncCall {
-    StartSyncRequest request;
-    StartSyncResponse response;
-    grpc::ClientContext context;
-    std::promise<void> promise;
-  };
-
-  absl::flat_hash_set<std::unique_ptr<StartSyncCall>> inflight_requests_;
-
   /// Timer is used to do broadcasting.
-  ray::PeriodicalRunner timer_;
+  std::shared_ptr<PeriodicalRunner> timer_;
 
-  std::shared_ptr<bool> stopped_;
+  /// Sync message observer, which is a callback on received message response for
+  /// [RaySyncerBidiReactor], so should be passed to each of them.
+  RpcCompletionCallback on_rpc_completion_;
 
   friend class RaySyncerService;
   /// Test purpose
@@ -209,9 +186,6 @@ class RaySyncer {
   FRIEND_TEST(SyncerTest, Reconnect);
 };
 
-class ClientSyncConnection;
-class ServerSyncConnection;
-
 /// RaySyncerService is a service to take care of resource synchronization
 /// related operations.
 /// Right now only raylet needs to setup this service. But in the future,
@@ -219,34 +193,14 @@ class ServerSyncConnection;
 /// like tree-based one.
 class RaySyncerService : public ray::rpc::syncer::RaySyncer::CallbackService {
  public:
-  RaySyncerService(RaySyncer &syncer) : syncer_(syncer) {}
+  explicit RaySyncerService(RaySyncer &syncer) : syncer_(syncer) {}
 
-  ~RaySyncerService();
-
-  grpc::ServerUnaryReactor *StartSync(grpc::CallbackServerContext *context,
-                                      const StartSyncRequest *request,
-                                      StartSyncResponse *response) override;
-
-  grpc::ServerUnaryReactor *Update(grpc::CallbackServerContext *context,
-                                   const RaySyncMessages *request,
-                                   DummyResponse *) override;
-
-  grpc::ServerUnaryReactor *LongPolling(grpc::CallbackServerContext *context,
-                                        const DummyRequest *,
-                                        RaySyncMessages *response) override;
+  grpc::ServerBidiReactor<RaySyncMessage, RaySyncMessage> *StartSync(
+      grpc::CallbackServerContext *context) override;
 
  private:
-  // This will be created after connection is established.
-  // Ideally this should be owned by RaySyncer, but since we are doing
-  // long-polling right now, we have to put it here so that when
-  // long-polling request comes, we can set it up.
-  std::string remote_node_id_;
-
   // The ray syncer this RPC wrappers of.
   RaySyncer &syncer_;
 };
 
-}  // namespace syncer
-}  // namespace ray
-
-#include "ray/common/ray_syncer/ray_syncer-inl.h"
+}  // namespace ray::syncer

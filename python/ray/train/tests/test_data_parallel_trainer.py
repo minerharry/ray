@@ -1,22 +1,23 @@
 import os
 import time
 from unittest.mock import patch
+
 import pytest
 
 import ray
-from ray import tune
-from ray.air import session
-from ray.air.checkpoint import Checkpoint
-from ray.data.preprocessor import Preprocessor
+from ray import train, tune
+from ray._private.ray_constants import RESOURCE_CONSTRAINT_PREFIX
+from ray.cluster_utils import Cluster
+from ray.train import RunConfig, ScalingConfig
 from ray.train._internal.backend_executor import BackendExecutor
 from ray.train._internal.worker_group import WorkerGroup
 from ray.train.backend import Backend, BackendConfig
-from ray.train.constants import PREPROCESSOR_KEY
 from ray.train.data_parallel_trainer import DataParallelTrainer
-from ray.air.config import ScalingConfig, CheckpointConfig, RunConfig
+from ray.train.tests.util import create_dict_checkpoint, load_dict_checkpoint
+from ray.tune.callback import Callback
 from ray.tune.tune_config import TuneConfig
 from ray.tune.tuner import Tuner
-from ray.tune.callback import Callback
+from ray.util.accelerators import NVIDIA_A100, NVIDIA_TESLA_A10G
 
 
 @pytest.fixture
@@ -35,15 +36,34 @@ def ray_start_4_cpus_4_gpus_4_extra():
     ray.shutdown()
 
 
-# Currently in DataParallelTrainers we only report metrics from rank 0.
-# For testing purposes here, we need to be able to report from all
-# workers.
+@pytest.fixture
+def ray_start_heterogenous_cluster():
+    """
+    Start a heterogenous cluster with 6 nodes:
+        - 2 node with 4 x A100
+        - 2 node with 4 x A10G
+        - 2 node with 4 x GPU without accelerator_type
+    """
+    cluster = Cluster()
 
+    for accelerator_type in [NVIDIA_A100, NVIDIA_TESLA_A10G, None]:
+        for _ in range(2):
+            cluster.add_node(
+                num_cpus=4,
+                num_gpus=4,
+                resources=(
+                    {f"{RESOURCE_CONSTRAINT_PREFIX}{accelerator_type}": 1.0}
+                    if accelerator_type
+                    else {}
+                ),
+            )
 
-class DataParallelTrainerPatchedMultipleReturns(DataParallelTrainer):
-    def _report(self, training_iterator) -> None:
-        for results in training_iterator:
-            tune.report(results=results)
+    ray.init(address=cluster.address)
+
+    yield
+
+    ray.shutdown()
+    cluster.shutdown()
 
 
 def gen_execute_single_async_special(special_f):
@@ -51,7 +71,11 @@ def gen_execute_single_async_special(special_f):
         assert len(self.workers) == 2
         if i == 0 and hasattr(self, "should_fail") and self.should_fail:
             kwargs["train_func"] = special_f
-        return self.workers[i].actor._RayTrainWorker__execute.remote(f, *args, **kwargs)
+        return (
+            self.workers[i]
+            .actor._RayTrainWorker__execute.options(name=f.__name__)
+            .remote(f, *args, **kwargs)
+        )
 
     return execute_single_async_special
 
@@ -90,7 +114,7 @@ scale_config = ScalingConfig(num_workers=2)
 
 def test_fit_train(ray_start_4_cpus):
     def train_func():
-        session.report({"loss": 1})
+        train.report({"loss": 1})
 
     trainer = DataParallelTrainer(
         train_loop_per_worker=train_func, scaling_config=scale_config
@@ -101,7 +125,7 @@ def test_fit_train(ray_start_4_cpus):
 def test_scaling_config(ray_start_4_cpus):
     def train_func():
         assert ray.available_resources()["CPU"] == 1
-        session.report({"loss": 1})
+        train.report({"loss": 1})
 
     assert ray.available_resources()["CPU"] == 4
     trainer = DataParallelTrainer(
@@ -112,7 +136,7 @@ def test_scaling_config(ray_start_4_cpus):
 
 def test_fit_train_config(ray_start_4_cpus):
     def train_func(config):
-        session.report({"loss": config["x"]})
+        train.report({"loss": config["x"]})
 
     trainer = DataParallelTrainer(
         train_loop_per_worker=train_func,
@@ -131,11 +155,13 @@ def test_datasets(ray_start_4_cpus):
 
     def get_dataset():
         # Train dataset should be sharded.
-        train_dataset = session.get_dataset_shard("train")
-        assert train_dataset.count() == num_train_data / scale_config.num_workers
+        train_dataset = train.get_dataset_shard("train")
+        train_ds_count = len(list(train_dataset.iter_rows()))
+        assert train_ds_count == num_train_data / scale_config.num_workers
         # All other datasets should not be sharded.
-        val_dataset = session.get_dataset_shard("val")
-        assert val_dataset.count() == num_val_data
+        val_dataset = train.get_dataset_shard("val")
+        val_ds_count = len(list(val_dataset.iter_rows()))
+        assert val_ds_count == num_val_data / scale_config.num_workers
 
     trainer = DataParallelTrainer(
         train_loop_per_worker=get_dataset,
@@ -145,70 +171,7 @@ def test_datasets(ray_start_4_cpus):
     trainer.fit()
 
 
-def test_checkpoint(ray_start_4_cpus):
-    def train_func():
-        for i in range(3):
-            session.report({"epoch": i}, checkpoint=Checkpoint.from_dict({"model": i}))
-
-    trainer = DataParallelTrainer(
-        train_loop_per_worker=train_func, scaling_config=scale_config
-    )
-    result = trainer.fit()
-    assert result.checkpoint.to_dict()["model"] == 2
-
-
-def test_preprocessor_in_checkpoint(ray_start_4_cpus):
-    class DummyPreprocessor(Preprocessor):
-        def __init__(self):
-            super().__init__()
-            self.is_same = True
-
-    def train_func():
-        for i in range(3):
-            session.report({"epoch": i}, checkpoint=Checkpoint.from_dict({"model": i}))
-
-    trainer = DataParallelTrainer(
-        train_loop_per_worker=train_func,
-        scaling_config=scale_config,
-        preprocessor=DummyPreprocessor(),
-    )
-    result = trainer.fit()
-    assert result.checkpoint.to_dict()["model"] == 2
-    assert result.checkpoint.to_dict()[PREPROCESSOR_KEY].is_same
-
-
-def test_resume_from_checkpoint(ray_start_4_cpus, tmpdir):
-    def train_func():
-        checkpoint = session.get_checkpoint()
-        if checkpoint:
-            epoch = checkpoint.to_dict()["epoch"]
-        else:
-            epoch = 0
-        for i in range(epoch, epoch + 2):
-            session.report({"epoch": i}, checkpoint=Checkpoint.from_dict({"epoch": i}))
-
-    trainer = DataParallelTrainer(
-        train_loop_per_worker=train_func, scaling_config=scale_config
-    )
-    result = trainer.fit()
-    assert result.checkpoint.to_dict()["epoch"] == 1
-
-    # Move checkpoint to a different directory.
-    checkpoint_dict = result.checkpoint.to_dict()
-    checkpoint = Checkpoint.from_dict(checkpoint_dict)
-    checkpoint_path = checkpoint.to_directory(tmpdir)
-    resume_from = Checkpoint.from_directory(checkpoint_path)
-
-    trainer = DataParallelTrainer(
-        train_loop_per_worker=train_func,
-        scaling_config=scale_config,
-        resume_from_checkpoint=resume_from,
-    )
-    result = trainer.fit()
-    assert result.checkpoint.to_dict()["epoch"] == 2
-
-
-def test_invalid_train_loop(ray_start_4_cpus):
+def test_invalid_train_loop():
     def train_loop(config, extra_arg):
         pass
 
@@ -225,7 +188,7 @@ def test_bad_return_in_train_loop(ray_start_4_cpus):
             raise RuntimeError("Failing")
 
     def train_loop(config):
-        session.report({"loss": 1})
+        train.report({"loss": 1})
         return FailOnUnpickle()
 
     trainer = DataParallelTrainer(
@@ -238,7 +201,7 @@ def test_bad_return_in_train_loop(ray_start_4_cpus):
 
 def test_tune(ray_start_4_cpus):
     def train_func(config):
-        session.report({"loss": config["x"]})
+        train.report({"loss": config["x"]})
 
     trainer = DataParallelTrainer(
         train_loop_per_worker=train_func,
@@ -261,11 +224,13 @@ def test_tune(ray_start_4_cpus):
 def test_fast_slow(ray_start_4_cpus):
     def train_func():
         for i in range(2):
-            session.report(dict(index=i), checkpoint=Checkpoint.from_dict({"epoch": i}))
+            with create_dict_checkpoint({"epoch": i}) as checkpoint:
+                train.report(dict(index=i), checkpoint=checkpoint)
 
     def train_slow():
         for i in range(2):
-            session.report(dict(index=i), checkpoint=Checkpoint.from_dict({"epoch": i}))
+            with create_dict_checkpoint({"epoch": i}) as checkpoint:
+                train.report(dict(index=i), checkpoint=checkpoint)
             time.sleep(5)
 
     new_backend_executor_cls = gen_new_backend_executor(train_slow)
@@ -281,7 +246,7 @@ def test_fast_slow(ray_start_4_cpus):
     )
     results = trainer.fit()
 
-    assert results.checkpoint.to_dict()["epoch"] == 1
+    assert load_dict_checkpoint(results.checkpoint)["epoch"] == 1
 
     result_list = callback.result_list
     assert len(result_list) == 2
@@ -290,10 +255,10 @@ def test_fast_slow(ray_start_4_cpus):
 def test_mismatch_report(ray_start_4_cpus):
     def train_func():
         for _ in range(2):
-            session.report(dict(loss=1))
+            train.report(dict(loss=1))
 
     def train_mismatch():
-        session.report(dict(loss=1))
+        train.report(dict(loss=1))
 
     new_backend_executor_cls = gen_new_backend_executor(train_mismatch)
 
@@ -308,73 +273,24 @@ def test_mismatch_report(ray_start_4_cpus):
         trainer.fit()
 
 
-def test_world_rank(ray_start_4_cpus):
+def test_world_rank(ray_start_4_cpus, tmp_path):
     def train_func():
-        session.report(dict(world_rank=session.get_world_rank()))
+        world_rank = train.get_context().get_world_rank()
+        (tmp_path / f"{world_rank}").touch()
+        train.report(dict(world_rank=world_rank))
 
-    # Currently in DataParallelTrainers we only report metrics from rank 0.
-    # For testing purposes here, we need to be able to report from all
-    # workers.
-    class DataParallelTrainerPatched(DataParallelTrainer):
-        def _report(self, training_iterator) -> None:
-            for results in training_iterator:
-                tune.report(results=results)
+    trainer = DataParallelTrainer(train_func, scaling_config=scale_config)
+    trainer.fit()
 
-    trainer = DataParallelTrainerPatched(
-        train_func,
-        scaling_config=scale_config,
-    )
-    results = trainer.fit()
-
-    assert [result["world_rank"] for result in results.metrics["results"]] == [
-        0,
-        1,
-    ]
+    created_files = list(tmp_path.glob("*"))
+    assert len(created_files) == 2
+    assert {int(file.name) for file in created_files} == {0, 1}
 
 
-@pytest.mark.parametrize("mode", ["min", "max"])
-def test_checkpoints_to_keep(ray_start_4_cpus, mode):
-    def train_func():
-        session.report(
-            dict(loss=float("nan")), checkpoint=Checkpoint.from_dict({"idx": 0})
-        )  # nan, deleted
-        session.report(
-            dict(loss=3), checkpoint=Checkpoint.from_dict({"idx": 1})
-        )  # best for min, worst for max (del)
-        session.report(
-            dict(loss=7), checkpoint=Checkpoint.from_dict({"idx": 2})
-        )  # worst for min (del), best for max
-        session.report(dict(loss=5), checkpoint=Checkpoint.from_dict({"idx": 3}))
+def test_gpu_requests(ray_start_4_cpus_4_gpus_4_extra, tmp_path):
+    def get_visible_devices_for_workers():
+        return [file.read_text() for file in tmp_path.glob("*")]
 
-    checkpoint_config = CheckpointConfig(
-        num_to_keep=2, checkpoint_score_attribute="loss", checkpoint_score_order=mode
-    )
-
-    trainer = DataParallelTrainer(
-        train_func,
-        scaling_config=scale_config,
-        run_config=RunConfig(checkpoint_config=checkpoint_config),
-    )
-    result = trainer.fit()
-    assert len(result.best_checkpoints) == 2
-
-    # Last checkpoint
-    assert result.checkpoint.to_dict()["idx"] == 3
-
-    if mode == "min":
-        indices = [3, 1]
-        losses = [5, 3]
-    else:
-        indices = [3, 2]
-        losses = [5, 7]
-
-    assert result.best_checkpoints[0][0].to_dict()["idx"] == indices[0]
-    assert result.best_checkpoints[1][0].to_dict()["idx"] == indices[1]
-    assert result.best_checkpoints[0][1]["loss"] == losses[0]
-    assert result.best_checkpoints[1][1]["loss"] == losses[1]
-
-
-def test_gpu_requests(ray_start_4_cpus_4_gpus_4_extra):
     class CudaTestBackend(Backend):
         share_cuda_visible_devices = True
 
@@ -385,55 +301,81 @@ def test_gpu_requests(ray_start_4_cpus_4_gpus_4_extra):
 
     def get_resources():
         cuda_visible_devices = os.environ["CUDA_VISIBLE_DEVICES"]
-        session.report(dict(devices=cuda_visible_devices))
+        world_rank = train.get_context().get_world_rank()
+        (tmp_path / f"{world_rank}").write_text(cuda_visible_devices)
+        train.report(dict(devices=cuda_visible_devices))
 
     # 0 GPUs will be requested and should not raise an error.
-    trainer = DataParallelTrainerPatchedMultipleReturns(
+    trainer = DataParallelTrainer(
         get_resources,
         backend_config=CudaTestConfig(),
         scaling_config=ScalingConfig(num_workers=2, use_gpu=False),
     )
-    results = trainer.fit()
-    results = [result["devices"] for result in results.metrics["results"]]
-    assert results == ["", ""]
+    trainer.fit()
+    assert get_visible_devices_for_workers() == ["", ""]
 
     # 1 GPU will be requested and should not raise an error.
-    trainer = DataParallelTrainerPatchedMultipleReturns(
+    trainer = DataParallelTrainer(
         get_resources,
         backend_config=CudaTestConfig(),
         scaling_config=ScalingConfig(num_workers=2, use_gpu=True),
     )
-    results = trainer.fit()
-    results = [result["devices"] for result in results.metrics["results"]]
+    trainer.fit()
+    visible_devices = get_visible_devices_for_workers()
     # Sort the cuda visible devices to have exact match with expected result.
-    results = [",".join(sorted(r.split(","))) for r in results]
-    assert results == ["0,1", "0,1"]
+    visible_devices = [",".join(sorted(r.split(","))) for r in visible_devices]
+    assert visible_devices == ["0,1", "0,1"]
 
     # Partial GPUs should not raise an error.
-    trainer = DataParallelTrainerPatchedMultipleReturns(
+    trainer = DataParallelTrainer(
         get_resources,
         backend_config=CudaTestConfig(),
         scaling_config=ScalingConfig(
             num_workers=2, use_gpu=True, resources_per_worker={"GPU": 0.1}
         ),
     )
-    results = trainer.fit()
-    results = [result["devices"] for result in results.metrics["results"]]
-    assert results == ["0", "0"]
+    trainer.fit()
+    visible_devices = get_visible_devices_for_workers()
+    assert visible_devices == ["0", "0"]
 
     # Multiple GPUs should not raise an error.
-    trainer = DataParallelTrainerPatchedMultipleReturns(
+    trainer = DataParallelTrainer(
         get_resources,
         backend_config=CudaTestConfig(),
         scaling_config=ScalingConfig(
             num_workers=2, use_gpu=True, resources_per_worker={"GPU": 2}
         ),
     )
-    results = trainer.fit()
-    results = [result["devices"] for result in results.metrics["results"]]
+    trainer.fit()
+    visible_devices = get_visible_devices_for_workers()
     # Sort the cuda visible devices to have exact match with expected result.
-    results = [",".join(sorted(r.split(","))) for r in results]
-    assert results == ["0,1,2,3", "0,1,2,3"]
+    visible_devices = [",".join(sorted(r.split(","))) for r in visible_devices]
+    assert visible_devices == ["0,1,2,3", "0,1,2,3"]
+
+
+@pytest.mark.parametrize("num_gpus", [1, 2])
+@pytest.mark.parametrize("accelerator_type", [NVIDIA_A100, NVIDIA_TESLA_A10G, None])
+def test_config_accelerator_type(
+    ray_start_heterogenous_cluster, num_gpus, accelerator_type
+):
+    def train_func():
+        # Ensure all workers are scheduled on nodes with specified accelerators
+        assigned_resources = ray.get_runtime_context().get_assigned_resources()
+        assert assigned_resources["GPU"] == num_gpus
+        if accelerator_type:
+            accelerator_key = f"{RESOURCE_CONSTRAINT_PREFIX}{accelerator_type}"
+            assert accelerator_key in assigned_resources
+
+    trainer = DataParallelTrainer(
+        train_func,
+        scaling_config=ScalingConfig(
+            num_workers=4,
+            use_gpu=True,
+            accelerator_type=accelerator_type,
+            resources_per_worker={"GPU": num_gpus},
+        ),
+    )
+    trainer.fit()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 .. _api-stability:
 
-API stability
+API Stability
 =============
 
 Ray provides stability guarantees for its public APIs in Ray core and libraries, which are decorated/labeled accordingly.
@@ -26,6 +26,8 @@ of them individually.
 Breaking changes **must** be both allowed and expected in alpha components, and
 users **must** have no expectation of stability.
 
+.. _api-stability-beta:
+
 Beta
 ~~~~
 
@@ -39,6 +41,8 @@ but **may** include backwards-incompatible changes to beta components.
 
 Backwards-incompatible changes **must** be made only after a reasonable
 deprecation period to provide users with an opportunity to migrate their code.
+
+.. _api-stability-stable:
 
 Stable
 ~~~~~~

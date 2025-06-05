@@ -1,25 +1,24 @@
-import unittest
 import threading
+import unittest
 
 import ray
-from ray.rllib import _register_all
-from ray.tune import register_trainable
-from ray.tune.experiment import Experiment, _convert_to_experiment_list
+import ray.train
+from ray.tune import CheckpointConfig, register_trainable
 from ray.tune.error import TuneError
+from ray.tune.experiment import Experiment, _convert_to_experiment_list
 from ray.tune.utils import diagnose_serialization
 
 
 class ExperimentTest(unittest.TestCase):
     def tearDown(self):
         ray.shutdown()
-        _register_all()  # re-register the evicted objects
 
     def setUp(self):
-        def train(config, reporter):
+        def train_fn(config):
             for i in range(100):
-                reporter(timesteps_total=i)
+                ray.tune.report(dict(timesteps_total=i))
 
-        register_trainable("f1", train)
+        register_trainable("f1", train_fn)
 
     def testConvertExperimentFromExperiment(self):
         exp1 = Experiment(
@@ -54,10 +53,44 @@ class ExperimentTest(unittest.TestCase):
     def testConvertExperimentIncorrect(self):
         self.assertRaises(TuneError, lambda: _convert_to_experiment_list("hi"))
 
+    def testFuncTrainableCheckpointConfigValidation(self):
+        """Raise an error when trying to specify checkpoint_at_end/checkpoint_frequency
+        with a function trainable."""
+        with self.assertRaises(ValueError):
+            Experiment(
+                name="foo",
+                run="f1",  # Will point to a wrapped function trainable
+                checkpoint_config=CheckpointConfig(checkpoint_at_end=True),
+            )
+        with self.assertRaises(ValueError):
+            Experiment(
+                name="foo",
+                run="f1",
+                checkpoint_config=CheckpointConfig(checkpoint_frequency=1),
+            )
+        with self.assertRaises(ValueError):
+            Experiment(
+                name="foo",
+                run=lambda config: 1,
+                checkpoint_config=CheckpointConfig(checkpoint_at_end=True),
+            )
+
+    def testInvalidExperimentConfig(self):
+        with self.assertRaises(ValueError):
+            Experiment(name="foo", run="f1", config="invalid")
+
+        class InvalidClass:
+            def to_dict(self):
+                return {"valid": 1}
+
+        with self.assertRaises(ValueError):
+            Experiment(name="foo", run="f1", config=InvalidClass())
+
+        Experiment(name="foo", run="f1", config=InvalidClass().to_dict())
+
 
 class ValidateUtilTest(unittest.TestCase):
     def testDiagnoseSerialization(self):
-
         # this is not serializable
         e = threading.Event()
 
@@ -78,7 +111,8 @@ class ValidateUtilTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
+
+    import pytest
 
     sys.exit(pytest.main(["-v", __file__]))

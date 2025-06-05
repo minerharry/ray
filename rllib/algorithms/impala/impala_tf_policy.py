@@ -4,11 +4,11 @@ Keep in sync with changes to A3CTFPolicy and VtraceSurrogatePolicy."""
 
 import numpy as np
 import logging
-import gym
-from typing import Dict, List, Type, Union
+import gymnasium as gym
+from typing import Dict, List, Optional, Type, Union
 
-import ray
 from ray.rllib.algorithms.impala import vtrace_tf as vtrace
+from ray.rllib.evaluation.postprocessing import compute_bootstrap_value
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.models.tf.tf_action_dist import Categorical, TFActionDistribution
 from ray.rllib.policy.dynamic_tf_policy_v2 import DynamicTFPolicyV2
@@ -19,7 +19,7 @@ from ray.rllib.utils import force_list
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.tf_utils import explained_variance
-from ray.rllib.policy.tf_mixins import GradStatsMixin
+from ray.rllib.policy.tf_mixins import GradStatsMixin, ValueNetworkMixin
 from ray.rllib.utils.typing import (
     LocalOptimizer,
     ModelGradients,
@@ -86,7 +86,7 @@ class VTraceLoss:
             config: Algorithm config dict.
         """
 
-        # Compute vtrace on the CPU for better perf.
+        # Compute vtrace on the CPU for better performance.
         with tf.device("/cpu:0"):
             self.vtrace_returns = vtrace.multi_from_logits(
                 behaviour_action_log_probs=behaviour_action_logp,
@@ -132,22 +132,21 @@ class VTraceLoss:
             self.total_loss += self.vf_loss * vf_loss_coeff
 
 
-def _make_time_major(policy, seq_lens, tensor, drop_last=False):
+def _make_time_major(policy, seq_lens, tensor):
     """Swaps batch and trajectory axis.
 
     Args:
         policy: Policy reference
         seq_lens: Sequence lengths if recurrent or None
         tensor: A tensor or list of tensors to reshape.
-        drop_last: A bool indicating whether to drop the last
-        trajectory item.
+            trajectory item.
 
     Returns:
         res: A tensor with swapped axes or a list of tensors with
         swapped axes.
     """
     if isinstance(tensor, list):
-        return [_make_time_major(policy, seq_lens, t, drop_last) for t in tensor]
+        return [_make_time_major(policy, seq_lens, t) for t in tensor]
 
     if policy.is_recurrent():
         B = tf.shape(seq_lens)[0]
@@ -164,8 +163,6 @@ def _make_time_major(policy, seq_lens, tensor, drop_last=False):
     # swap B and T axes
     res = tf.transpose(rs, [1, 0] + list(range(2, 1 + int(tf.shape(tensor).shape[0]))))
 
-    if drop_last:
-        return res[:-1]
     return res
 
 
@@ -180,15 +177,14 @@ class VTraceClipGradients:
         self, optimizer: LocalOptimizer, loss: TensorType
     ) -> ModelGradients:
         # Supporting more than one loss/optimizer.
+        trainable_variables = self.model.trainable_variables()
         if self.config["_tf_policy_handles_more_than_one_loss"]:
             optimizers = force_list(optimizer)
             losses = force_list(loss)
             assert len(optimizers) == len(losses)
             clipped_grads_and_vars = []
             for optim, loss_ in zip(optimizers, losses):
-                grads_and_vars = optim.compute_gradients(
-                    loss_, self.model.trainable_variables()
-                )
+                grads_and_vars = optim.compute_gradients(loss_, trainable_variables)
                 clipped_g_and_v = []
                 for g, v in grads_and_vars:
                     if g is not None:
@@ -206,9 +202,7 @@ class VTraceClipGradients:
             )
             grads = [g for (g, v) in grads_and_vars]
             self.grads, _ = tf.clip_by_global_norm(grads, self.config["grad_clip"])
-            clipped_grads_and_vars = list(
-                zip(self.grads, self.model.trainable_variables())
-            )
+            clipped_grads_and_vars = list(zip(self.grads, trainable_variables))
 
         return clipped_grads_and_vars
 
@@ -264,6 +258,7 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
     Returns:
         A TF Policy to be used with Impala.
     """
+
     # VTrace mixins are placed in front of more general mixins to make sure
     # their functions like optimizer() overrides all the other implementations
     # (e.g., LearningRateSchedule.optimizer())
@@ -273,6 +268,7 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
         LearningRateSchedule,
         EntropyCoeffSchedule,
         GradStatsMixin,
+        ValueNetworkMixin,
         base,
     ):
         def __init__(
@@ -286,10 +282,6 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
             # First thing first, enable eager execution if necessary.
             base.enable_eager_execution_if_necessary()
 
-            config = dict(
-                ray.rllib.algorithms.impala.impala.ImpalaConfig().to_dict(), **config
-            )
-
             # Initialize base class.
             base.__init__(
                 self,
@@ -299,7 +291,12 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
                 existing_inputs=existing_inputs,
                 existing_model=existing_model,
             )
+            ValueNetworkMixin.__init__(self, config)
 
+            # If Learner API is used, we don't need any loss-specific mixins.
+            # However, we also would like to avoid creating special Policy-subclasses
+            # for this as the entire Policy concept will soon not be used anymore with
+            # the new Learner- and RLModule APIs.
             GradStatsMixin.__init__(self)
             VTraceClipGradients.__init__(self)
             VTraceOptimizer.__init__(self)
@@ -338,7 +335,7 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
                 )
 
             actions = train_batch[SampleBatch.ACTIONS]
-            dones = train_batch[SampleBatch.DONES]
+            dones = train_batch[SampleBatch.TERMINATEDS]
             rewards = train_batch[SampleBatch.REWARDS]
             behaviour_action_logp = train_batch[SampleBatch.ACTION_LOGP]
             behaviour_logits = train_batch[SampleBatch.ACTION_DIST_INPUTS]
@@ -347,6 +344,11 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
             )
             unpacked_outputs = tf.split(model_out, output_hidden_shape, axis=1)
             values = model.value_function()
+            values_time_major = make_time_major(values)
+            bootstrap_values_time_major = make_time_major(
+                train_batch[SampleBatch.VALUES_BOOTSTRAPPED]
+            )
+            bootstrap_value = bootstrap_values_time_major[-1]
 
             if self.is_recurrent():
                 max_seq_len = tf.reduce_max(train_batch[SampleBatch.SEQ_LENS])
@@ -361,30 +363,21 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
             )
 
             # Inputs are reshaped from [B * T] => [(T|T-1), B] for V-trace calc.
-            drop_last = self.config["vtrace_drop_last_ts"]
             self.vtrace_loss = VTraceLoss(
-                actions=make_time_major(loss_actions, drop_last=drop_last),
-                actions_logp=make_time_major(
-                    action_dist.logp(actions), drop_last=drop_last
-                ),
-                actions_entropy=make_time_major(
-                    action_dist.multi_entropy(), drop_last=drop_last
-                ),
-                dones=make_time_major(dones, drop_last=drop_last),
-                behaviour_action_logp=make_time_major(
-                    behaviour_action_logp, drop_last=drop_last
-                ),
-                behaviour_logits=make_time_major(
-                    unpacked_behaviour_logits, drop_last=drop_last
-                ),
-                target_logits=make_time_major(unpacked_outputs, drop_last=drop_last),
+                actions=make_time_major(loss_actions),
+                actions_logp=make_time_major(action_dist.logp(actions)),
+                actions_entropy=make_time_major(action_dist.multi_entropy()),
+                dones=make_time_major(dones),
+                behaviour_action_logp=make_time_major(behaviour_action_logp),
+                behaviour_logits=make_time_major(unpacked_behaviour_logits),
+                target_logits=make_time_major(unpacked_outputs),
                 discount=self.config["gamma"],
-                rewards=make_time_major(rewards, drop_last=drop_last),
-                values=make_time_major(values, drop_last=drop_last),
-                bootstrap_value=make_time_major(values)[-1],
+                rewards=make_time_major(rewards),
+                values=values_time_major,
+                bootstrap_value=bootstrap_value,
                 dist_class=Categorical if is_multidiscrete else dist_class,
                 model=model,
-                valid_mask=make_time_major(mask, drop_last=drop_last),
+                valid_mask=make_time_major(mask),
                 config=self.config,
                 vf_loss_coeff=self.config["vf_loss_coeff"],
                 entropy_coeff=self.entropy_coeff,
@@ -399,12 +392,10 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
 
         @override(base)
         def stats_fn(self, train_batch: SampleBatch) -> Dict[str, TensorType]:
-            drop_last = self.config["vtrace"] and self.config["vtrace_drop_last_ts"]
             values_batched = _make_time_major(
                 self,
                 train_batch.get(SampleBatch.SEQ_LENS),
                 self.model.value_function(),
-                drop_last=drop_last,
             )
 
             return {
@@ -419,6 +410,25 @@ def get_impala_tf_policy(name: str, base: TFPolicyV2Type) -> TFPolicyV2Type:
                     tf.reshape(values_batched, [-1]),
                 ),
             }
+
+        @override(base)
+        def postprocess_trajectory(
+            self,
+            sample_batch: SampleBatch,
+            other_agent_batches: Optional[SampleBatch] = None,
+            episode=None,
+        ):
+            # Call super's postprocess_trajectory first.
+            # sample_batch = super().postprocess_trajectory(
+            #    sample_batch, other_agent_batches, episode
+            # )
+
+            if self.config["vtrace"]:
+                # Add the SampleBatch.VALUES_BOOTSTRAPPED column, which we'll need
+                # inside the loss for vtrace calculations.
+                sample_batch = compute_bootstrap_value(sample_batch, self)
+
+            return sample_batch
 
         @override(base)
         def get_batch_divisibility_req(self) -> int:

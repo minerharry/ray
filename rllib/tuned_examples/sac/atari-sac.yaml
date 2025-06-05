@@ -1,11 +1,12 @@
+# @OldAPIStack
 # Run e.g. on a g3.16xlarge (4 GPUs) with `num_gpus=1` (1 for each trial;
 # MsPacman torch + tf; Pong torch + tf).
-# Uses the hyperparameters published in [2] (see rllib/agents/sac/README.md).
+# Uses the hyperparameters published in [2] (see rllib/algorithms/sac/README.md).
 atari-sac-tf-and-torch:
     env:
         grid_search:
-            - MsPacmanNoFrameskip-v4
-            - PongNoFrameskip-v4
+            - ale_py:ALE/MsPacman-v5
+            - ale_py:ALE/Pong-v5
     run: SAC
     stop:
         timesteps_total: 20000000
@@ -13,6 +14,8 @@ atari-sac-tf-and-torch:
         # Works for both torch and tf.
         framework:
             grid_search: [tf, torch]
+        env_config:
+            frameskip: 1  # no frameskip
         gamma: 0.99
         q_model_config:
             hidden_activation: relu
@@ -27,7 +30,6 @@ atari-sac-tf-and-torch:
         # auto = 0.98 * -log(1/|A|)
         target_entropy: auto
         clip_rewards: 1.0
-        no_done_at_end: False
         n_step: 1
         rollout_fragment_length: 1
         replay_buffer_config:
@@ -48,6 +50,6 @@ atari-sac-tf-and-torch:
             actor_learning_rate: 0.0003
             critic_learning_rate: 0.0003
             entropy_learning_rate: 0.0003
-        num_workers: 0
+        num_env_runners: 0
         num_gpus: 1
         metrics_num_episodes_for_smoothing: 5

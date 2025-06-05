@@ -1,11 +1,12 @@
 import logging
+import sys
 import time
 
 import pytest
 
 import ray
+from ray._common.test_utils import SignalActor
 from ray._private.test_utils import (
-    SignalActor,
     generate_system_config_map,
     wait_for_condition,
 )
@@ -42,16 +43,10 @@ def test_shutdown():
     "ray_start_cluster_head",
     [
         generate_system_config_map(
-            num_heartbeats_timeout=3,
-            object_timeout_milliseconds=12345,
-            pull_based_healthcheck=False,
-        ),
-        generate_system_config_map(
             health_check_initial_delay_ms=0,
             health_check_period_ms=1000,
             health_check_failure_threshold=3,
             object_timeout_milliseconds=12345,
-            pull_based_healthcheck=True,
         ),
     ],
     indirect=True,
@@ -71,12 +66,9 @@ def test_system_config(ray_start_cluster_head):
     @ray.remote
     def f():
         assert ray._config.object_timeout_milliseconds() == 12345
-        if ray._config.pull_based_healthcheck():
-            assert ray._config.health_check_initial_delay_ms() == 0
-            assert ray._config.health_check_failure_threshold() == 3
-            assert ray._config.health_check_period_ms() == 1000
-        else:
-            assert ray._config.num_heartbeats_timeout() == 3
+        assert ray._config.health_check_initial_delay_ms() == 0
+        assert ray._config.health_check_failure_threshold() == 3
+        assert ray._config.health_check_period_ms() == 1000
 
     ray.get([f.remote() for _ in range(5)])
 
@@ -374,11 +366,4 @@ def test_multi_node_pgs(ray_start_cluster):
 
 
 if __name__ == "__main__":
-    import pytest
-    import os
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

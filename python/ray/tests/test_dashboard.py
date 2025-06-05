@@ -98,7 +98,6 @@ ray.shutdown()
     indirect=True,
 )
 def test_port_conflict(listen_port, call_ray_stop_only, shutdown_only):
-
     try:
         subprocess.check_output(
             [
@@ -151,6 +150,7 @@ def test_dashboard(shutdown_only):
 
 
 conflict_port = 34567
+configured_test_port = 34568
 
 
 def run_tasks_without_runtime_env():
@@ -189,32 +189,6 @@ def run_tasks_with_runtime_env():
 )
 @pytest.mark.parametrize(
     "call_ray_start",
-    [f"ray start --head --num-cpus=1 --dashboard-agent-grpc-port={conflict_port}"],
-    indirect=True,
-)
-def test_dashboard_agent_grpc_port_conflict(listen_port, call_ray_start):
-    address = call_ray_start
-    ray.init(address=address)
-    # Tasks without runtime env still work when dashboard agent grpc port conflicts.
-    run_tasks_without_runtime_env()
-    # Tasks with runtime env couldn't work.
-    with pytest.raises(
-        ray.exceptions.RuntimeEnvSetupError,
-        match="the grpc service of agent is invalid",
-    ):
-        run_tasks_with_runtime_env()
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="`runtime_env` with `pip` not supported on Windows."
-)
-@pytest.mark.parametrize(
-    "listen_port",
-    [conflict_port],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "call_ray_start",
     [
         f"ray start --head --num-cpus=1 --metrics-export-port={conflict_port}",
         f"ray start --head --num-cpus=1 --dashboard-agent-listen-port={conflict_port}",
@@ -230,9 +204,4 @@ def test_dashboard_agent_metrics_or_http_port_conflict(listen_port, call_ray_sta
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

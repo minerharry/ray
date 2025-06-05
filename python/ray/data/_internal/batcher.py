@@ -1,8 +1,20 @@
-import random
-from typing import Optional, List
+import warnings
+from typing import Optional
 
-from ray.data.block import Block, BlockAccessor
+from ray.data._internal.arrow_block import ArrowBlockAccessor
+from ray.data._internal.arrow_ops import transform_pyarrow
+from ray.data._internal.arrow_ops.transform_pyarrow import try_combine_chunked_columns
 from ray.data._internal.delegating_block_builder import DelegatingBlockBuilder
+from ray.data._internal.execution.util import memory_string
+from ray.data._internal.util import get_total_obj_store_mem_on_node
+from ray.data.block import Block, BlockAccessor
+from ray.util import log_once
+
+# Delay compaction until the shuffle buffer has reached this ratio over the min
+# shuffle buffer size. Setting this to 1 minimizes memory usage, at the cost of
+# frequent compactions. Setting this to higher values increases memory usage but
+# reduces compaction frequency.
+SHUFFLE_BUFFER_COMPACTION_RATIO = 1.5
 
 
 class BatcherInterface:
@@ -12,10 +24,6 @@ class BatcherInterface:
         Args:
             block: Block to add to the block buffer.
         """
-        raise NotImplementedError()
-
-    def can_add(self, block: Block) -> bool:
-        """Whether the block can be added to the buffer."""
         raise NotImplementedError()
 
     def done_adding(self) -> bool:
@@ -73,13 +81,8 @@ class Batcher(BatcherInterface):
             block: Block to add to the block buffer.
         """
         if BlockAccessor.for_block(block).num_rows() > 0:
-            assert self.can_add(block)
             self._buffer.append(block)
             self._buffer_size += BlockAccessor.for_block(block).num_rows()
-
-    def can_add(self, block: Block) -> bool:
-        """Whether the block can be added to the buffer."""
-        return not self._done_adding
 
     def done_adding(self) -> bool:
         """Indicate to the batcher that no more blocks will be added to the batcher."""
@@ -102,11 +105,12 @@ class Batcher(BatcherInterface):
             A batch represented as a Block.
         """
         assert self.has_batch() or (self._done_adding and self.has_any())
+        needs_copy = self._ensure_copy
         # If no batch size, short-circuit.
         if self._batch_size is None:
             assert len(self._buffer) == 1
             block = self._buffer[0]
-            if self._ensure_copy:
+            if needs_copy:
                 # Copy block if needing to ensure fresh batch copy.
                 block = BlockAccessor.for_block(block)
                 block = block.slice(0, block.num_rows(), copy=True)
@@ -123,12 +127,17 @@ class Batcher(BatcherInterface):
                 # the leftovers.
                 leftover.append(block)
             elif accessor.num_rows() <= needed:
-                # We need this entire block to fill out a batch.
-                # We need to call `accessor.slice()` to ensure
-                # the subsequent block's type are the same.
-                output.add_block(accessor.slice(0, accessor.num_rows(), copy=False))
+                output.add_block(accessor.to_block())
                 needed -= accessor.num_rows()
             else:
+                # Try de-fragmenting table in case its columns
+                # have too many chunks (potentially hindering performance of
+                # subsequent slicing operation)
+                if isinstance(accessor, ArrowBlockAccessor):
+                    accessor = BlockAccessor.for_block(
+                        transform_pyarrow.try_combine_chunked_columns(block)
+                    )
+
                 # We only need part of the block to fill out a batch.
                 output.add_block(accessor.slice(0, needed, copy=False))
                 # Add the rest of the block to the leftovers.
@@ -139,13 +148,11 @@ class Batcher(BatcherInterface):
         # blocks consumed on the next batch extraction.
         self._buffer = leftover
         self._buffer_size -= self._batch_size
+        needs_copy = needs_copy and not output.will_build_yield_copy()
         batch = output.build()
-        if self._ensure_copy:
+        if needs_copy:
             # Need to ensure that the batch is a fresh copy.
             batch = BlockAccessor.for_block(batch)
-            # TOOD(Clark): This copy will often be unnecessary, e.g. for pandas
-            # DataFrame batches that have required concatenation to construct, which
-            # always requires a copy. We should elide this copy in those cases.
             batch = batch.slice(0, batch.num_rows(), copy=True)
         return batch
 
@@ -157,28 +164,18 @@ class ShufflingBatcher(BatcherInterface):
     #
     # This shuffling batcher lazily builds a shuffle buffer from added blocks, and once
     # a batch is requested via .next_batch(), it concatenates the blocks into a concrete
-    # shuffle buffer, generates random shuffle indices, and starts returning shuffled
-    # batches.
+    # shuffle buffer and randomly shuffles the entire buffer.
     #
     # Adding of more blocks can be intermixed with retrieving batches, but it should be
     # noted that we can end up performing two expensive operations on each retrieval:
     #  1. Build added blocks into a concrete shuffle buffer.
-    #  2. Generate random shuffle indices.
-    # Note that (1) and (2) only happen when new blocks are added, upon the next
-    # retrieval. I.e., if no new blocks have been added since the last batch retrieval,
-    # and there are still batches in the existing concrete shuffle buffer to be yielded,
-    # then each batch retrieval will only involve slicing the batch out of the concrete
-    # shuffle buffer.
+    #  2. Shuffling the entire buffer.
+    # To amortize the overhead of this process, we only shuffle the blocks after a
+    # delay designated by SHUFFLE_BUFFER_COMPACTION_RATIO.
     #
     # Similarly, adding blocks is very cheap. Each added block will be appended to a
     # list, with concatenation of the underlying data delayed until the next batch
-    # retrieval.
-    #
-    # Since (1) runs of block additions are cheap, and (2) runs of batch retrievals are
-    # cheap, callers of ShufflingBatcher are encouraged to add as many blocks as
-    # possible (up to the shuffle buffer capacity), followed by retrieving as many
-    # batches as possible (down to the shuffle buffer minimum size), in such contiguous
-    # runs.
+    # compaction.
 
     def __init__(
         self,
@@ -202,23 +199,23 @@ class ShufflingBatcher(BatcherInterface):
         if batch_size is None:
             raise ValueError("Must specify a batch_size if using a local shuffle.")
         self._batch_size = batch_size
+        self._shuffle_seed = shuffle_seed
         if shuffle_buffer_min_size < batch_size:
             # Round it up internally to `batch_size` since our algorithm requires it.
             # This is harmless since it only offers extra randomization.
             shuffle_buffer_min_size = batch_size
-        self._buffer_capacity = max(
-            2 * shuffle_buffer_min_size,
-            shuffle_buffer_min_size + batch_size,
+        self._min_rows_to_yield_batch = shuffle_buffer_min_size
+        self._min_rows_to_trigger_compaction = int(
+            shuffle_buffer_min_size * SHUFFLE_BUFFER_COMPACTION_RATIO
         )
-        self._buffer_min_size = shuffle_buffer_min_size
         self._builder = DelegatingBlockBuilder()
         self._shuffle_buffer: Block = None
-        self._shuffle_indices: List[int] = None
         self._batch_head = 0
         self._done_adding = False
 
-        if shuffle_seed is not None:
-            random.seed(shuffle_seed)
+        self._total_object_store_nbytes = get_total_obj_store_mem_on_node()
+        self._total_num_rows_added = 0
+        self._total_nbytes_added = 0
 
     def add(self, block: Block):
         """Add a block to the shuffle buffer.
@@ -228,18 +225,49 @@ class ShufflingBatcher(BatcherInterface):
         Args:
             block: Block to add to the shuffle buffer.
         """
-        if BlockAccessor.for_block(block).num_rows() > 0:
-            assert self.can_add(block)
+        # Because Arrow tables are memory mapped, blocks in the builder reside in object
+        # store memory and not local heap memory. So, if you specify a large buffer size
+        # and there isn't enough object store memory on the node, you encounter
+        # spilling.
+        if (
+            self._estimated_min_nbytes_in_buffers is not None
+            and self._estimated_min_nbytes_in_buffers > self._total_object_store_nbytes
+            and log_once("shuffle_buffer_mem_warning")
+        ):
+            warnings.warn(
+                "The node you're iterating on has "
+                f"{memory_string(self._total_object_store_nbytes)} object "
+                "store memory, but the shuffle buffer is estimated to use "
+                f"{memory_string(self._estimated_min_nbytes_in_buffers)}. If you don't "
+                f"decrease the shuffle buffer size from "
+                f"{self._min_rows_to_yield_batch} rows, you might encounter spilling."
+            )
+
+        block_accessor = BlockAccessor.for_block(block)
+        if block_accessor.num_rows() > 0:
             self._builder.add_block(block)
+            self._total_num_rows_added += block_accessor.num_rows()
+            self._total_nbytes_added += block_accessor.size_bytes()
 
-    def can_add(self, block: Block) -> bool:
-        """Whether the block can be added to the shuffle buffer.
+    @property
+    def _average_row_nbytes(self) -> Optional[int]:
+        """Return the average number of bytes per row added to this batcher."""
+        return (
+            self._total_nbytes_added // self._total_num_rows_added
+            if self._total_num_rows_added > 0
+            else None
+        )
 
-        This does not take the to-be-added block size into account when checking the
-        buffer size vs. buffer capacity, since we need to support large outlier blocks
-        and have to guard against min buffer size liveness issues.
+    @property
+    def _estimated_min_nbytes_in_buffers(self) -> Optional[int]:
+        """Return the estimated minimum number of bytes across all buffers.
+
+        This includes data in both the compacted and uncompacted buffers.
         """
-        return self._buffer_size() <= self._buffer_capacity and not self._done_adding
+        if self._average_row_nbytes is None:
+            return None
+
+        return self._average_row_nbytes * self._min_rows_to_trigger_compaction
 
     def done_adding(self) -> bool:
         """Indicate to the batcher that no more blocks will be added to the batcher.
@@ -250,29 +278,44 @@ class ShufflingBatcher(BatcherInterface):
 
     def has_any(self) -> bool:
         """Whether this batcher has any data."""
-        return self._buffer_size() > 0
+        return self._num_rows() > 0
 
     def has_batch(self) -> bool:
         """Whether this batcher has any batches."""
-        buffer_size = self._buffer_size()
-        # If still adding blocks, ensure that removing a batch wouldn't cause the
-        # shuffle buffer to dip beneath its configured minimum size.
-        return buffer_size - self._batch_size >= self._buffer_min_size or (
-            self._done_adding and buffer_size >= self._batch_size
+        num_rows = self._num_rows()
+
+        if not self._done_adding:
+            # Delay pulling of batches until the buffer is large enough in order to
+            # amortize compaction overhead.
+            return (
+                self._num_compacted_rows() >= self._min_rows_to_yield_batch
+                or num_rows - self._batch_size >= self._min_rows_to_trigger_compaction
+            )
+        else:
+            return num_rows >= self._batch_size
+
+    def _num_rows(self) -> int:
+        """Return the total number of rows that haven't been yielded yet.
+
+        This includes rows in both the compacted and uncompacted buffers.
+        """
+        return self._num_compacted_rows() + self._num_uncompacted_rows()
+
+    def _num_compacted_rows(self) -> int:
+        """Return number of unyielded rows in the compacted (shuffle) buffer."""
+        if self._shuffle_buffer is None:
+            return 0
+        # The size of the concrete (materialized) shuffle buffer, adjusting
+        # for the batch head position, which also serves as a counter of the number
+        # of already-yielded rows from the current concrete shuffle buffer.
+        return max(
+            0,
+            BlockAccessor.for_block(self._shuffle_buffer).num_rows() - self._batch_head,
         )
 
-    def _buffer_size(self) -> int:
-        """Return shuffle buffer size."""
-        buffer_size = self._builder.num_rows()
-        if self._shuffle_buffer is not None:
-            # Include the size of the concrete (materialized) shuffle buffer, adjusting
-            # for the batch head position, which also serves as a counter of the number
-            # of already-yielded rows from the current concrete shuffle buffer.
-            buffer_size += (
-                BlockAccessor.for_block(self._shuffle_buffer).num_rows()
-                - self._batch_head
-            )
-        return buffer_size
+    def _num_uncompacted_rows(self) -> int:
+        """Return number of unyielded rows in the uncompacted buffer."""
+        return self._builder.num_rows()
 
     def next_batch(self) -> Block:
         """Get the next shuffled batch from the shuffle buffer.
@@ -281,40 +324,46 @@ class ShufflingBatcher(BatcherInterface):
             A batch represented as a Block.
         """
         assert self.has_batch() or (self._done_adding and self.has_any())
-        # Add rows in the builder to the shuffle buffer.
-        if self._builder.num_rows() > 0:
+        # Add rows in the builder to the shuffle buffer. Note that we delay compaction
+        # as much as possible to amortize the concatenation overhead. Compaction is
+        # only necessary when the materialized buffer size falls below the min size.
+        if self._num_uncompacted_rows() > 0 and (
+            self._done_adding
+            or self._num_compacted_rows() <= self._min_rows_to_yield_batch
+        ):
             if self._shuffle_buffer is not None:
                 if self._batch_head > 0:
                     # Compact the materialized shuffle buffer.
-                    # TODO(Clark): If alternating between adding blocks and fetching
-                    # shuffled batches, this aggressive compaction could be inefficient.
-                    self._shuffle_buffer = BlockAccessor.for_block(
-                        self._shuffle_buffer
-                    ).take(self._shuffle_indices[self._batch_head :])
+                    block = BlockAccessor.for_block(self._shuffle_buffer)
+                    self._shuffle_buffer = block.slice(
+                        self._batch_head, block.num_rows()
+                    )
                 # Add the unyielded rows from the existing shuffle buffer.
                 self._builder.add_block(self._shuffle_buffer)
             # Build the new shuffle buffer.
             self._shuffle_buffer = self._builder.build()
+            self._shuffle_buffer = BlockAccessor.for_block(
+                self._shuffle_buffer
+            ).random_shuffle(self._shuffle_seed)
+            if self._shuffle_seed is not None:
+                self._shuffle_seed += 1
+
+            if isinstance(
+                BlockAccessor.for_block(self._shuffle_buffer), ArrowBlockAccessor
+            ):
+                self._shuffle_buffer = try_combine_chunked_columns(self._shuffle_buffer)
+
             # Reset the builder.
             self._builder = DelegatingBlockBuilder()
-            # Invalidate the shuffle indices.
-            self._shuffle_indices = None
             self._batch_head = 0
 
         assert self._shuffle_buffer is not None
         buffer_size = BlockAccessor.for_block(self._shuffle_buffer).num_rows()
         # Truncate the batch to the buffer size, if necessary.
         batch_size = min(self._batch_size, buffer_size)
-
-        if self._shuffle_indices is None:
-            # Need to generate new shuffle indices.
-            self._shuffle_indices = list(range(buffer_size))
-            random.shuffle(self._shuffle_indices)
-
-        # Get the shuffle indices for this batch.
-        batch_indices = self._shuffle_indices[
-            self._batch_head : self._batch_head + batch_size
-        ]
+        slice_start = self._batch_head
         self._batch_head += batch_size
         # Yield the shuffled batch.
-        return BlockAccessor.for_block(self._shuffle_buffer).take(batch_indices)
+        return BlockAccessor.for_block(self._shuffle_buffer).slice(
+            slice_start, self._batch_head
+        )

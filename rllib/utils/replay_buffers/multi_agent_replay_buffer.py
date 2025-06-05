@@ -72,7 +72,7 @@ class MultiAgentReplayBuffer(ReplayBuffer):
         replay_burn_in: int = 0,
         replay_zero_init_states: bool = True,
         underlying_buffer_config: dict = None,
-        **kwargs
+        **kwargs,
     ):
         """Initializes a MultiAgentReplayBuffer instance.
 
@@ -242,7 +242,7 @@ class MultiAgentReplayBuffer(ReplayBuffer):
 
         Args:
             policy_id: ID of the policy that corresponds to the underlying
-            buffer
+                buffer
             batch: SampleBatch to add to the underlying buffer
             ``**kwargs``: Forward compatibility kwargs.
         """
@@ -267,9 +267,9 @@ class MultiAgentReplayBuffer(ReplayBuffer):
         elif self.storage_unit == StorageUnit.EPISODES:
             timeslices = []
             for eps in batch.split_by_episode():
-                if (
-                    eps.get(SampleBatch.T)[0] == 0
-                    and eps.get(SampleBatch.DONES)[-1] == True  # noqa E712
+                if eps.get(SampleBatch.T)[0] == 0 and (
+                    eps.get(SampleBatch.TERMINATEDS, [True])[-1]
+                    or eps.get(SampleBatch.TRUNCATEDS, [False])[-1]
                 ):
                     # Only add full episodes to the buffer
                     timeslices.append(eps)
@@ -304,7 +304,7 @@ class MultiAgentReplayBuffer(ReplayBuffer):
         Args:
             num_items: Number of items to sample from a policy's buffer.
             policy_id: ID of the policy that created the experiences we sample. If
-            none is given, sample from all policies.
+                none is given, sample from all policies.
 
         Returns:
             Concatenated MultiAgentBatch of items.
@@ -337,8 +337,8 @@ class MultiAgentReplayBuffer(ReplayBuffer):
         """Returns the stats of this buffer and all underlying buffers.
 
         Args:
-            debug: If True, stats of underlying replay buffers will
-            be fetched with debug=True.
+            debug: If True, stats of underlying replay buffers
+                are fetched with debug=True.
 
         Returns:
             stat: Dictionary of buffer stats.

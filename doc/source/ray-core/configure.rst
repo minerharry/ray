@@ -3,33 +3,53 @@
 Configuring Ray
 ===============
 
-.. note:: For running Java applications, please see `Java Applications`_.
+.. note:: For running Java applications, see `Java Applications`_.
 
 This page discusses the various way to configure Ray, both from the Python API
 and from the command line. Take a look at the ``ray.init`` `documentation
 <package-ref.html#ray.init>`__ for a complete overview of the configurations.
 
-.. important:: For the multi-node setting, you must first run ``ray start`` on the command line to start the Ray cluster services on the machine before ``ray.init`` in Python to connect to the cluster services. On a single machine, you can run ``ray.init()`` without ``ray start``, which will both start the Ray cluster services and connect to them.
+.. important:: For the multi-node setting, you must first run ``ray start`` on the command line to start the Ray cluster services on the machine before ``ray.init`` in Python to connect to the cluster services. On a single machine, you can run ``ray.init()`` without ``ray start``, which both starts the Ray cluster services and connects to them.
 
 
 .. _cluster-resources:
 
-Cluster Resources
+Cluster resources
 -----------------
 
 Ray by default detects available resources.
 
-.. code-block:: python
+.. testcode::
+  :hide:
+
+  import ray
+  ray.shutdown()
+
+.. testcode::
+
+  import ray
 
   # This automatically detects available resources in the single machine.
   ray.init()
 
 If not running cluster mode, you can specify cluster resources overrides through ``ray.init`` as follows.
 
-.. code-block:: python
+.. testcode::
+  :hide:
+
+  ray.shutdown()
+
+.. testcode::
 
   # If not connecting to an existing cluster, you can specify resources overrides:
   ray.init(num_cpus=8, num_gpus=1)
+
+.. testcode::
+  :hide:
+
+  ray.shutdown()
+
+.. testcode::
 
   # Specifying custom resources
   ray.init(num_gpus=1, resources={'Resource1': 4, 'Resource2': 16})
@@ -49,36 +69,24 @@ When starting Ray from the command line, pass the ``--num-cpus`` and ``--num-gpu
 
 If using the command line, connect to the Ray cluster as follow:
 
-.. code-block:: python
+.. testcode::
+  :skipif: True
 
   # Connect to ray. Notice if connected to existing cluster, you don't specify resources.
   ray.init(address=<address>)
 
-.. _omp-num-thread-note:
-
-.. note::
-    Ray sets the environment variable ``OMP_NUM_THREADS=1`` by default. This is done
-    to avoid performance degradation with many workers (issue #6998). You can
-    override this by explicitly setting ``OMP_NUM_THREADS``. ``OMP_NUM_THREADS`` is commonly
-    used in numpy, PyTorch, and Tensorflow to perform multi-threaded linear algebra.
-    In multi-worker setting, we want one thread per worker instead of many threads
-    per worker to avoid contention. Some other libraries may have their own way to configure
-    parallelism. For example, if you're using OpenCV, you should manually set the number of
-    threads using cv2.setNumThreads(num_threads) (set to 0 to disable multi-threading).
-
-
 .. _temp-dir-log-files:
 
-Logging and Debugging
+Logging and debugging
 ---------------------
 
-Each Ray session will have a unique name. By default, the name is
+Each Ray session has a unique name. By default, the name is
 ``session_{timestamp}_{pid}``. The format of ``timestamp`` is
 ``%Y-%m-%d_%H-%M-%S_%f`` (See `Python time format <strftime.org>`__ for details);
 the pid belongs to the startup process (the process calling ``ray.init()`` or
 the Ray process executed by a shell in ``ray start``).
 
-For each session, Ray will place all its temporary files under the
+For each session, Ray places all its temporary files under the
 *session directory*. A *session directory* is a subdirectory of the
 *root temporary path* (``/tmp/ray`` by default),
 so the default session directory is ``/tmp/ray/{ray_session_name}``.
@@ -86,7 +94,7 @@ You can sort by their names to find the latest session.
 
 Change the *root temporary directory* by passing ``--temp-dir={your temp path}`` to ``ray start``.
 
-(There is not currently a stable way to change the root temporary directory when calling ``ray.init()``, but if you need to, you can provide the ``_temp_dir`` argument to ``ray.init()``.)
+There currently isn't a stable way to change the root temporary directory when calling ``ray.init()``, but if you need to, you can provide the ``_temp_dir`` argument to ``ray.init()``.
 
 Look :ref:`Logging Directory Structure <logging-directory-structure>` for more details.
 
@@ -94,42 +102,45 @@ Look :ref:`Logging Directory Structure <logging-directory-structure>` for more d
 
 Ports configurations
 --------------------
-Ray requires bi-directional communication among its nodes in a cluster. Each of node is supposed to open specific ports to receive incoming network requests.
+Ray requires bi-directional communication among its nodes in a cluster. Each node opens specific ports to receive incoming network requests.
 
 All Nodes
 ~~~~~~~~~
 - ``--node-manager-port``: Raylet port for node manager. Default: Random value.
 - ``--object-manager-port``: Raylet port for object manager. Default: Random value.
+- ``--runtime-env-agent-port``: Raylet port for runtime env agent. Default: Random value.
 
 The node manager and object manager run as separate processes with their own ports for communication.
 
 The following options specify the ports used by dashboard agent process.
 
 - ``--dashboard-agent-grpc-port``: The port to listen for grpc on. Default: Random value.
-- ``--dashboard-agent-listen-port``: The port to listen for http on. Default: Random value.
+- ``--dashboard-agent-listen-port``: The port to listen for http on. Default: 52365.
 - ``--metrics-export-port``: The port to use to expose Ray metrics. Default: Random value.
 
 The following options specify the range of ports used by worker processes across machines. All ports in the range should be open.
 
-- ``--min-worker-port``: Minimum port number worker can be bound to. Default: 10002.
-- ``--max-worker-port``: Maximum port number worker can be bound to. Default: 19999.
+- ``--min-worker-port``: Minimum port number for the worker to bind to. Default: 10002.
+- ``--max-worker-port``: Maximum port number for the worker to bind to. Default: 19999.
 
-Port numbers are how Ray disambiguates input and output to and from multiple workers on a single node. Each worker will take input and give output on a single port number. Thus, for example, by default, there is a maximum of 10,000 workers on each node, irrespective of number of CPUs.
+Port numbers are how Ray differentiates input and output to and from multiple workers on a single node. Each worker takes input and gives output on a single port number. Therefore, by default, there's a maximum of 10,000 workers on each node, irrespective of number of CPUs.
 
-In general, it is recommended to give Ray a wide range of possible worker ports, in case any of those ports happen to be in use by some other program on your machine. However, when debugging it is useful to explicitly specify a short list of worker ports such as ``--worker-port-list=10000,10001,10002,10003,10004`` (note that this will limit the number of workers, just like specifying a narrow range).
+In general, you should give Ray a wide range of possible worker ports, in case any of those ports happen to be in use by some other program on your machine. However, when debugging, it's useful to explicitly specify a short list of worker ports such as ``--worker-port-list=10000,10001,10002,10003,10004``
+Note that this practice limits the number of workers, just like specifying a narrow range.
 
-Head Node
+Head node
 ~~~~~~~~~
-In addition to ports specified above, the head node needs to open several more ports.
+In addition to ports specified in the preceding section, the head node needs to open several more ports.
 
-- ``--port``: Port of Ray (GCS server). The head node will start a GCS server listening on this port. Default: 6379.
+- ``--port``: Port of the Ray GCS server. The head node starts a GCS server listening on this port. Default: 6379.
 - ``--ray-client-server-port``: Listening port for Ray Client Server. Default: 10001.
 - ``--redis-shard-ports``: Comma-separated list of ports for non-primary Redis shards. Default: Random values.
+- ``--dashboard-grpc-port``: (Deprecated) No longer used. Only kept for backward compatibility.
 
 - If ``--include-dashboard`` is true (the default), then the head node must open ``--dashboard-port``. Default: 8265.
 
-If ``--include-dashboard`` is true but the ``--dashboard-port`` is not open on
-the head node, you will repeatedly get
+If ``--include-dashboard`` is true but the ``--dashboard-port`` isn't open on
+the head node, you won't be able to access the dashboard, and you repeatedly get
 
 .. code-block:: bash
 
@@ -142,10 +153,8 @@ the head node, you will repeatedly get
     details = "failed to connect to all addresses"
     debug_error_string = "{"description":"Failed to pick subchannel","file":"src/core/ext/filters/client_channel/client_channel.cc","file_line":4165,"referenced_errors":[{"description":"failed to connect to all addresses","file":"src/core/ext/filters/client_channel/lb_policy/pick_first/pick_first.cc","file_line":397,"grpc_status":14}]}"
 
-(Also, you will not be able to access the dashboard.)
-
 If you see that error, check whether the ``--dashboard-port`` is accessible
-with ``nc`` or ``nmap`` (or your browser).
+through ``nc``, ``nmap``, or your hello browser.
 
 .. code-block:: bash
 
@@ -159,46 +168,124 @@ with ``nc`` or ``nmap`` (or your browser).
 
 Note that the dashboard runs as a separate subprocess which can crash invisibly
 in the background, so even if you checked port 8265 earlier, the port might be
-closed *now* (for the prosaic reason that there is no longer a service running
-on it). This also means that if that port is unreachable, if you ``ray stop``
-and ``ray start``, it may become reachable again due to the dashboard
-restarting.
+closed *now* (for the prosaic reason that there's no longer a service running
+on it). This also means that if you ``ray stop`` and ``ray start`` when the port is
+unreachable, it may become reachable again due to the dashboard restarting.
+
 
 If you don't want the dashboard, set ``--include-dashboard=false``.
 
-TLS Authentication
+TLS authentication
 ------------------
 
-Ray can be configured to use TLS on it's gRPC channels.
-This means that connecting to the Ray client on the head node will
-require an appropriate set of credentials and also that data exchanged between
-various processes (client, head, workers) will be encrypted.
+You can configure Ray to use TLS on its gRPC channels.
+This means that connecting to the Ray head requires
+an appropriate set of credentials and also that data exchanged between
+various processes (client, head, workers) is encrypted.
 
-Enabling TLS will cause a performance hit due to the extra overhead of mutual
+TLS uses the private key and public key for encryption and decryption. The owner
+keeps the private key secret and TLS shares the public key with the other party.
+This pattern ensures that only the intended recipient can read the message.
+
+A Certificate Authority (CA) is a trusted third party that certifies the identity of the
+public key owner. The digital certificate issued by the CA contains the public key itself,
+the identity of the public key owner, and the expiration date of the certificate. Note that
+if the owner of the public key doesn't want to obtain a digital certificate from a CA,
+they can generate a self-signed certificate with tools like OpenSSL.
+
+To obtain a digital certificate, the owner of the public key must generate a Certificate Signing
+Request (CSR). The CSR contains information about the owner of the public
+key and the public key itself. Ray requires additional steps for achieving
+a successful TLS encryption.
+
+Here is a step-by-step guide for adding TLS Authentication to a static Kubernetes Ray cluster using
+a self-signed certificates:
+
+Step 1: Generate a private key and self-signed certificate for CA
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+  openssl req -x509 \
+              -sha256 -days 3650 \
+              -nodes \
+              -newkey rsa:2048 \
+              -subj "/CN=*.ray.io/C=US/L=San Francisco" \
+              -keyout ca.key -out ca.crt
+
+Use the following command to encode the private key file and the self-signed certificate file,
+then paste encoded strings to the secret.yaml.
+
+.. code-block:: bash
+
+  cat ca.key | base64
+  cat ca.crt | base64
+
+# Alternatively, this command automatically encode and create the secret for the CA key pair.
+.. code-block:: bash
+
+  kubectl create secret generic ca-tls --from-file=ca.crt=<path-to-ca.crt> --from-file=ca.key=<path-to-ca.key>
+
+Step 2: Generate individual private keys and self-signed certificates for the Ray head and workers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The `YAML file
+<https://raw.githubusercontent.com/ray-project/ray/master/doc/source/cluster/kubernetes/configs/static-ray-cluster.tls.yaml>`__, has a ConfigMap named `tls` that
+includes two shell scripts: `gencert_head.sh` and `gencert_worker.sh`. These scripts produce the private key
+and self-signed certificate files (`tls.key` and `tls.crt`) for both head and worker Pods in the initContainer
+of each deployment. By using the initContainer, we can dynamically retrieve the `POD_IP` to the `[alt_names]` section.
+
+The scripts perform the following steps: first, it generates a 2048-bit RSA private key and saves the key as
+`/etc/ray/tls/tls.key`. Then, a Certificate Signing Request (CSR) is generated using the `tls.key` file
+and the `csr.conf` configuration file. Finally, a self-signed certificate (`tls.crt`) is created using
+the Certificate Authority's (`ca.key and ca.crt`) keypair and the CSR (`ca.csr`).
+
+Step 3: Set the environment variables for both Ray head and worker to enable TLS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You enable TLS by setting environment variables.
+
+- ``RAY_USE_TLS``: Either 1 or 0 to use/not-use TLS. If you set it to 1, you must set the environment variables below. Default: 0.
+- ``RAY_TLS_SERVER_CERT``: Location of a `certificate file (tls.crt)`, which Ray presents to other endpoints to achieve mutual authentication.
+- ``RAY_TLS_SERVER_KEY``: Location of a `private key file (tls.key)`, which is the cryptographic means to prove to other endpoints that you are the authorized user of a given certificate.
+- ``RAY_TLS_CA_CERT``: Location of a `CA certificate file (ca.crt)`, which allows TLS to decide whether an the correct authority signed the endpoint's certificate.
+
+Step 4: Verify TLS authentication
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+  # Log in to the worker Pod
+  kubectl exec -it ${WORKER_POD} -- bash
+
+  # Since the head Pod has the certificate of the full qualified DNS resolution for the Ray head service, the connection to the worker Pods
+  # is established successfully
+  ray health-check --address service-ray-head.default.svc.cluster.local:6379
+
+  # Since service-ray-head hasn't added to the alt_names section in the certificate, the connection fails and an error
+  # message similar to the following is displayed: "Peer name service-ray-head is not in peer certificate".
+  ray health-check --address service-ray-head:6379
+
+  # After you add `DNS.3 = service-ray-head` to the alt_names sections and deploy the YAML again, the connection is able to work.
+
+
+Enabling TLS causes a performance hit due to the extra overhead of mutual
 authentication and encryption.
 Testing has shown that this overhead is large for small workloads and becomes
 relatively smaller for large workloads.
-The exact overhead will depend on the nature of your workload.
+The exact overhead depends on the nature of your workload.
 
-TLS is enabled by setting environment variables.
-
-- ``RAY_USE_TLS``: Either 1 or 0 to use/not-use TLS. If this is set to 1 then all of the environment variables below must be set. Default: 0.
-- ``RAY_TLS_SERVER_CERT``: Location of a `certificate file` which is presented to other endpoints so as to achieve mutual authentication.
-- ``RAY_TLS_SERVER_KEY``: Location of a `private key file` which is the cryptographic means to prove to other endpoints that you are the authorized user of a given certificate.
-- ``RAY_TLS_CA_CERT``: Location of a `CA certificate file` which allows TLS to decide whether an endpoint's certificate has been signed by the correct authority.
-
-
-Java Applications
+Java applications
 -----------------
 
-.. important:: For the multi-node setting, you must first run ``ray start`` on the command line to start the Ray cluster services on the machine before ``Ray.init()`` in Java to connect to the cluster services. On a single machine, you can run ``Ray.init()`` without ``ray start``, which will both start the Ray cluster services and connect to them.
+.. important:: For the multi-node setting, you must first run ``ray start`` on the command line to start the Ray cluster services on the machine before ``ray.init()`` in Java to connect to the cluster services. On a single machine, you can run ``ray.init()`` without ``ray start``. It both starts the Ray cluster services and connects to them.
 
 .. _code_search_path:
 
-Code Search Path
+Code search path
 ~~~~~~~~~~~~~~~~
 
-If you want to run a Java application in a multi-node cluster, you must specify the code search path in your driver. The code search path is to tell Ray where to load jars when starting Java workers. Your jar files must be distributed to the same path(s) on all nodes of the Ray cluster before running your code.
+If you want to run a Java application in a multi-node cluster, you must specify the code search path in your driver. The code search path tells Ray where to load jars when starting Java workers. You must distribute your jar files to the same paths on all nodes of the Ray cluster before running your code.
 
 .. code-block:: bash
 
@@ -207,7 +294,7 @@ If you want to run a Java application in a multi-node cluster, you must specify 
       -Dray.job.code-search-path=/path/to/jars/ \
       <classname> <args>
 
-The ``/path/to/jars/`` here points to a directory which contains jars. All jars in the directory will be loaded by workers. You can also provide multiple directories for this parameter.
+The ``/path/to/jars/`` points to a directory which contains jars. Workers load all jars in the directory. You can also provide multiple directories for this parameter.
 
 .. code-block:: bash
 
@@ -220,14 +307,14 @@ You don't need to configure code search path if you run a Java application in a 
 
 See ``ray.job.code-search-path`` under :ref:`Driver Options <java-driver-options>` for more information.
 
-.. note:: Currently we don't provide a way to configure Ray when running a Java application in single machine mode. If you need to configure Ray, run ``ray start`` to start the Ray cluster first.
+.. note:: Currently there's no way to configure Ray when running a Java application in single machine mode. If you need to configure Ray, run ``ray start`` to start the Ray cluster first.
 
 .. _java-driver-options:
 
-Driver Options
+Driver options
 ~~~~~~~~~~~~~~
 
-There is a limited set of options for Java drivers. They are not for configuring the Ray cluster, but only for configuring the driver.
+There's a limited set of options for Java drivers. They're not for configuring the Ray cluster, but only for configuring the driver.
 
 Ray uses `Typesafe Config <https://lightbend.github.io/config/>`__ to read options. There are several ways to set options:
 
@@ -240,20 +327,20 @@ The list of available driver options:
 
 - ``ray.address``
 
-  - The cluster address if the driver connects to an existing Ray cluster. If it is empty, a new Ray cluster will be created.
+  - The cluster address if the driver connects to an existing Ray cluster. If it's empty, Ray creates a new Ray cluster.
   - Type: ``String``
   - Default: empty string.
 
 - ``ray.job.code-search-path``
 
-  - The paths for Java workers to load code from. Currently only directories are supported. You can specify one or more directories split by a ``:``. You don't need to configure code search path if you run a Java application in single machine mode or local mode. Code search path is also used for loading Python code if it's specified. This is required for :ref:`cross_language`. If code search path is specified, you can only run Python remote functions which can be found in the code search path.
+  - The paths for Java workers to load code from. Currently, Ray only supports directories. You can specify one or more directories split by a ``:``. You don't need to configure code search path if you run a Java application in single machine mode or local mode. Ray also uses the code search path to load Python code, if specified. This parameter is required for :ref:`cross_language`. If you specify a code search path, you can only run Python remote functions which you can find in the code search path.
   - Type: ``String``
   - Default: empty string.
   - Example: ``/path/to/jars1:/path/to/jars2:/path/to/pys1:/path/to/pys2``
 
 - ``ray.job.namespace``
 
-  - The namespace of this job. It's used for isolation between jobs. Jobs in different namespaces cannot access each other. If it's not specified, a randomized value will be used instead.
+  - The namespace of this job. Ray uses it for isolation between jobs. Jobs in different namespaces can't access each other. If it's not specified, Ray uses a randomized value.
   - Type: ``String``
   - Default: A random UUID string value.
 

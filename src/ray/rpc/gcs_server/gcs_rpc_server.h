@@ -14,11 +14,91 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/id.h"
 #include "ray/rpc/grpc_server.h"
 #include "ray/rpc/server_call.h"
+#include "src/ray/protobuf/autoscaler.grpc.pb.h"
 #include "src/ray/protobuf/gcs_service.grpc.pb.h"
+
+namespace ray {
+namespace rpc {
+namespace autoscaler {
+
+#define AUTOSCALER_STATE_SERVICE_RPC_HANDLER(HANDLER) \
+  RPC_SERVICE_HANDLER(AutoscalerStateService,         \
+                      HANDLER,                        \
+                      RayConfig::instance().gcs_max_active_rpcs_per_handler())
+
+class AutoscalerStateServiceHandler {
+ public:
+  virtual ~AutoscalerStateServiceHandler() = default;
+
+  virtual void HandleGetClusterResourceState(GetClusterResourceStateRequest request,
+                                             GetClusterResourceStateReply *reply,
+                                             SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleReportAutoscalingState(ReportAutoscalingStateRequest request,
+                                            ReportAutoscalingStateReply *reply,
+                                            SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleRequestClusterResourceConstraint(
+      RequestClusterResourceConstraintRequest request,
+      RequestClusterResourceConstraintReply *reply,
+      SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleGetClusterStatus(GetClusterStatusRequest request,
+                                      GetClusterStatusReply *reply,
+                                      SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleDrainNode(DrainNodeRequest request,
+                               DrainNodeReply *reply,
+                               SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleReportClusterConfig(ReportClusterConfigRequest request,
+                                         ReportClusterConfigReply *reply,
+                                         SendReplyCallback send_reply_callback) = 0;
+};
+
+/// The `GrpcService` for `AutoscalerStateService`.
+class AutoscalerStateGrpcService : public GrpcService {
+ public:
+  /// Constructor.
+  ///
+  /// \param[in] handler The service handler that actually handle the requests.
+  explicit AutoscalerStateGrpcService(instrumented_io_context &io_service,
+                                      AutoscalerStateServiceHandler &handler)
+      : GrpcService(io_service), service_handler_(handler){};
+
+ protected:
+  grpc::Service &GetGrpcService() override { return service_; }
+  void InitServerCallFactories(
+      const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
+    AUTOSCALER_STATE_SERVICE_RPC_HANDLER(GetClusterResourceState);
+    AUTOSCALER_STATE_SERVICE_RPC_HANDLER(ReportAutoscalingState);
+    AUTOSCALER_STATE_SERVICE_RPC_HANDLER(ReportClusterConfig);
+    AUTOSCALER_STATE_SERVICE_RPC_HANDLER(RequestClusterResourceConstraint);
+    AUTOSCALER_STATE_SERVICE_RPC_HANDLER(GetClusterStatus);
+    AUTOSCALER_STATE_SERVICE_RPC_HANDLER(DrainNode);
+  }
+
+ private:
+  /// The grpc async service object.
+  AutoscalerStateService::AsyncService service_;
+  /// The service handler that actually handle the requests.
+  AutoscalerStateServiceHandler &service_handler_;
+};
+
+using AutoscalerStateHandler = AutoscalerStateServiceHandler;
+
+}  // namespace autoscaler
+}  // namespace rpc
+}  // namespace ray
 
 namespace ray {
 namespace rpc {
@@ -31,13 +111,20 @@ namespace rpc {
 #define ACTOR_INFO_SERVICE_RPC_HANDLER(HANDLER, MAX_ACTIVE_RPCS) \
   RPC_SERVICE_HANDLER(ActorInfoGcsService, HANDLER, MAX_ACTIVE_RPCS)
 
+#define MONITOR_SERVICE_RPC_HANDLER(HANDLER) \
+  RPC_SERVICE_HANDLER(MonitorGcsService,     \
+                      HANDLER,               \
+                      RayConfig::instance().gcs_max_active_rpcs_per_handler())
+
 #define NODE_INFO_SERVICE_RPC_HANDLER(HANDLER) \
   RPC_SERVICE_HANDLER(NodeInfoGcsService,      \
                       HANDLER,                 \
                       RayConfig::instance().gcs_max_active_rpcs_per_handler())
 
-#define HEARTBEAT_INFO_SERVICE_RPC_HANDLER(HANDLER) \
-  RPC_SERVICE_HANDLER(HeartbeatInfoGcsService, HANDLER, -1)
+#define TASK_INFO_SERVICE_RPC_HANDLER(HANDLER) \
+  RPC_SERVICE_HANDLER(TaskInfoGcsService,      \
+                      HANDLER,                 \
+                      RayConfig::instance().gcs_max_active_rpcs_per_handler())
 
 #define NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(HANDLER) \
   RPC_SERVICE_HANDLER(NodeResourceInfoGcsService,       \
@@ -48,10 +135,6 @@ namespace rpc {
   RPC_SERVICE_HANDLER(ObjectInfoGcsService,      \
                       HANDLER,                   \
                       RayConfig::instance().gcs_max_active_rpcs_per_handler())
-
-#define STATS_SERVICE_RPC_HANDLER(HANDLER) \
-  RPC_SERVICE_HANDLER(                     \
-      StatsGcsService, HANDLER, RayConfig::instance().gcs_max_active_rpcs_per_handler())
 
 #define WORKER_INFO_SERVICE_RPC_HANDLER(HANDLER) \
   RPC_SERVICE_HANDLER(WorkerInfoGcsService,      \
@@ -73,13 +156,15 @@ namespace rpc {
 #define INTERNAL_PUBSUB_SERVICE_RPC_HANDLER(HANDLER) \
   RPC_SERVICE_HANDLER(InternalPubSubGcsService, HANDLER, -1)
 
-#define GCS_RPC_SEND_REPLY(send_reply_callback, reply, status) \
-  reply->mutable_status()->set_code((int)status.code());       \
-  reply->mutable_status()->set_message(status.message());      \
+#define GCS_RPC_SEND_REPLY(send_reply_callback, reply, status)        \
+  reply->mutable_status()->set_code(static_cast<int>(status.code())); \
+  reply->mutable_status()->set_message(status.message());             \
   send_reply_callback(ray::Status::OK(), nullptr, nullptr)
 
 class JobInfoGcsServiceHandler {
  public:
+  using JobFinishListenerCallback = std::function<void(const rpc::JobTableData &)>;
+
   virtual ~JobInfoGcsServiceHandler() = default;
 
   virtual void HandleAddJob(AddJobRequest request,
@@ -94,8 +179,7 @@ class JobInfoGcsServiceHandler {
                                    GetAllJobInfoReply *reply,
                                    SendReplyCallback send_reply_callback) = 0;
 
-  virtual void AddJobFinishedListener(
-      std::function<void(std::shared_ptr<JobID>)> listener) = 0;
+  virtual void AddJobFinishedListener(JobFinishListenerCallback listener) = 0;
 
   virtual void HandleReportJobError(ReportJobErrorRequest request,
                                     ReportJobErrorReply *reply,
@@ -121,7 +205,8 @@ class JobInfoGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     JOB_INFO_SERVICE_RPC_HANDLER(AddJob);
     JOB_INFO_SERVICE_RPC_HANDLER(MarkJobFinished);
     JOB_INFO_SERVICE_RPC_HANDLER(GetAllJobInfo);
@@ -143,6 +228,11 @@ class ActorInfoGcsServiceHandler {
   virtual void HandleRegisterActor(RegisterActorRequest request,
                                    RegisterActorReply *reply,
                                    SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleRestartActorForLineageReconstruction(
+      RestartActorForLineageReconstructionRequest request,
+      RestartActorForLineageReconstructionReply *reply,
+      SendReplyCallback send_reply_callback) = 0;
 
   virtual void HandleCreateActor(CreateActorRequest request,
                                  CreateActorReply *reply,
@@ -167,6 +257,10 @@ class ActorInfoGcsServiceHandler {
   virtual void HandleKillActorViaGcs(KillActorViaGcsRequest request,
                                      KillActorViaGcsReply *reply,
                                      SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleReportActorOutOfScope(ReportActorOutOfScopeRequest request,
+                                           ReportActorOutOfScopeReply *reply,
+                                           SendReplyCallback send_reply_callback) = 0;
 };
 
 /// The `GrpcService` for `ActorInfoGcsService`.
@@ -184,10 +278,12 @@ class ActorInfoGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     /// Register/Create Actor RPC takes long time, we shouldn't limit them to avoid
     /// distributed deadlock.
     ACTOR_INFO_SERVICE_RPC_HANDLER(RegisterActor, -1);
+    ACTOR_INFO_SERVICE_RPC_HANDLER(RestartActorForLineageReconstruction, -1);
     ACTOR_INFO_SERVICE_RPC_HANDLER(CreateActor, -1);
 
     /// Others need back pressure.
@@ -201,6 +297,8 @@ class ActorInfoGrpcService : public GrpcService {
         GetAllActorInfo, RayConfig::instance().gcs_max_active_rpcs_per_handler());
     ACTOR_INFO_SERVICE_RPC_HANDLER(
         KillActorViaGcs, RayConfig::instance().gcs_max_active_rpcs_per_handler());
+    ACTOR_INFO_SERVICE_RPC_HANDLER(
+        ReportActorOutOfScope, RayConfig::instance().gcs_max_active_rpcs_per_handler());
   }
 
  private:
@@ -214,9 +312,17 @@ class NodeInfoGcsServiceHandler {
  public:
   virtual ~NodeInfoGcsServiceHandler() = default;
 
+  virtual void HandleGetClusterId(rpc::GetClusterIdRequest request,
+                                  rpc::GetClusterIdReply *reply,
+                                  rpc::SendReplyCallback send_reply_callback) = 0;
+
   virtual void HandleRegisterNode(RegisterNodeRequest request,
                                   RegisterNodeReply *reply,
                                   SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleUnregisterNode(UnregisterNodeRequest request,
+                                    UnregisterNodeReply *reply,
+                                    SendReplyCallback send_reply_callback) = 0;
 
   virtual void HandleCheckAlive(CheckAliveRequest request,
                                 CheckAliveReply *reply,
@@ -229,10 +335,6 @@ class NodeInfoGcsServiceHandler {
   virtual void HandleGetAllNodeInfo(GetAllNodeInfoRequest request,
                                     GetAllNodeInfoReply *reply,
                                     SendReplyCallback send_reply_callback) = 0;
-
-  virtual void HandleGetInternalConfig(GetInternalConfigRequest request,
-                                       GetInternalConfigReply *reply,
-                                       SendReplyCallback send_reply_callback) = 0;
 };
 
 /// The `GrpcService` for `NodeInfoGcsService`.
@@ -250,11 +352,19 @@ class NodeInfoGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
+    // We only allow one cluster ID in the lifetime of a client.
+    // So, if a client connects, it should not have a pre-existing different ID.
+    RPC_SERVICE_HANDLER_CUSTOM_AUTH(
+        NodeInfoGcsService,
+        GetClusterId,
+        RayConfig::instance().gcs_max_active_rpcs_per_handler(),
+        AuthType::EMPTY_AUTH);
     NODE_INFO_SERVICE_RPC_HANDLER(RegisterNode);
+    NODE_INFO_SERVICE_RPC_HANDLER(UnregisterNode);
     NODE_INFO_SERVICE_RPC_HANDLER(DrainNode);
     NODE_INFO_SERVICE_RPC_HANDLER(GetAllNodeInfo);
-    NODE_INFO_SERVICE_RPC_HANDLER(GetInternalConfig);
     NODE_INFO_SERVICE_RPC_HANDLER(CheckAlive);
   }
 
@@ -269,26 +379,22 @@ class NodeResourceInfoGcsServiceHandler {
  public:
   virtual ~NodeResourceInfoGcsServiceHandler() = default;
 
-  virtual void HandleGetResources(GetResourcesRequest request,
-                                  GetResourcesReply *reply,
-                                  SendReplyCallback send_reply_callback) = 0;
-
   virtual void HandleGetAllAvailableResources(
       rpc::GetAllAvailableResourcesRequest request,
       rpc::GetAllAvailableResourcesReply *reply,
       rpc::SendReplyCallback send_reply_callback) = 0;
 
-  virtual void HandleReportResourceUsage(ReportResourceUsageRequest request,
-                                         ReportResourceUsageReply *reply,
-                                         SendReplyCallback send_reply_callback) = 0;
+  virtual void HandleGetAllTotalResources(rpc::GetAllTotalResourcesRequest request,
+                                          rpc::GetAllTotalResourcesReply *reply,
+                                          rpc::SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleGetDrainingNodes(rpc::GetDrainingNodesRequest request,
+                                      rpc::GetDrainingNodesReply *reply,
+                                      rpc::SendReplyCallback send_reply_callback) = 0;
 
   virtual void HandleGetAllResourceUsage(GetAllResourceUsageRequest request,
                                          GetAllResourceUsageReply *reply,
                                          SendReplyCallback send_reply_callback) = 0;
-
-  virtual void HandleGetGcsSchedulingStats(GetGcsSchedulingStatsRequest request,
-                                           GetGcsSchedulingStatsReply *reply,
-                                           SendReplyCallback send_reply_callback) = 0;
 };
 
 /// The `GrpcService` for `NodeResourceInfoGcsService`.
@@ -306,12 +412,12 @@ class NodeResourceInfoGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
-    NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(GetResources);
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(GetAllAvailableResources);
-    NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(ReportResourceUsage);
+    NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(GetAllTotalResources);
+    NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(GetDrainingNodes);
     NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(GetAllResourceUsage);
-    NODE_RESOURCE_INFO_SERVICE_RPC_HANDLER(GetGcsSchedulingStats);
   }
 
  private:
@@ -319,78 +425,6 @@ class NodeResourceInfoGrpcService : public GrpcService {
   NodeResourceInfoGcsService::AsyncService service_;
   /// The service handler that actually handle the requests.
   NodeResourceInfoGcsServiceHandler &service_handler_;
-};
-
-class HeartbeatInfoGcsServiceHandler {
- public:
-  virtual ~HeartbeatInfoGcsServiceHandler() = default;
-  virtual void HandleReportHeartbeat(ReportHeartbeatRequest request,
-                                     ReportHeartbeatReply *reply,
-                                     SendReplyCallback send_reply_callback) = 0;
-};
-/// The `GrpcService` for `HeartbeatInfoGcsService`.
-class HeartbeatInfoGrpcService : public GrpcService {
- public:
-  /// Constructor.
-  ///
-  /// \param[in] handler The service handler that actually handle the requests.
-  explicit HeartbeatInfoGrpcService(instrumented_io_context &io_service,
-                                    HeartbeatInfoGcsServiceHandler &handler)
-      : GrpcService(io_service), service_handler_(handler){};
-
- protected:
-  grpc::Service &GetGrpcService() override { return service_; }
-  void InitServerCallFactories(
-      const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
-    HEARTBEAT_INFO_SERVICE_RPC_HANDLER(ReportHeartbeat);
-  }
-
- private:
-  /// The grpc async service object.
-  HeartbeatInfoGcsService::AsyncService service_;
-  /// The service handler that actually handle the requests.
-  HeartbeatInfoGcsServiceHandler &service_handler_;
-};
-
-class StatsGcsServiceHandler {
- public:
-  virtual ~StatsGcsServiceHandler() = default;
-
-  virtual void HandleAddProfileData(AddProfileDataRequest request,
-                                    AddProfileDataReply *reply,
-                                    SendReplyCallback send_reply_callback) = 0;
-
-  virtual void HandleGetAllProfileInfo(GetAllProfileInfoRequest request,
-                                       GetAllProfileInfoReply *reply,
-                                       SendReplyCallback send_reply_callback) = 0;
-};
-
-/// The `GrpcService` for `StatsGcsService`.
-class StatsGrpcService : public GrpcService {
- public:
-  /// Constructor.
-  ///
-  /// \param[in] handler The service handler that actually handle the requests.
-  explicit StatsGrpcService(instrumented_io_context &io_service,
-                            StatsGcsServiceHandler &handler)
-      : GrpcService(io_service), service_handler_(handler){};
-
- protected:
-  grpc::Service &GetGrpcService() override { return service_; }
-
-  void InitServerCallFactories(
-      const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
-    STATS_SERVICE_RPC_HANDLER(AddProfileData);
-    STATS_SERVICE_RPC_HANDLER(GetAllProfileInfo);
-  }
-
- private:
-  /// The grpc async service object.
-  StatsGcsService::AsyncService service_;
-  /// The service handler that actually handle the requests.
-  StatsGcsServiceHandler &service_handler_;
 };
 
 class WorkerInfoGcsServiceHandler {
@@ -412,6 +446,15 @@ class WorkerInfoGcsServiceHandler {
   virtual void HandleAddWorkerInfo(AddWorkerInfoRequest request,
                                    AddWorkerInfoReply *reply,
                                    SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleUpdateWorkerDebuggerPort(UpdateWorkerDebuggerPortRequest request,
+                                              UpdateWorkerDebuggerPortReply *reply,
+                                              SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleUpdateWorkerNumPausedThreads(
+      UpdateWorkerNumPausedThreadsRequest request,
+      UpdateWorkerNumPausedThreadsReply *reply,
+      SendReplyCallback send_reply_callback) = 0;
 };
 
 /// The `GrpcService` for `WorkerInfoGcsService`.
@@ -429,11 +472,14 @@ class WorkerInfoGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     WORKER_INFO_SERVICE_RPC_HANDLER(ReportWorkerFailure);
     WORKER_INFO_SERVICE_RPC_HANDLER(GetWorkerInfo);
     WORKER_INFO_SERVICE_RPC_HANDLER(GetAllWorkerInfo);
     WORKER_INFO_SERVICE_RPC_HANDLER(AddWorkerInfo);
+    WORKER_INFO_SERVICE_RPC_HANDLER(UpdateWorkerDebuggerPort);
+    WORKER_INFO_SERVICE_RPC_HANDLER(UpdateWorkerNumPausedThreads);
   }
 
  private:
@@ -488,7 +534,8 @@ class PlacementGroupInfoGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     PLACEMENT_GROUP_INFO_SERVICE_RPC_HANDLER(CreatePlacementGroup);
     PLACEMENT_GROUP_INFO_SERVICE_RPC_HANDLER(RemovePlacementGroup);
     PLACEMENT_GROUP_INFO_SERVICE_RPC_HANDLER(GetPlacementGroup);
@@ -515,6 +562,10 @@ class InternalKVGcsServiceHandler {
                                    InternalKVGetReply *reply,
                                    SendReplyCallback send_reply_callback) = 0;
 
+  virtual void HandleInternalKVMultiGet(InternalKVMultiGetRequest request,
+                                        InternalKVMultiGetReply *reply,
+                                        SendReplyCallback send_reply_callback) = 0;
+
   virtual void HandleInternalKVPut(InternalKVPutRequest request,
                                    InternalKVPutReply *reply,
                                    SendReplyCallback send_reply_callback) = 0;
@@ -526,6 +577,10 @@ class InternalKVGcsServiceHandler {
   virtual void HandleInternalKVExists(InternalKVExistsRequest request,
                                       InternalKVExistsReply *reply,
                                       SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleGetInternalConfig(GetInternalConfigRequest request,
+                                       GetInternalConfigReply *reply,
+                                       SendReplyCallback send_reply_callback) = 0;
 };
 
 class InternalKVGrpcService : public GrpcService {
@@ -538,12 +593,15 @@ class InternalKVGrpcService : public GrpcService {
   grpc::Service &GetGrpcService() override { return service_; }
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     INTERNAL_KV_SERVICE_RPC_HANDLER(InternalKVGet);
+    INTERNAL_KV_SERVICE_RPC_HANDLER(InternalKVMultiGet);
     INTERNAL_KV_SERVICE_RPC_HANDLER(InternalKVPut);
     INTERNAL_KV_SERVICE_RPC_HANDLER(InternalKVDel);
     INTERNAL_KV_SERVICE_RPC_HANDLER(InternalKVExists);
     INTERNAL_KV_SERVICE_RPC_HANDLER(InternalKVKeys);
+    INTERNAL_KV_SERVICE_RPC_HANDLER(GetInternalConfig);
   }
 
  private:
@@ -569,13 +627,56 @@ class RuntimeEnvGrpcService : public GrpcService {
   grpc::Service &GetGrpcService() override { return service_; }
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     RUNTIME_ENV_SERVICE_RPC_HANDLER(PinRuntimeEnvURI);
   }
 
  private:
   RuntimeEnvGcsService::AsyncService service_;
   RuntimeEnvGcsServiceHandler &service_handler_;
+};
+
+class TaskInfoGcsServiceHandler {
+ public:
+  virtual ~TaskInfoGcsServiceHandler() = default;
+
+  virtual void HandleAddTaskEventData(AddTaskEventDataRequest request,
+                                      AddTaskEventDataReply *reply,
+                                      SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleGetTaskEvents(rpc::GetTaskEventsRequest request,
+                                   rpc::GetTaskEventsReply *reply,
+                                   rpc::SendReplyCallback send_reply_callback) = 0;
+};
+
+/// The `GrpcService` for `TaskInfoGcsService`.
+class TaskInfoGrpcService : public GrpcService {
+ public:
+  /// Constructor.
+  ///
+  /// \param[in] io_service IO service to run the handler.
+  /// \param[in] handler The service handler that actually handle the requests.
+  explicit TaskInfoGrpcService(instrumented_io_context &io_service,
+                               TaskInfoGcsServiceHandler &handler)
+      : GrpcService(io_service), service_handler_(handler){};
+
+ protected:
+  grpc::Service &GetGrpcService() override { return service_; }
+
+  void InitServerCallFactories(
+      const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
+    TASK_INFO_SERVICE_RPC_HANDLER(AddTaskEventData);
+    TASK_INFO_SERVICE_RPC_HANDLER(GetTaskEvents);
+  }
+
+ private:
+  /// The grpc async service object.
+  TaskInfoGcsService::AsyncService service_;
+  /// The service handler that actually handle the requests.
+  TaskInfoGcsServiceHandler &service_handler_;
 };
 
 class InternalPubSubGcsServiceHandler {
@@ -593,6 +694,10 @@ class InternalPubSubGcsServiceHandler {
   virtual void HandleGcsSubscriberCommandBatch(GcsSubscriberCommandBatchRequest request,
                                                GcsSubscriberCommandBatchReply *reply,
                                                SendReplyCallback send_reply_callback) = 0;
+
+  virtual void HandleGcsUnregisterSubscriber(GcsUnregisterSubscriberRequest request,
+                                             GcsUnregisterSubscriberReply *reply,
+                                             SendReplyCallback send_reply_callback) = 0;
 };
 
 class InternalPubSubGrpcService : public GrpcService {
@@ -605,10 +710,12 @@ class InternalPubSubGrpcService : public GrpcService {
   grpc::Service &GetGrpcService() override { return service_; }
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     INTERNAL_PUBSUB_SERVICE_RPC_HANDLER(GcsPublish);
     INTERNAL_PUBSUB_SERVICE_RPC_HANDLER(GcsSubscriberPoll);
     INTERNAL_PUBSUB_SERVICE_RPC_HANDLER(GcsSubscriberCommandBatch);
+    INTERNAL_PUBSUB_SERVICE_RPC_HANDLER(GcsUnregisterSubscriber);
   }
 
  private:
@@ -620,13 +727,12 @@ using JobInfoHandler = JobInfoGcsServiceHandler;
 using ActorInfoHandler = ActorInfoGcsServiceHandler;
 using NodeInfoHandler = NodeInfoGcsServiceHandler;
 using NodeResourceInfoHandler = NodeResourceInfoGcsServiceHandler;
-using HeartbeatInfoHandler = HeartbeatInfoGcsServiceHandler;
-using StatsHandler = StatsGcsServiceHandler;
 using WorkerInfoHandler = WorkerInfoGcsServiceHandler;
 using PlacementGroupInfoHandler = PlacementGroupInfoGcsServiceHandler;
 using InternalKVHandler = InternalKVGcsServiceHandler;
 using InternalPubSubHandler = InternalPubSubGcsServiceHandler;
 using RuntimeEnvHandler = RuntimeEnvGcsServiceHandler;
+using TaskInfoHandler = TaskInfoGcsServiceHandler;
 
 }  // namespace rpc
 }  // namespace ray

@@ -12,6 +12,7 @@ from multiprocessing import TimeoutError
 from typing import Any, Callable, Dict, Hashable, Iterable, List, Optional, Tuple
 
 import ray
+from ray._private.usage import usage_lib
 from ray.util import log_once
 
 try:
@@ -388,12 +389,7 @@ class IMapIterator:
         # submitted chunks. Ordering mirrors that in the in the ResultThread.
         self._submitted_chunks = []
         self._ready_objects = collections.deque()
-        try:
-            self._iterator = iter(iterable)
-        except TypeError:
-            # for compatibility with prior releases, encapsulate non-iterable in a list
-            iterable = [iterable]
-            self._iterator = iter(iterable)
+        self._iterator = iter(iterable)
         if isinstance(iterable, collections.abc.Iterator):
             # Got iterator (which has no len() function).
             # Make default chunksize 1 instead of using _calculate_chunksize().
@@ -563,7 +559,7 @@ class Pool:
             be passed to `ray.init()` to connect to a running cluster. This may
             also be specified using the `RAY_ADDRESS` environment variable.
         ray_remote_args: arguments used to configure the Ray Actors making up
-            the pool.
+            the pool. See :func:`ray.remote` for details.
     """
 
     def __init__(
@@ -576,7 +572,7 @@ class Pool:
         ray_address: Optional[str] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
     ):
-        ray._private.usage.usage_lib.record_library_usage("util.multiprocessing.Pool")
+        usage_lib.record_library_usage("util.multiprocessing.Pool")
 
         self._closed = False
         self._initializer = initializer
@@ -609,7 +605,10 @@ class Pool:
                 RAY_ADDRESS_ENV in os.environ
                 or ray._private.utils.read_ray_address() is not None
             ):
-                ray.init()
+                init_kwargs = {}
+                if os.environ.get(RAY_ADDRESS_ENV) == "local":
+                    init_kwargs["num_cpus"] = processes
+                ray.init(**init_kwargs)
             elif ray_address is not None:
                 init_kwargs = {}
                 if ray_address == "local":

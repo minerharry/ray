@@ -1,11 +1,9 @@
 # coding: utf-8
 import collections
 import logging
-import platform
 import subprocess
 import sys
 import time
-import unittest
 
 import numpy as np
 import pytest
@@ -15,12 +13,12 @@ import ray.cluster_utils
 import ray.util.accelerators
 from ray._private.internal_api import memory_summary
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray._common.test_utils import SignalActor, Semaphore
 from ray._private.test_utils import (
-    Semaphore,
-    SignalActor,
-    fetch_prometheus,
     object_memory_usage,
+    get_metric_check_condition,
     wait_for_condition,
+    MetricSamplePattern,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,12 +60,21 @@ def test_load_balancing(ray_start_cluster):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Times out on Windows")
 def test_hybrid_policy(ray_start_cluster):
-
     cluster = ray_start_cluster
-    num_nodes = 2
+
     num_cpus = 10
-    for _ in range(num_nodes):
-        cluster.add_node(num_cpus=num_cpus, memory=num_cpus)
+    cluster.add_node(
+        num_cpus=num_cpus,
+        memory=num_cpus,
+        _system_config={
+            "scheduler_top_k_absolute": 1,
+            "scheduler_top_k_fraction": 0,
+        },
+    )
+    cluster.add_node(
+        num_cpus=num_cpus,
+        memory=num_cpus,
+    )
     cluster.wait_for_nodes()
     ray.init(address=cluster.address)
 
@@ -215,9 +222,7 @@ def test_load_balancing_with_dependencies(ray_start_cluster):
     attempt_to_load_balance(f, [x], 100, num_nodes, 20)
 
 
-@pytest.mark.skipif(
-    platform.system() == "Windows", reason="Failing on Windows. Multi node."
-)
+@pytest.mark.skipif(sys.platform == "win32", reason="Fails on Windows (multi node).")
 def test_spillback_waiting_task_on_oom(ray_start_cluster):
     # This test ensures that tasks are spilled if they are not schedulable due
     # to lack of object store memory.
@@ -425,7 +430,10 @@ def test_locality_aware_leasing_borrowed_objects(ray_start_cluster):
     )
 
 
-@unittest.skipIf(sys.platform == "win32", "Failing on Windows.")
+@pytest.mark.skipif(
+    ray._private.client_mode_hook.is_client_mode_enabled, reason="Fails w/ Ray Client."
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="Fails on Windows.")
 def test_lease_request_leak(shutdown_only):
     ray.init(num_cpus=1, _system_config={"object_timeout_milliseconds": 200})
 
@@ -702,12 +710,6 @@ def test_gpu_scheduling_liveness(ray_start_cluster):
     indirect=True,
 )
 def test_scheduling_class_depth(ray_start_regular):
-
-    node_info = ray.nodes()[0]
-    metrics_export_port = node_info["MetricsExportPort"]
-    addr = node_info["NodeManagerAddress"]
-    prom_addr = f"{addr}:{metrics_export_port}"
-
     @ray.remote(num_cpus=1000)
     def infeasible():
         pass
@@ -723,33 +725,28 @@ def test_scheduling_class_depth(ray_start_regular):
 
     # We expect the 2 calls to `infeasible` to be separate scheduling classes
     # because one has depth=1, and the other has depth=2.
-
     metric_name = "ray_internal_num_infeasible_scheduling_classes"
 
-    def make_condition(n):
-        def condition():
-            _, metric_names, metric_samples = fetch_prometheus([prom_addr])
-            if metric_name in metric_names:
-                for sample in metric_samples:
-                    if sample.name == metric_name and sample.value == n:
-                        return True
-            return False
+    timeout = 60
+    if sys.platform == "win32":
+        # longer timeout is necessary to pass on windows debug/asan builds.
+        timeout = 180
 
-        return condition
-
-    # timeout=60 necessary to pass on windows debug/asan builds.
-    wait_for_condition(make_condition(2), timeout=60)
+    wait_for_condition(
+        get_metric_check_condition([MetricSamplePattern(name=metric_name, value=2)]),
+        timeout=timeout,
+    )
     start_infeasible.remote(2)
-    wait_for_condition(make_condition(3), timeout=60)
+    wait_for_condition(
+        get_metric_check_condition([MetricSamplePattern(name=metric_name, value=3)]),
+        timeout=timeout,
+    )
     start_infeasible.remote(4)
-    wait_for_condition(make_condition(4), timeout=60)
+    wait_for_condition(
+        get_metric_check_condition([MetricSamplePattern(name=metric_name, value=4)]),
+        timeout=timeout,
+    )
 
 
 if __name__ == "__main__":
-    import os
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -16,7 +16,12 @@
 
 #include <jni.h>
 
-#include "jni_utils.h"
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "jni_utils.h"  // NOLINT(build/include_subdir)
 #include "ray/common/id.h"
 #include "ray/core_worker/common.h"
 #include "ray/core_worker/core_worker.h"
@@ -42,6 +47,7 @@ Status PutSerializedObject(JNIEnv *env,
       nested_ids.push_back(ObjectID::FromBinary(ref.object_id()));
     }
     status = CoreWorkerProcess::GetCoreWorker().CreateOwnedAndIncrementLocalRef(
+        /*is_experimental_mutable_object=*/false,
         native_ray_object->GetMetadata(),
         data_size,
         nested_ids,
@@ -127,8 +133,8 @@ JNIEXPORT jobject JNICALL Java_io_ray_runtime_object_NativeObjectStore_nativeGet
     return JavaByteArrayToId<ObjectID>(env, static_cast<jbyteArray>(id));
   });
   std::vector<std::shared_ptr<RayObject>> results;
-  auto status =
-      CoreWorkerProcess::GetCoreWorker().Get(object_ids, (int64_t)timeoutMs, &results);
+  auto status = CoreWorkerProcess::GetCoreWorker().Get(
+      object_ids, static_cast<int64_t>(timeoutMs), results);
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, nullptr);
   return NativeVectorToJavaList<std::shared_ptr<RayObject>>(
       env, results, NativeRayObjectToJavaNativeRayObject);
@@ -147,8 +153,11 @@ Java_io_ray_runtime_object_NativeObjectStore_nativeWait(JNIEnv *env,
         return JavaByteArrayToId<ObjectID>(env, static_cast<jbyteArray>(id));
       });
   std::vector<bool> results;
-  auto status = CoreWorkerProcess::GetCoreWorker().Wait(
-      object_ids, (int)numObjects, (int64_t)timeoutMs, &results, (bool)fetch_local);
+  auto status = CoreWorkerProcess::GetCoreWorker().Wait(object_ids,
+                                                        static_cast<int>(numObjects),
+                                                        static_cast<int64_t>(timeoutMs),
+                                                        &results,
+                                                        static_cast<bool>(fetch_local));
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, nullptr);
   return NativeVectorToJavaList<bool>(env, results, [](JNIEnv *env, const bool &item) {
     jobject java_item =
@@ -165,7 +174,8 @@ JNIEXPORT void JNICALL Java_io_ray_runtime_object_NativeObjectStore_nativeDelete
       env, objectIds, &object_ids, [](JNIEnv *env, jobject id) {
         return JavaByteArrayToId<ObjectID>(env, static_cast<jbyteArray>(id));
       });
-  auto status = CoreWorkerProcess::GetCoreWorker().Delete(object_ids, (bool)localOnly);
+  auto status =
+      CoreWorkerProcess::GetCoreWorker().Delete(object_ids, static_cast<bool>(localOnly));
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, (void)0);
 }
 
@@ -216,7 +226,8 @@ Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnerAddress(JNIEnv *env,
                                                                    jclass,
                                                                    jbyteArray objectId) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
-  const auto &rpc_address = CoreWorkerProcess::GetCoreWorker().GetOwnerAddress(object_id);
+  const auto &rpc_address =
+      CoreWorkerProcess::GetCoreWorker().GetOwnerAddressOrDie(object_id);
   return NativeStringToJavaByteArray(env, rpc_address.SerializeAsString());
 }
 
@@ -228,7 +239,7 @@ Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnershipInfo(JNIEnv *env,
   rpc::Address address;
   // TODO(ekl) send serialized object status to Java land.
   std::string serialized_object_status;
-  CoreWorkerProcess::GetCoreWorker().GetOwnershipInfo(
+  CoreWorkerProcess::GetCoreWorker().GetOwnershipInfoOrDie(
       object_id, &address, &serialized_object_status);
   auto address_str = address.SerializeAsString();
   auto arr = NativeStringToJavaByteArray(env, address_str);

@@ -19,13 +19,11 @@
 #include <boost/range/adaptor/filtered.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/join.hpp>
+#include <deque>
+#include <utility>
 
 namespace ray {
 namespace raylet {
-namespace {
-// The max number of pending actors to report in node stats.
-const int kMaxPendingActorsToReport = 20;
-};  // namespace
 
 SchedulerResourceReporter::SchedulerResourceReporter(
     const absl::flat_hash_map<SchedulingClass,
@@ -56,9 +54,7 @@ int64_t SchedulerResourceReporter::TotalBacklogSize(
   return sum;
 }
 
-void SchedulerResourceReporter::FillResourceUsage(
-    rpc::ResourcesData &data,
-    const std::shared_ptr<NodeResources> &last_reported_resources) const {
+void SchedulerResourceReporter::FillResourceUsage(rpc::ResourcesData &data) const {
   if (max_resource_shapes_per_load_report_ == 0) {
     return;
   }
@@ -75,7 +71,7 @@ void SchedulerResourceReporter::FillResourceUsage(
     for (auto [scheduling_class, count] : range) {
       if (num_reported++ >= max_resource_shapes_per_load_report_ &&
           max_resource_shapes_per_load_report_ >= 0) {
-        // TODO (Alex): It's possible that we skip a different scheduling key which
+        // TODO(Alex): It's possible that we skip a different scheduling key which
         // contains the same resources.
         skipped_requests++;
         break;
@@ -134,8 +130,19 @@ void SchedulerResourceReporter::FillResourceUsage(
 
   fill_resource_usage_helper(
       tasks_to_schedule_ | boost::adaptors::transformed(transform_func), false);
-  fill_resource_usage_helper(
-      tasks_to_dispatch_ | boost::adaptors::transformed(transform_func), false);
+  auto tasks_to_dispatch_range =
+      tasks_to_dispatch_ | boost::adaptors::transformed([](const auto &pair) {
+        auto cnt = pair.second.size();
+        // We should only report dispatching tasks that do not have resources allocated.
+        for (const auto &task : pair.second) {
+          if (task->allocated_instances) {
+            cnt--;
+          }
+        }
+        return std::make_pair(pair.first, cnt);
+      });
+  fill_resource_usage_helper(tasks_to_dispatch_range, false);
+
   fill_resource_usage_helper(
       infeasible_tasks_ | boost::adaptors::transformed(transform_func), true);
   auto backlog_tracker_range = backlog_tracker_ |
@@ -149,59 +156,9 @@ void SchedulerResourceReporter::FillResourceUsage(
   fill_resource_usage_helper(backlog_tracker_range, false);
 
   if (skipped_requests > 0) {
-    RAY_LOG(INFO) << "More than " << max_resource_shapes_per_load_report_
-                  << " scheduling classes. Some resource loads may not be reported to "
-                     "the autoscaler.";
-  }
-
-  if (RayConfig::instance().enable_light_weight_resource_report() &&
-      last_reported_resources != nullptr) {
-    // Check whether resources have been changed.
-    absl::flat_hash_map<std::string, double> local_resource_map(
-        data.resource_load().begin(), data.resource_load().end());
-    ray::ResourceRequest local_resource =
-        ResourceMapToResourceRequest(local_resource_map, false);
-    if (last_reported_resources->load != local_resource) {
-      data.set_resource_load_changed(true);
-    }
-  } else {
-    data.set_resource_load_changed(true);
-  }
-}
-
-void SchedulerResourceReporter::FillPendingActorInfo(
-    rpc::GetNodeStatsReply *reply) const {
-  // Report infeasible actors.
-  int num_reported = 0;
-  for (const auto &shapes_it : infeasible_tasks_) {
-    auto &work_queue = shapes_it.second;
-    for (const auto &work_it : work_queue) {
-      const RayTask &task = work_it->task;
-      if (task.GetTaskSpecification().IsActorCreationTask()) {
-        if (num_reported++ > kMaxPendingActorsToReport) {
-          break;  // Protect the raylet from reporting too much data.
-        }
-        auto infeasible_task = reply->add_infeasible_tasks();
-        infeasible_task->CopyFrom(task.GetTaskSpecification().GetMessage());
-      }
-    }
-  }
-  // Report actors blocked on resources.
-  num_reported = 0;
-  for (const auto &shapes_it :
-       boost::range::join(tasks_to_dispatch_, tasks_to_schedule_)) {
-    auto &work_queue = shapes_it.second;
-    for (const auto &work_it : work_queue) {
-      const RayTask &task = work_it->task;
-      if (task.GetTaskSpecification().IsActorCreationTask()) {
-        if (num_reported++ > kMaxPendingActorsToReport) {
-          break;  // Protect the raylet from reporting too much data.
-        }
-        // TODO(scv119): we should report pending tasks instead.
-        auto ready_task = reply->add_infeasible_tasks();
-        ready_task->CopyFrom(task.GetTaskSpecification().GetMessage());
-      }
-    }
+    RAY_LOG(WARNING) << "There are more than " << max_resource_shapes_per_load_report_
+                     << " scheduling classes. Some resource loads may not be reported to "
+                        "the autoscaler.";
   }
 }
 

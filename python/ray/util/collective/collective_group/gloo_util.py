@@ -7,7 +7,7 @@ import numpy
 
 import ray
 import ray.experimental.internal_kv as internal_kv
-from ray._private.gcs_utils import GcsClient
+from ray._raylet import GcsClient
 from ray.util.collective.types import ReduceOp, torch_available
 from ray.util.queue import _QueueActor
 
@@ -28,7 +28,7 @@ GLOO_REDUCE_OP_MAP = {
 
 NUMPY_GLOO_DTYPE_MAP = {
     # INT types
-    numpy.int: pygloo.glooDataType_t.glooInt64,
+    numpy.int_: pygloo.glooDataType_t.glooInt64,
     numpy.uint8: pygloo.glooDataType_t.glooUint8,
     numpy.uint32: pygloo.glooDataType_t.glooUint32,
     numpy.uint64: pygloo.glooDataType_t.glooUint64,
@@ -37,7 +37,7 @@ NUMPY_GLOO_DTYPE_MAP = {
     numpy.int64: pygloo.glooDataType_t.glooInt64,
     # FLOAT types
     numpy.half: pygloo.glooDataType_t.glooFloat16,
-    numpy.float: pygloo.glooDataType_t.glooFloat64,
+    float: pygloo.glooDataType_t.glooFloat64,
     numpy.float16: pygloo.glooDataType_t.glooFloat16,
     numpy.float32: pygloo.glooDataType_t.glooFloat32,
     numpy.float64: pygloo.glooDataType_t.glooFloat64,
@@ -271,9 +271,9 @@ class SignalActor:
 class RayInternalKvStore:
     def __init__(self, group_name: str):
         self._group_name = group_name
-        self._job_id = ray.get_runtime_context().job_id
+        self._job_id = ray.get_runtime_context().get_job_id()
         gcs_address = ray._private.worker._global_node.gcs_address
-        self._gcs_client = GcsClient(address=gcs_address, nums_reconnect_retry=10)
+        self._gcs_client = GcsClient(address=gcs_address)
         internal_kv._initialize_internal_kv(self._gcs_client)
 
     def set(self, key: str, data: bytes) -> bool:
@@ -313,4 +313,4 @@ class RayInternalKvStore:
     def __concat_key_with_prefixes(self, original_key):
         """Concat the necessary prefixes and key for isolation purpose for
         different jobs and different groups."""
-        return f"{self._job_id.hex()}-{self._group_name}-{original_key}"
+        return f"{self._job_id}-{self._group_name}-{original_key}"

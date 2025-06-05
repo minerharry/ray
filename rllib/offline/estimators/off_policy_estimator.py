@@ -1,15 +1,12 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import tree
 from typing import Dict, Any, List
 
 import logging
-from ray.rllib.policy.sample_batch import (
-    MultiAgentBatch,
-    DEFAULT_POLICY_ID,
-    SampleBatch,
-)
+from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy import Policy
+from ray.rllib.policy.sample_batch import convert_ma_batch_to_sample_batch
 from ray.rllib.utils.policy import compute_log_likelihoods_from_input_dict
 from ray.rllib.utils.annotations import (
     DeveloperAPI,
@@ -41,8 +38,8 @@ class OffPolicyEstimator(OfflineEvaluator):
             policy: Policy to evaluate.
             gamma: Discount factor of the environment.
             epsilon_greedy: The probability by which we act acording to a fully random
-            policy during deployment. With 1-epsilon_greedy we act according the target
-            policy.
+                policy during deployment. With 1-epsilon_greedy we act according the target
+                policy.
             # TODO (kourosh): convert the input parameters to a config dict.
         """
         super().__init__(policy)
@@ -55,9 +52,9 @@ class OffPolicyEstimator(OfflineEvaluator):
 
         Args:
             batch: The episode to calculate the off-policy estimates (OPE) on. The
-            episode must be a sample batch type that contains the fields "obs",
-            "actions", and "action_prob" and it needs to represent a
-            complete trajectory.
+                episode must be a sample batch type that contains the fields "obs",
+                "actions", and "action_prob" and it needs to represent a
+                complete trajectory.
 
         Returns:
             The off-policy estimates (OPE) calculated on the given episode. The returned
@@ -75,8 +72,8 @@ class OffPolicyEstimator(OfflineEvaluator):
 
         Args:
             batch: The batch to calculate the off-policy estimates (OPE) on. The
-            batch must be a sample batch type that contains the fields "obs",
-            "actions", and "action_prob".
+                batch must be a sample batch type that contains the fields "obs",
+                "actions", and "action_prob".
 
         Returns:
             The off-policy estimates (OPE) calculated on the given batch of single time
@@ -95,7 +92,7 @@ class OffPolicyEstimator(OfflineEvaluator):
 
         Args:
             sample_batch: The batch to split by episode. This contains multiple
-            episodes.
+                episodes.
 
         Returns:
             The modified batch before calling split_by_episode().
@@ -112,7 +109,7 @@ class OffPolicyEstimator(OfflineEvaluator):
 
         Args:
             all_episodes: The list of episodes in the original batch. Each element is a
-            sample batch type that is a single episode.
+                sample batch type that is a single episode.
         """
 
         return all_episodes
@@ -127,7 +124,7 @@ class OffPolicyEstimator(OfflineEvaluator):
 
         Args:
             episode: The episode that is split from the original batch. This is a
-            sample batch type that is a single episode.
+                sample batch type that is a single episode.
         """
         pass
 
@@ -139,8 +136,8 @@ class OffPolicyEstimator(OfflineEvaluator):
 
         Args:
             batch: The batch to calculate the off-policy estimates (OPE) on. The
-            batch must contain the fields "obs", "actions", and "action_prob".
-            split_batch_by_episode: Whether to split the batch by episode.
+                batch must contain the fields "obs", "actions", and "action_prob".
+                split_batch_by_episode: Whether to split the batch by episode.
 
         Returns:
             The off-policy estimates (OPE) calculated on the given batch. The returned
@@ -154,7 +151,7 @@ class OffPolicyEstimator(OfflineEvaluator):
             - v_gain: v_target / max(v_behavior, 1e-8)
             - v_delta: The difference between v_target and v_behavior.
         """
-        batch = self.convert_ma_batch_to_sample_batch(batch)
+        batch = convert_ma_batch_to_sample_batch(batch)
         self.check_action_prob_in_batch(batch)
         estimates_per_epsiode = []
         if split_batch_by_episode:
@@ -192,33 +189,6 @@ class OffPolicyEstimator(OfflineEvaluator):
         estimates["v_delta"] = estimates["v_target"] - estimates["v_behavior"]
 
         return estimates
-
-    @DeveloperAPI
-    def convert_ma_batch_to_sample_batch(self, batch: SampleBatchType) -> SampleBatch:
-        """Converts a MultiAgentBatch to a SampleBatch if neccessary.
-
-        Args:
-            batch: The SampleBatchType to convert.
-
-        Returns:
-            batch: the converted SampleBatch
-
-        Raises:
-            ValueError if the MultiAgentBatch has more than one policy_id
-            or if the policy_id is not `DEFAULT_POLICY_ID`
-        """
-        # TODO: Make this a util to sample_batch.py
-        if isinstance(batch, MultiAgentBatch):
-            policy_keys = batch.policy_batches.keys()
-            if len(policy_keys) == 1 and DEFAULT_POLICY_ID in policy_keys:
-                batch = batch.policy_batches[DEFAULT_POLICY_ID]
-            else:
-                raise ValueError(
-                    "Off-Policy Estimation is not implemented for "
-                    "multi-agent batches. You can set "
-                    "`off_policy_estimation_methods: {}` to resolve this."
-                )
-        return batch
 
     @DeveloperAPI
     def check_action_prob_in_batch(self, batch: SampleBatchType) -> None:

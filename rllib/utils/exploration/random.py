@@ -1,12 +1,11 @@
-from gym.spaces import Discrete, Box, MultiDiscrete, Space
+from gymnasium.spaces import Discrete, Box, MultiDiscrete, Space
 import numpy as np
 import tree  # pip install dm_tree
 from typing import Union, Optional
 
-from ray.rllib.utils.annotations import PublicAPI
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.modelv2 import ModelV2
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.exploration.exploration import Exploration
 from ray.rllib.utils import force_tuple
 from ray.rllib.utils.framework import try_import_tf, try_import_torch, TensorType
@@ -18,7 +17,7 @@ tf1, tf, tfv = try_import_tf()
 torch, _ = try_import_torch()
 
 
-@PublicAPI
+@OldAPIStack
 class Random(Exploration):
     """A random action selector (deterministic/greedy for explore=False).
 

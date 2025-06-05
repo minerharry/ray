@@ -1,29 +1,33 @@
 import logging
 from typing import Any, List
+from collections import defaultdict
 
 from ray.rllib.connectors.connector import (
     ActionConnector,
     Connector,
     ConnectorContext,
     ConnectorPipeline,
-    get_connector,
-    register_connector,
 )
+from ray.rllib.connectors.registry import get_connector, register_connector
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.typing import ActionConnectorDataType
-from ray.util.annotations import PublicAPI
+from ray.util.timer import _Timer
 
 
 logger = logging.getLogger(__name__)
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class ActionConnectorPipeline(ConnectorPipeline, ActionConnector):
     def __init__(self, ctx: ConnectorContext, connectors: List[Connector]):
         super().__init__(ctx, connectors)
+        self.timers = defaultdict(_Timer)
 
     def __call__(self, ac_data: ActionConnectorDataType) -> ActionConnectorDataType:
         for c in self.connectors:
-            ac_data = c(ac_data)
+            timer = self.timers[str(c)]
+            with timer:
+                ac_data = c(ac_data)
         return ac_data
 
     def to_state(self):
@@ -41,13 +45,13 @@ class ActionConnectorPipeline(ConnectorPipeline, ActionConnector):
     @staticmethod
     def from_state(ctx: ConnectorContext, params: Any):
         assert (
-            type(params) == list
+            type(params) is list
         ), "ActionConnectorPipeline takes a list of connector params."
         connectors = []
         for state in params:
             try:
                 name, subparams = state
-                connectors.append(get_connector(ctx, name, subparams))
+                connectors.append(get_connector(name, ctx, subparams))
             except Exception as e:
                 logger.error(f"Failed to de-serialize connector state: {state}")
                 raise e

@@ -28,9 +28,7 @@ class WorkflowEventHandleError(Exception):
 app = FastAPI()
 
 
-@serve.deployment(
-    name=common.HTTP_EVENT_PROVIDER_NAME, route_prefix="/event", num_replicas=1
-)
+@serve.deployment(num_replicas=1)
 @serve.ingress(app)
 class HTTPEventProvider:
     """HTTPEventProvider is defined to be a Ray Serve deployment with route_prefix='/event',
@@ -69,19 +67,25 @@ class HTTPEventProvider:
 
     Example Usage
     =============
-    >>> from ray.workflow.http_event_provider import HTTPEventProvider, HTTPListener
-    >>> ray.init(address='auto', namespace='serve')
-    >>> serve.start(detached=True)
-    >>> event_node = workflow.wait_for_event( # doctest: +SKIP
-    ...     HTTPListener, event_key='')
-    >>> handle_event = ... # doctest: +SKIP
-    >>> workflow.run_aync(handle_event.bind(event_node)) # doctest: +SKIP
-    >>>
-    >>> On a separate python process, it sends an event to the HTTPEventProvider.
-    >>> import requests
-    >>> resp = requests.post('http://127.0.0.1:8000/event/send_event/{workflow_id}',
-    ...     json={'event_key':'my_key','event_payload':'testMessage'})
-    >>>
+    .. testcode::
+        :skipif: True
+
+        from ray.workflow.http_event_provider import HTTPEventProvider, HTTPListener
+        ray.init(address='auto', namespace='serve')
+        serve.start(detached=True)
+        event_node = workflow.wait_for_event(
+            HTTPListener, event_key='')
+        handle_event = ...
+        workflow.run_aync(handle_event.bind(event_node))
+
+    On a separate python process, it sends an event to the HTTPEventProvider:
+
+    .. testcode::
+        :skipif: True
+
+        import requests
+        resp = requests.post('http://127.0.0.1:8000/event/send_event/{workflow_id}',
+            json={'event_key':'my_key','event_payload':'testMessage'})
 
     """
 
@@ -98,20 +102,20 @@ class HTTPEventProvider:
     @app.post("/send_event/{workflow_id}")
     async def send_event(self, workflow_id: str, req: Request) -> JSONResponse:
         """Receive an external event message and acknowledge if it was processed
-        by the workflow
+        by the workflow.
         Args:
-            workflow_id: the workflow that this event is submitted for
-            req: the JSON formatted request that contains two string fields: '
-            event_key' and 'event_payload'
-                'event_key' uniquely identifies a node in the receiving workflow;
-                'event_payload' refers to the event's content
+            workflow_id: The workflow that this event is submitted for.
+            req: The JSON formatted request that contains two string fields:
+                'event_key', which uniquely identifies a node in the receiving
+                workflow and
+                'event_payload', which refers to the event's content.
         Example:
-            JSON formatted request {"event_key":"node_event","event_payload":"approved"}
+            JSON formatted request:
+            {"event_key":"node_event","event_payload":"approved"}
         Returns:
-            if the event was received and processed, HTTP response status 200
-            if the event was not expected or the workflow_id did not exist, HTTP
-                response status 404
-            if the event was received but failed at checkpointing, HTTP response 500
+            HTTP 200 if the event was received and processed.
+            HTTP 404 if the event was not expected or the workflow_id did not exist.
+            HTTP 500 if the event was received but failed at checkpointing.
 
         """
         req_json = await req.json()
@@ -212,38 +216,45 @@ class HTTPListener(EventListener):
 
     Example Usage
     =============
-    >>> from ray.workflow.http_event_provider import HTTPEventProvider, HTTPListener
-    >>> ray.init(address='auto', namespace='serve')
-    >>> serve.start(detached=True)
-    >>> event_node = workflow.wait_for_event( # doctest: +SKIP
-    ...     HTTPListener, event_key='')
-    >>> handle_event = ... # doctest: +SKIP
-    >>> workflow.run(handle_event.bind(event_node)) # doctest: +SKIP
-    >>>
 
+    .. testcode::
+
+        import tempfile
+        from ray import workflow
+        from ray.workflow.http_event_provider import HTTPListener
+
+        temp_dir = tempfile.TemporaryDirectory()
+        ray.init(storage=f"file://{temp_dir.name}")
+
+        serve.start(detached=True)
+        event_node = workflow.wait_for_event(HTTPListener, event_key='')
+
+        @ray.remote
+        def handle_event(arg):
+            return arg
+
+        workflow.run_async(handle_event.bind(event_node), workflow_id="http_listener")
     """
 
     def __init__(self):
         super().__init__()
         try:
-            self.handle = ray.serve.get_deployment(
-                common.HTTP_EVENT_PROVIDER_NAME
-            ).get_handle(sync=True)
-        except KeyError:
+            self.handle = ray.serve.get_app_handle(common.HTTP_EVENT_PROVIDER_NAME)
+        except ray.serve.exceptions.RayServeException:
             mgr = workflow_access.get_management_actor()
             ray.get(mgr.create_http_event_provider.remote())
-            self.handle = ray.serve.get_deployment(
-                common.HTTP_EVENT_PROVIDER_NAME
-            ).get_handle(sync=True)
+            self.handle = ray.serve.get_app_handle(common.HTTP_EVENT_PROVIDER_NAME)
 
     async def poll_for_event(self, event_key: str = None) -> Event:
         """workflow.wait_for_event calls this method to subscribe to the
         HTTPEventProvider and return the received external event
+
         Args:
             event_key: a unique identifier to the receiving node in a workflow;
-            if missing, default to current workflow task id
+                if missing, default to current workflow task id
+
         Returns:
-            tuple(event_key, event_payload)
+            Tuple[event_key: str, event_payload: Event]'
         """
         workflow_id = workflow_context.get_current_workflow_id()
         if event_key is None:

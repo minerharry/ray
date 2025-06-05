@@ -1,11 +1,12 @@
 import copy
-from six.moves import queue
+import queue
 import threading
 from typing import Dict, Optional
 
 from ray.util.timer import _Timer
 from ray.rllib.evaluation.rollout_worker import RolloutWorker
 from ray.rllib.execution.minibatch_buffer import MinibatchBuffer
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.metrics.learner_info import LearnerInfoBuilder, LEARNER_INFO
 from ray.rllib.utils.metrics.window_stat import WindowStat
@@ -14,6 +15,7 @@ from ray.util.iter import _NextValueNotReady
 tf1, tf, tfv = try_import_tf()
 
 
+@OldAPIStack
 class LearnerThread(threading.Thread):
     """Background thread that updates the local model from sample trajectories.
 
@@ -61,14 +63,14 @@ class LearnerThread(threading.Thread):
         self.load_timer = _Timer()
         self.load_wait_timer = _Timer()
         self.daemon = True
-        self.weights_updated = False
+        self.policy_ids_updated = []
         self.learner_info = {}
         self.stopped = False
         self.num_steps = 0
 
     def run(self) -> None:
         # Switch on eager mode if configured.
-        if self.local_worker.policy_config.get("framework") == "tf2":
+        if self.local_worker.config.framework_str == "tf2":
             tf1.enable_eager_execution()
         while not self.stopped:
             self.step()
@@ -86,11 +88,15 @@ class LearnerThread(threading.Thread):
             # no matter the setup (multi-GPU, multi-agent, minibatch SGD,
             # tf vs torch).
             learner_info_builder = LearnerInfoBuilder(num_devices=1)
+            if self.local_worker.config.policy_states_are_swappable:
+                self.local_worker.lock()
             multi_agent_results = self.local_worker.learn_on_batch(batch)
+            if self.local_worker.config.policy_states_are_swappable:
+                self.local_worker.unlock()
+            self.policy_ids_updated.extend(list(multi_agent_results.keys()))
             for pid, results in multi_agent_results.items():
                 learner_info_builder.add_learn_on_batch_results(results, pid)
             self.learner_info = learner_info_builder.finalize()
-            self.weights_updated = True
 
         self.num_steps += 1
         # Put tuple: env-steps, agent-steps, and learner info into the queue.

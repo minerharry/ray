@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from ray.util.annotations import DeveloperAPI
 
@@ -115,7 +115,7 @@ class SearchAlgorithm:
         self._finished = True
 
     def has_checkpoint(self, dirpath: str) -> bool:
-        """Should return False if not restoring is not implemented."""
+        """Should return False if restoring is not implemented."""
         return False
 
     def save_to_dir(self, dirpath: str, **kwargs):

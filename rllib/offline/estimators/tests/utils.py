@@ -2,16 +2,22 @@ from typing import Type, Union, Dict, Tuple
 
 import numpy as np
 from ray.rllib.algorithms import AlgorithmConfig
-from ray.rllib.evaluation.worker_set import WorkerSet
-from ray.rllib.examples.env.cliff_walking_wall_env import CliffWalkingWallEnv
-from ray.rllib.examples.policy.cliff_walking_wall_policy import CliffWalkingWallPolicy
+from ray.rllib.env.env_runner_group import EnvRunnerGroup
+from ray.rllib.examples.envs.classes.cliff_walking_wall_env import CliffWalkingWallEnv
+from ray.rllib.examples._old_api_stack.policy.cliff_walking_wall_policy import (
+    CliffWalkingWallPolicy,
+)
 from ray.rllib.execution.rollout_ops import synchronous_parallel_sample
 from ray.rllib.offline.estimators import (
     DirectMethod,
     DoublyRobust,
 )
 from ray.rllib.policy import Policy
-from ray.rllib.policy.sample_batch import SampleBatch, concat_samples
+from ray.rllib.policy.sample_batch import (
+    SampleBatch,
+    concat_samples,
+    convert_ma_batch_to_sample_batch,
+)
 from ray.rllib.utils.debug import update_global_seed_if_necessary
 
 
@@ -37,9 +43,12 @@ def get_cliff_walking_wall_policy_and_data(
 
     config = (
         AlgorithmConfig()
+        .api_stack(
+            enable_env_runner_and_connector_v2=False,
+            enable_rl_module_and_learner=False,
+        )
         .debugging(seed=seed)
-        .rollouts(batch_mode="complete_episodes")
-        .environment(disable_env_checking=True)
+        .env_runners(batch_mode="complete_episodes")
         .experimental(_disable_preprocessor_api=True)
     )
     config = config.to_dict()
@@ -49,17 +58,19 @@ def get_cliff_walking_wall_policy_and_data(
     policy = CliffWalkingWallPolicy(
         env.observation_space, env.action_space, {"epsilon": epsilon, "seed": seed}
     )
-    workers = WorkerSet(
+    workers = EnvRunnerGroup(
         env_creator=lambda env_config: CliffWalkingWallEnv(),
         default_policy_class=CliffWalkingWallPolicy,
         config=config,
-        num_workers=4,
+        num_env_runners=4,
     )
     ep_ret = []
     batches = []
     n_eps = 0
     while n_eps < num_episodes:
         batch = synchronous_parallel_sample(worker_set=workers)
+        batch = convert_ma_batch_to_sample_batch(batch)
+
         for episode in batch.split_by_episode():
             ret = 0
             for r in episode[SampleBatch.REWARDS][::-1]:

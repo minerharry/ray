@@ -5,14 +5,14 @@ import numpy as np
 from ray.rllib.connectors.connector import (
     AgentConnector,
     ConnectorContext,
-    register_connector,
 )
+from ray.rllib.connectors.registry import register_connector
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils.typing import AgentConnectorDataType
-from ray.util.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class ClipRewardAgentConnector(AgentConnector):
     def __init__(self, ctx: ConnectorContext, sign=False, limit=None):
         super().__init__(ctx)
@@ -25,10 +25,13 @@ class ClipRewardAgentConnector(AgentConnector):
     def transform(self, ac_data: AgentConnectorDataType) -> AgentConnectorDataType:
         d = ac_data.data
         assert (
-            type(d) == dict
+            type(d) is dict
         ), "Single agent data must be of type Dict[str, TensorStructType]"
 
-        assert SampleBatch.REWARDS in d, "input data does not have reward column."
+        if SampleBatch.REWARDS not in d:
+            # Nothing to clip. May happen for initial obs.
+            return ac_data
+
         if self.sign:
             d[SampleBatch.REWARDS] = np.sign(d[SampleBatch.REWARDS])
         elif self.limit:

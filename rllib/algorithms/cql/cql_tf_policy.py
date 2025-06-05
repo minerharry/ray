@@ -3,13 +3,12 @@ TensorFlow policy class used for CQL.
 """
 from functools import partial
 import numpy as np
-import gym
+import gymnasium as gym
 import logging
 import tree
 from typing import Dict, List, Type, Union
 
 import ray
-import ray.experimental.tf_utils
 from ray.rllib.algorithms.sac.sac_tf_policy import (
     apply_gradients as sac_apply_gradients,
     compute_and_clip_gradients as sac_compute_and_clip_gradients,
@@ -109,7 +108,7 @@ def cql_loss(
     actions = tf.cast(train_batch[SampleBatch.ACTIONS], tf.float32)
     rewards = tf.cast(train_batch[SampleBatch.REWARDS], tf.float32)
     next_obs = train_batch[SampleBatch.NEXT_OBS]
-    terminals = train_batch[SampleBatch.DONES]
+    terminals = train_batch[SampleBatch.TERMINATEDS]
 
     model_out_t, _ = model(SampleBatch(obs=obs, _is_training=True), [], None)
 
@@ -411,7 +410,7 @@ def apply_gradients_fn(policy, optimizer, grads_and_vars):
 CQLTFPolicy = build_tf_policy(
     name="CQLTFPolicy",
     loss_fn=cql_loss,
-    get_default_config=lambda: ray.rllib.algorithms.cql.cql.DEFAULT_CONFIG,
+    get_default_config=lambda: ray.rllib.algorithms.cql.cql.CQLConfig(),
     validate_spaces=validate_spaces,
     stats_fn=cql_stats,
     postprocess_fn=postprocess_trajectory,

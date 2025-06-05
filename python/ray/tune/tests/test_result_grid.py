@@ -1,19 +1,10 @@
-import json
-import os
-import pickle
-import shutil
-
 import pytest
-import pandas as pd
 
 import ray
-from ray.air._internal.checkpoint_manager import CheckpointStorage, _TrackedCheckpoint
 from ray import tune
-from ray.air.checkpoint import Checkpoint
-from ray.tune.registry import get_trainable_cls
+from ray.train.tests.util import create_dict_checkpoint, load_dict_checkpoint
+from ray.tune import Checkpoint, Result
 from ray.tune.result_grid import ResultGrid
-from ray.tune.experiment import Trial
-from ray.tune.tests.tune_test_util import create_tune_experiment_checkpoint
 
 
 @pytest.fixture
@@ -24,74 +15,58 @@ def ray_start_2_cpus():
     ray.shutdown()
 
 
-def test_result_grid(ray_start_2_cpus):
-    def f(config):
-        # simulating the case that no report is called in train.
-        with tune.checkpoint_dir(step=0) as checkpoint_dir:
-            path = os.path.join(checkpoint_dir, "checkpoint")
-            with open(path, "w") as f:
-                f.write(json.dumps({"step": 0}))
+def test_result_grid_api(ray_start_2_cpus, tmp_path):
+    def train_fn(config):
+        peak_fn = [0, config["id"], -config["id"], 0]
+        for i in range(len(peak_fn)):
+            with create_dict_checkpoint({"iter": i}) as checkpoint:
+                tune.report(
+                    {"iter": i, "score": config["id"], "peak": peak_fn[i]},
+                    checkpoint=checkpoint,
+                )
 
-    analysis = tune.run(f, config={"a": 1})
-    result_grid = ResultGrid(analysis)
-    result = result_grid[0]
-    assert isinstance(result.checkpoint, Checkpoint)
-    assert isinstance(result.metrics, dict)
-    assert isinstance(result.config, dict)
-    assert result.config == {"a": 1}
-    assert result.metrics["config"] == result.config
-
-
-def test_result_grid_metric_mode(ray_start_2_cpus):
-    def f(config):
-        for i in range(2):
-            with tune.checkpoint_dir(step=i) as checkpoint_dir:
-                path = os.path.join(checkpoint_dir, "checkpoint")
-                with open(path, "w") as f:
-                    f.write(json.dumps({"step": i}))
-            tune.report(step=i)
-
-    analysis = tune.run(f, config={"a": 1}, metric="step", mode="min")
-    analysis._legacy_checkpoint = False
-    result_grid = ResultGrid(analysis)
-    result = result_grid[0]
-    assert isinstance(result.checkpoint, Checkpoint)
-    assert isinstance(result.best_checkpoints, list)
-    assert isinstance(result.metrics, dict)
-    assert isinstance(result.config, dict)
-    assert isinstance(result.metrics_dataframe, pd.DataFrame)
-    assert os.path.normpath(
-        result.checkpoint.get_internal_representation()[1]
-    ) != os.path.normpath(
-        min((x for x in result.best_checkpoints), key=lambda x: x[1]["step"])[
-            0
-        ].get_internal_representation()[1]
+    tuner = tune.Tuner(
+        train_fn,
+        param_space={"id": tune.grid_search([1, 2])},
+        run_config=tune.RunConfig(
+            storage_path=str(tmp_path),
+            name="test_result_grid_api",
+            checkpoint_config=tune.CheckpointConfig(num_to_keep=2),
+        ),
     )
-    assert result.config == {"a": 1}
-    assert result.metrics["config"] == result.config
-    assert len(result.metrics_dataframe) == 2
+    result_grid = tuner.fit()
 
+    assert len(result_grid) == 2
+    assert result_grid.experiment_path == str(tmp_path / "test_result_grid_api")
 
-def test_result_grid_metric_mode_unset(ray_start_2_cpus):
-    def f(config):
-        for i in range(2):
-            with tune.checkpoint_dir(step=i) as checkpoint_dir:
-                path = os.path.join(checkpoint_dir, "checkpoint")
-                with open(path, "w") as f:
-                    f.write(json.dumps({"step": i}))
-            tune.report(step=i)
+    with pytest.raises(ValueError):
+        result_grid.get_best_result()
+    with pytest.raises(ValueError):
+        result_grid.get_best_result(metric="score")
+    assert result_grid.get_best_result(metric="score", mode="max").config["id"] == 2
 
-    analysis = tune.run(f, config={"a": 1})
-    analysis._legacy_checkpoint = False
-    result_grid = ResultGrid(analysis)
-    result = result_grid[0]
-    assert isinstance(result.checkpoint, Checkpoint)
-    assert isinstance(result.metrics, dict)
-    assert isinstance(result.config, dict)
-    assert isinstance(result.metrics_dataframe, pd.DataFrame)
-    assert result.config == {"a": 1}
-    assert result.metrics["config"] == result.config
-    assert len(result.metrics_dataframe) == 2
+    df = result_grid.get_dataframe()
+    assert len(df) == 2
+    assert df["iter"].to_list() == [3, 3]
+
+    df = result_grid.get_dataframe(filter_metric="peak", filter_mode="max")
+    assert df["iter"].to_list() == [1, 1]
+    df = result_grid.get_dataframe(filter_metric="peak", filter_mode="min")
+    assert df["iter"].to_list() == [2, 2]
+
+    assert not result_grid.errors
+    assert result_grid.num_errors == 0
+    assert result_grid.num_terminated == 2
+
+    for result in result_grid:
+        assert result.checkpoint is not None
+        assert result.error is None
+        assert load_dict_checkpoint(result.checkpoint)["iter"] == 3
+        assert {metrics["iter"] for _, metrics in result.best_checkpoints} == {2, 3}
+        assert {
+            load_dict_checkpoint(checkpoint)["iter"]
+            for checkpoint, _ in result.best_checkpoints
+        } == {2, 3}
 
 
 def test_result_grid_no_checkpoint(ray_start_2_cpus):
@@ -102,82 +77,6 @@ def test_result_grid_no_checkpoint(ray_start_2_cpus):
     result_grid = ResultGrid(analysis)
     result = result_grid[0]
     assert result.checkpoint is None
-
-
-@pytest.mark.parametrize("to_object", [False, True])
-def test_result_grid_future_checkpoint(ray_start_2_cpus, to_object):
-    trainable_cls = get_trainable_cls("__fake")
-    trial = Trial("__fake", stub=True)
-    trial.config = {"some_config": 1}
-    trial.last_result = {"some_result": 2, "config": trial.config}
-
-    trainable = ray.remote(trainable_cls).remote()
-    ray.get(trainable.set_info.remote({"info": 4}))
-
-    if to_object:
-        checkpoint_data = trainable.save_to_object.remote()
-    else:
-        checkpoint_data = trainable.save.remote()
-
-    trial.on_checkpoint(
-        _TrackedCheckpoint(checkpoint_data, storage_mode=CheckpointStorage.MEMORY)
-    )
-    trial.pickled_error_file = None
-    trial.error_file = None
-    result_grid = ResultGrid(None)
-
-    # Internal result grid conversion
-    result = result_grid._trial_to_result(trial)
-    assert isinstance(result.checkpoint, Checkpoint)
-    assert isinstance(result.metrics, dict)
-    assert isinstance(result.config, dict)
-    assert result.metrics_dataframe is None
-    assert result.config == {"some_config": 1}
-    assert result.metrics["config"] == result.config
-
-    # Load checkpoint data (see ray.rllib.algorithms.mock.MockTrainer definition)
-    with result.checkpoint.as_directory() as checkpoint_dir:
-        with open(os.path.join(checkpoint_dir, "mock_agent.pkl"), "rb") as f:
-            info = pickle.load(f)
-            assert info["info"] == 4
-
-
-def test_best_result(ray_start_2_cpus):
-    def f(config):
-        for _ in range(2):
-            tune.report(x=config["x"])
-
-    analysis = tune.run(f, config={"x": tune.grid_search([1, 2])})
-    result_grid = ResultGrid(analysis)
-    best_result = result_grid.get_best_result(metric="x", mode="max")
-    assert best_result.config["x"] == 2
-    assert best_result.metrics["x"] == 2
-
-
-def test_best_result_checkpoint_history(ray_start_2_cpus):
-    def f(config):
-        for i in range(2):
-            with tune.checkpoint_dir(step=i) as checkpoint_dir:
-                path = os.path.join(checkpoint_dir, "checkpoint")
-                with open(path, "w") as f:
-                    f.write(json.dumps(dict(x=config["x"], step=i)))
-            tune.report(x=config["x"], step=i)
-
-    analysis = tune.run(f, config={"x": tune.grid_search([1, 3])})
-
-    # No checkpointing config. Use metric and mode
-    result_grid = ResultGrid(analysis)
-    best_result = result_grid.get_best_result(metric="x", mode="max")
-    assert best_result.metrics["x"] == 3
-    print(best_result.best_checkpoints)
-    print([x[0].get_internal_representation() for x in best_result.best_checkpoints])
-    assert len(best_result.best_checkpoints) == 2
-    i = 0
-    for checkpoint, metrics in best_result.best_checkpoints:
-        assert isinstance(checkpoint, Checkpoint)
-        assert metrics["x"] == 3
-        assert metrics["step"] == i
-        i += 1
 
 
 def test_best_result_no_report(ray_start_2_cpus):
@@ -192,39 +91,71 @@ def test_best_result_no_report(ray_start_2_cpus):
 
 def test_result_repr(ray_start_2_cpus):
     def f(config):
-        from ray.air import session
-
-        session.report({"loss": 1})
+        tune.report({"loss": 1})
 
     tuner = tune.Tuner(f, param_space={"x": tune.grid_search([1, 2])})
     result_grid = tuner.fit()
     result = result_grid[0]
 
+    from ray.tune.experimental.output import BLACKLISTED_KEYS
     from ray.tune.result import AUTO_RESULT_KEYS
 
     representation = result.__repr__()
     assert not any(key in representation for key in AUTO_RESULT_KEYS)
+    assert not any(key in representation for key in BLACKLISTED_KEYS)
 
 
-def test_no_metric_mode(ray_start_2_cpus):
-    def f(config):
-        tune.report(x=1)
+def test_result_grid_repr(tmp_path):
+    class MockExperimentAnalysis:
+        trials = []
 
-    analysis = tune.run(f, num_samples=2)
-    result_grid = ResultGrid(analysis)
-    with pytest.raises(ValueError):
-        result_grid.get_best_result()
+    result_grid = ResultGrid(experiment_analysis=MockExperimentAnalysis())
 
-    with pytest.raises(ValueError):
-        result_grid.get_best_result(metric="x")
+    result_grid._results = [
+        Result(
+            metrics={"loss": 1.0},
+            checkpoint=Checkpoint("/tmp/ckpt1"),
+            path="log_1",
+            error=None,
+            metrics_dataframe=None,
+        ),
+        Result(
+            metrics={"loss": 2.0},
+            checkpoint=Checkpoint("/tmp/ckpt2"),
+            path="log_2",
+            error=RuntimeError(),
+            metrics_dataframe=None,
+            best_checkpoints=None,
+        ),
+    ]
 
-    with pytest.raises(ValueError):
-        result_grid.get_best_result(mode="max")
+    from ray.tune.result import AUTO_RESULT_KEYS
+
+    assert len(result_grid) == 2
+    assert not any(key in repr(result_grid) for key in AUTO_RESULT_KEYS)
+
+    expected_repr = """ResultGrid<[
+  Result(
+    metrics={'loss': 1.0},
+    path='log_1',
+    filesystem='local',
+    checkpoint=Checkpoint(filesystem=local, path=/tmp/ckpt1)
+  ),
+  Result(
+    error='RuntimeError',
+    metrics={'loss': 2.0},
+    path='log_2',
+    filesystem='local',
+    checkpoint=Checkpoint(filesystem=local, path=/tmp/ckpt2)
+  )
+]>"""
+
+    assert repr(result_grid) == expected_repr
 
 
 def test_no_metric_mode_one_trial(ray_start_2_cpus):
     def f(config):
-        tune.report(x=1)
+        tune.report(dict(x=1))
 
     results = tune.Tuner(f, tune_config=tune.TuneConfig(num_samples=1)).fit()
     # This should not throw any exception
@@ -234,9 +165,9 @@ def test_no_metric_mode_one_trial(ray_start_2_cpus):
 
 def test_result_grid_df(ray_start_2_cpus):
     def f(config):
-        tune.report(metric=config["nested"]["param"] * 1)
-        tune.report(metric=config["nested"]["param"] * 4)
-        tune.report(metric=config["nested"]["param"] * 3)
+        tune.report(dict(metric=config["nested"]["param"] * 1))
+        tune.report(dict(metric=config["nested"]["param"] * 4))
+        tune.report(dict(metric=config["nested"]["param"] * 3))
 
     analysis = tune.run(f, config={"nested": {"param": tune.grid_search([1, 2])}})
     result_grid = ResultGrid(analysis)
@@ -258,29 +189,23 @@ def test_result_grid_df(ray_start_2_cpus):
     assert sorted(df["config/nested/param"]) == [1, 2]
 
 
-def test_num_errors_terminated(tmpdir):
-    error_file = tmpdir / "error.txt"
-    with open(error_file, "w") as fp:
-        fp.write("Test error\n")
+def test_num_errors_terminated(ray_start_2_cpus, tmp_path):
+    def train_fn(config):
+        if config["id"] == 1:
+            raise RuntimeError()
+        else:
+            tune.report({"score": config["id"]})
 
-    trials = [Trial("foo", stub=True) for i in range(10)]
-    trials[4].status = Trial.ERROR
-    trials[6].status = Trial.ERROR
-    trials[8].status = Trial.ERROR
+    tuner = tune.Tuner(
+        train_fn,
+        param_space={"id": tune.grid_search([1, 2])},
+        run_config=tune.RunConfig(storage_path=str(tmp_path)),
+    )
 
-    trials[4].error_file = error_file
-    trials[6].error_file = error_file
-    trials[8].error_file = error_file
-
-    trials[3].status = Trial.TERMINATED
-    trials[5].status = Trial.TERMINATED
-
-    experiment_dir = create_tune_experiment_checkpoint(trials)
-    result_grid = ResultGrid(tune.ExperimentAnalysis(experiment_dir))
-    assert len(result_grid.errors) == 3
-    assert result_grid.num_errors == 3
-    assert result_grid.num_terminated == 2
-    shutil.rmtree(experiment_dir)
+    result_grid = tuner.fit()
+    assert result_grid.num_errors == 1
+    assert result_grid.num_terminated == 1
+    assert isinstance(result_grid.errors[0], RuntimeError)
 
 
 if __name__ == "__main__":

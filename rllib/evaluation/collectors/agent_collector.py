@@ -1,14 +1,20 @@
-from copy import deepcopy
-from gym.spaces import Space
+import copy
+import logging
 import math
-import numpy as np
-import tree  # pip install dm_tree
 from typing import Any, Dict, List, Optional
 
-from ray.rllib.policy.view_requirement import ViewRequirement
+import numpy as np
+import tree  # pip install dm_tree
+from gymnasium.spaces import Space
+
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.utils.framework import try_import_tf, try_import_torch
-from ray.rllib.utils.spaces.space_utils import get_dummy_batch_for_space
+from ray.rllib.policy.view_requirement import ViewRequirement
+from ray.rllib.utils.annotations import OldAPIStack
+from ray.rllib.utils.framework import try_import_torch
+from ray.rllib.utils.spaces.space_utils import (
+    flatten_to_single_ndarray,
+    get_dummy_batch_for_space,
+)
 from ray.rllib.utils.typing import (
     EpisodeID,
     EnvID,
@@ -16,9 +22,8 @@ from ray.rllib.utils.typing import (
     ViewRequirementsDict,
 )
 
-from ray.util.annotations import PublicAPI
+logger = logging.getLogger(__name__)
 
-_, tf, _ = try_import_tf()
 torch, _ = try_import_torch()
 
 
@@ -31,7 +36,18 @@ def _to_float_np_array(v: List[Any]) -> np.ndarray:
     return arr
 
 
-@PublicAPI
+def _get_buffered_slice_with_paddings(d, inds):
+    element_at_t = []
+    for index in inds:
+        if index < len(d):
+            element_at_t.append(d[index])
+        else:
+            # zero pad similar to the last element.
+            element_at_t.append(tree.map_structure(np.zeros_like, d[-1]))
+    return element_at_t
+
+
+@OldAPIStack
 class AgentCollector:
     """Collects samples for one agent in one trajectory (episode).
 
@@ -53,6 +69,7 @@ class AgentCollector:
         intial_states: Optional[List[TensorType]] = None,
         is_policy_recurrent: bool = False,
         is_training: bool = True,
+        _enable_new_api_stack: bool = False,
     ):
         """Initialize an AgentCollector.
 
@@ -63,7 +80,7 @@ class AgentCollector:
             intial_states: The initial states from the policy.get_initial_states()
             is_policy_recurrent: If True, the policy is recurrent.
             is_training: Sets the is_training flag for the buffers. if True, all the
-                timesteps are stored in the buffers until explictly build_for_training
+                timesteps are stored in the buffers until explicitly build_for_training
                 () is called. if False, only the content required for the last time
                 step is stored in the buffers. This will save memory during inference.
                 You can change the behavior at runtime by calling is_training(mode).
@@ -71,15 +88,18 @@ class AgentCollector:
         self.max_seq_len = max_seq_len
         self.disable_action_flattening = disable_action_flattening
         self.view_requirements = view_reqs
-        self.intial_states = intial_states or []
+        # The initial_states can be an np array
+        self.initial_states = intial_states if intial_states is not None else []
         self.is_policy_recurrent = is_policy_recurrent
         self._is_training = is_training
+        self._enable_new_api_stack = _enable_new_api_stack
 
         # Determine the size of the buffer we need for data before the actual
         # episode starts. This is used for 0-buffering of e.g. prev-actions,
         # or internal state inputs.
         view_req_shifts = [
-            min(vr.shift_arr) - int((vr.data_col or k) == SampleBatch.OBS)
+            min(vr.shift_arr)
+            - int((vr.data_col or k) in [SampleBatch.OBS, SampleBatch.INFOS])
             for k, vr in view_reqs.items()
         ]
         self.shift_before = -min(view_req_shifts)
@@ -92,7 +112,7 @@ class AgentCollector:
         #    [0, 1],  # <- 1st sub-component of observation
         #    [np.array([.2, .3]), np.array([.0, -.2])]  # <- 2nd sub-component
         # ]
-        # NOTE: infos and state_out_... are not flattened due to them often
+        # NOTE: infos and state_out... are not flattened due to them often
         # using custom dict values whose structure may vary from timestep to
         # timestep.
         self.buffers: Dict[str, List[List[TensorType]]] = {}
@@ -108,6 +128,15 @@ class AgentCollector:
         # The simple timestep count for this agent. Gets increased by one
         # each time a (non-initial!) observation is added.
         self.agent_steps = 0
+        # Keep track of view requirements that have a view on columns that we gain from
+        # inference and also need for inference. These have dummy values appended in
+        # buffers to account for the missing value when building for inference
+        # Example: We have one 'state_in' view requirement that has a view on our
+        # state_outs at t=[-10, ..., -1]. At any given build_for_inference()-call,
+        # the buffer must contain eleven values from t=[-10, ..., 0] for us to index
+        # properly. Since state_out at t=0 is missing, we substitute it with a buffer
+        # value that should never make it into batches built for training.
+        self.data_cols_with_dummy_values = set()
 
     @property
     def training(self) -> bool:
@@ -126,6 +155,7 @@ class AgentCollector:
         agent_index: int,
         env_id: EnvID,
         init_obs: TensorType,
+        init_infos: Optional[Dict[str, TensorType]] = None,
         t: int = -1,
     ) -> None:
         """Adds an initial observation (after reset) to the Agent's trajectory.
@@ -136,8 +166,8 @@ class AgentCollector:
             agent_index: Unique int index (starting from 0) for the agent
                 within its episode. Not to be confused with AGENT_ID (Any).
             env_id: The environment index (in a vectorized setup).
-            init_obs: The initial observation tensor (after
-            `env.reset()`).
+            init_obs: The initial observation tensor (after `env.reset()`).
+            init_infos: The initial infos dict (after `env.reset()`).
             t: The time step (episode length - 1). The initial obs has
                 ts=-1(!), then an action/reward/next-obs at t=0, etc..
         """
@@ -148,22 +178,51 @@ class AgentCollector:
             self.unroll_id = AgentCollector._next_unroll_id
             AgentCollector._next_unroll_id += 1
 
+        # convert init_obs to np.array (in case it is a list)
+        if isinstance(init_obs, list):
+            init_obs = np.array(init_obs)
+
         if SampleBatch.OBS not in self.buffers:
-            self._build_buffers(
-                single_row={
-                    SampleBatch.OBS: init_obs,
-                    SampleBatch.AGENT_INDEX: agent_index,
-                    SampleBatch.ENV_ID: env_id,
-                    SampleBatch.T: t,
-                    SampleBatch.EPS_ID: self.episode_id,
-                    SampleBatch.UNROLL_ID: self.unroll_id,
-                }
-            )
+            single_row = {
+                SampleBatch.OBS: init_obs,
+                SampleBatch.INFOS: init_infos or {},
+                SampleBatch.AGENT_INDEX: agent_index,
+                SampleBatch.ENV_ID: env_id,
+                SampleBatch.T: t,
+                SampleBatch.EPS_ID: self.episode_id,
+                SampleBatch.UNROLL_ID: self.unroll_id,
+            }
+
+            # TODO (Artur): Remove when PREV_ACTIONS and PREV_REWARDS get deprecated.
+            # Note (Artur): As long as we have these in our default view requirements,
+            # we should  build buffers with neutral elements instead of building them
+            # on the first AgentCollector.build_for_inference call if present.
+            # This prevents us from accidentally building buffers with duplicates of
+            # the first incoming value.
+            if SampleBatch.PREV_REWARDS in self.view_requirements:
+                single_row[SampleBatch.REWARDS] = get_dummy_batch_for_space(
+                    space=self.view_requirements[SampleBatch.REWARDS].space,
+                    batch_size=0,
+                    fill_value=0.0,
+                )
+            if SampleBatch.PREV_ACTIONS in self.view_requirements:
+                potentially_flattened_batch = get_dummy_batch_for_space(
+                    space=self.view_requirements[SampleBatch.ACTIONS].space,
+                    batch_size=0,
+                    fill_value=0.0,
+                )
+                if not self.disable_action_flattening:
+                    potentially_flattened_batch = flatten_to_single_ndarray(
+                        potentially_flattened_batch
+                    )
+                single_row[SampleBatch.ACTIONS] = potentially_flattened_batch
+            self._build_buffers(single_row)
 
         # Append data to existing buffers.
         flattened = tree.flatten(init_obs)
         for i, sub_obs in enumerate(flattened):
             self.buffers[SampleBatch.OBS][i].append(sub_obs)
+        self.buffers[SampleBatch.INFOS][0].append(init_infos or {})
         self.buffers[SampleBatch.AGENT_INDEX][0].append(agent_index)
         self.buffers[SampleBatch.ENV_ID][0].append(env_id)
         self.buffers[SampleBatch.T][0].append(t)
@@ -175,19 +234,22 @@ class AgentCollector:
 
         Args:
             values: Data dict (interpreted as a single row) to be added to buffer.
-            Must contain keys:
-                SampleBatch.ACTIONS, REWARDS, DONES, and NEXT_OBS.
+                Must contain keys:
+                SampleBatch.ACTIONS, REWARDS, TERMINATEDS, TRUNCATEDS, and NEXT_OBS.
         """
         if self.unroll_id is None:
             self.unroll_id = AgentCollector._next_unroll_id
             AgentCollector._next_unroll_id += 1
 
         # Next obs -> obs.
-        # TODO @kourosh: remove the in-place operations and get rid of this deepcopy.
-        values = deepcopy(input_values)
+        values = copy.copy(input_values)
         assert SampleBatch.OBS not in values
         values[SampleBatch.OBS] = values[SampleBatch.NEXT_OBS]
         del values[SampleBatch.NEXT_OBS]
+
+        # convert obs to np.array (in case it is a list)
+        if isinstance(values[SampleBatch.OBS], list):
+            values[SampleBatch.OBS] = np.array(values[SampleBatch.OBS])
 
         # Default to next timestep if not provided in input values
         if SampleBatch.T not in input_values:
@@ -205,21 +267,49 @@ class AgentCollector:
 
         for k, v in values.items():
             if k not in self.buffers:
-                self._build_buffers(single_row=values)
-            # Do not flatten infos, state_out_ and (if configured) actions.
+                if self.training and k.startswith("state_out"):
+                    vr = self.view_requirements[k]
+                    data_col = vr.data_col or k
+                    self._fill_buffer_with_initial_values(
+                        data_col, vr, build_for_inference=False
+                    )
+                else:
+                    self._build_buffers({k: v})
+            # Do not flatten infos, state_out and (if configured) actions.
             # Infos/state-outs may be structs that change from timestep to
             # timestep.
+            should_flatten_action_key = (
+                k == SampleBatch.ACTIONS and not self.disable_action_flattening
+            )
+            # Note (Artur) RL Modules's states need no flattening
+            should_flatten_state_key = (
+                k.startswith("state_out") and not self._enable_new_api_stack
+            )
             if (
                 k == SampleBatch.INFOS
-                or k.startswith("state_out_")
-                or (k == SampleBatch.ACTIONS and not self.disable_action_flattening)
+                or should_flatten_state_key
+                or should_flatten_action_key
             ):
+                if should_flatten_action_key:
+                    v = flatten_to_single_ndarray(v)
+                # Briefly remove dummy value to add to buffer
+                if k in self.data_cols_with_dummy_values:
+                    dummy = self.buffers[k][0].pop(-1)
                 self.buffers[k][0].append(v)
+                # Add back dummy value
+                if k in self.data_cols_with_dummy_values:
+                    self.buffers[k][0].append(dummy)
             # Flatten all other columns.
             else:
                 flattened = tree.flatten(v)
                 for i, sub_list in enumerate(self.buffers[k]):
+                    # Briefly remove dummy value to add to buffer
+                    if k in self.data_cols_with_dummy_values:
+                        dummy = sub_list.pop(-1)
                     sub_list.append(flattened[i])
+                    # Add back dummy value
+                    if k in self.data_cols_with_dummy_values:
+                        sub_list.append(dummy)
 
         # In inference mode, we don't need to keep all of trajectory in memory
         # we only need to keep the steps required. We can pop from the beginning to
@@ -268,8 +358,9 @@ class AgentCollector:
                 self._fill_buffer_with_initial_values(
                     data_col, view_req, build_for_inference=True
                 )
+                self._prepare_for_data_cols_with_dummy_values(data_col)
 
-            # Keep an np-array cache so we don't have to regenerate the
+            # Keep an np-array cache, so we don't have to regenerate the
             # np-array for different view_cols using to the same data_col.
             self._cache_in_np(np_data, data_col)
 
@@ -280,40 +371,44 @@ class AgentCollector:
                 # before the last one (len(d) - 2) and so on.
                 element_at_t = d[view_req.shift_arr + len(d) - 1]
                 if element_at_t.shape[0] == 1:
-                    # squeeze to remove the T dimension if it is 1.
-                    element_at_t = element_at_t.squeeze(0)
+                    # We'd normally squeeze here to remove the time dim, but we'll
+                    # simply use the time dim as the batch dim.
+                    data.append(element_at_t)
+                    continue
                 # add the batch dimension with [None]
                 data.append(element_at_t[None])
 
-            if data:
-                batch_data[view_col] = self._unflatten_as_buffer_struct(data, data_col)
+            # We unflatten even if data is empty here, because the structure might be
+            # nested with empty leafs and so we still need to reconstruct it.
+            # This is useful because we spec-check states in RLModules and these
+            # states can sometimes be nested dicts with empty leafs.
+            batch_data[view_col] = self._unflatten_as_buffer_struct(data, data_col)
 
         batch = self._get_sample_batch(batch_data)
         return batch
 
     # TODO: @kouorsh we don't really need view_requirements anymore since it's already
-    # and attribute of the class
+    # an attribute of the class
     def build_for_training(
         self, view_requirements: ViewRequirementsDict
     ) -> SampleBatch:
         """Builds a SampleBatch from the thus-far collected agent data.
 
-        If the episode/trajectory has no DONE=True at the end, will copy
-        the necessary n timesteps at the end of the trajectory back to the
+        If the episode/trajectory has no TERMINATED|TRUNCATED=True at the end, will
+        copy the necessary n timesteps at the end of the trajectory back to the
         beginning of the buffers and wait for new samples coming in.
         SampleBatches created by this method will be ready for postprocessing
         by a Policy.
 
         Args:
             view_requirements: The viewrequirements dict needed to build the
-            SampleBatch from the raw buffers (which may have data shifts as well as
-            mappings from view-col to data-col in them).
+                SampleBatch from the raw buffers, which may have data shifts as well as
+                mappings from view-col to data-col in them.
 
         Returns:
             SampleBatch: The built SampleBatch for this agent, ready to go into
             postprocessing.
         """
-
         batch_data = {}
         np_data = {}
         for view_col, view_req in view_requirements.items():
@@ -331,15 +426,15 @@ class AgentCollector:
                 if not is_state:
                     continue
 
-            # OBS are already shifted by -1 (the initial obs starts one ts
-            # before all other data columns).
-            obs_shift = -1 if data_col == SampleBatch.OBS else 0
+            # OBS and INFOS are already shifted by -1 (the initial obs/info starts one
+            # ts before all other data columns).
+            obs_shift = -1 if data_col in [SampleBatch.OBS, SampleBatch.INFOS] else 0
 
             # Keep an np-array cache so we don't have to regenerate the
             # np-array for different view_cols using to the same data_col.
             self._cache_in_np(np_data, data_col)
 
-            # Go throught each time-step in the buffer and construct the view
+            # Go through each time-step in the buffer and construct the view
             # accordingly.
             data = []
             for d in np_data[data_col]:
@@ -358,14 +453,20 @@ class AgentCollector:
 
                 # count computes the number of time steps that we need to consider.
                 # if batch_repeat_value = 1, this number should be the length of
-                # episode so far, which is len(buffer) - shift_before.
+                # episode so far, which is len(buffer) - shift_before (-1 if this
+                # value was gained during inference. This is because we keep a dummy
+                # value at the last position of the buffer that makes it one longer).
                 count = int(
                     math.ceil(
-                        (len(d) - self.shift_before) / view_req.batch_repeat_value
+                        (
+                            len(d)
+                            - int(data_col in self.data_cols_with_dummy_values)
+                            - self.shift_before
+                        )
+                        / view_req.batch_repeat_value
                     )
                 )
                 for i in range(count):
-
                     # the indices for time step t
                     inds = (
                         self.shift_before
@@ -377,20 +478,20 @@ class AgentCollector:
                     # handle the case where the inds are out of bounds from the end.
                     # if during the indexing any of the indices are out of bounds, we
                     # need to use padding on the end to fill in the missing indices.
-                    element_at_t = []
-                    for index in inds:
-                        if index < len(d):
-                            element_at_t.append(d[index])
-                        else:
-                            # zero pad similar to the last element.
-                            element_at_t.append(
-                                tree.map_structure(np.zeros_like, d[-1])
-                            )
-                    element_at_t = np.stack(element_at_t)
+                    # Create padding first time we encounter data
+                    if max(inds) < len(d):
+                        # Simple case where we can simply pick slices from buffer
+                        element_at_t = d[inds]
+                    else:
+                        # Case in which we have to pad because buffer has insufficient
+                        # length. This branch takes more time than simply picking
+                        # slices we try to avoid it.
+                        element_at_t = _get_buffered_slice_with_paddings(d, inds)
+                        element_at_t = np.stack(element_at_t)
 
                     if element_at_t.shape[0] == 1:
-                        # squeeze to remove the T dimension if it is 1.
-                        element_at_t = element_at_t.squeeze(0)
+                        # Remove the T dimension if it is 1.
+                        element_at_t = element_at_t[0]
                     shifted_data.append(element_at_t)
 
                 # in some multi-agent cases shifted_data may be an empty list.
@@ -401,8 +502,11 @@ class AgentCollector:
                     shifted_data_np = np.array(shifted_data)
                 data.append(shifted_data_np)
 
-            if data:
-                batch_data[view_col] = self._unflatten_as_buffer_struct(data, data_col)
+            # We unflatten even if data is empty here, because the structure might be
+            # nested with empty leafs and so we still need to reconstruct it.
+            # This is useful because we spec-check states in RLModules and these
+            # states can sometimes be nested dicts with empty leafs.
+            batch_data[view_col] = self._unflatten_as_buffer_struct(data, data_col)
 
         batch = self._get_sample_batch(batch_data)
 
@@ -410,8 +514,10 @@ class AgentCollector:
         # self.shift_before) to the beginning of buffers and erase everything
         # else.
         if (
-            SampleBatch.DONES in self.buffers
-            and not self.buffers[SampleBatch.DONES][0][-1]
+            SampleBatch.TERMINATEDS in self.buffers
+            and not self.buffers[SampleBatch.TERMINATEDS][0][-1]
+            and SampleBatch.TRUNCATEDS in self.buffers
+            and not self.buffers[SampleBatch.TRUNCATEDS][0][-1]
         ):
             # Copy data to beginning of buffer and cut lists.
             if self.shift_before > 0:
@@ -442,6 +548,7 @@ class AgentCollector:
                 if col
                 in [
                     SampleBatch.OBS,
+                    SampleBatch.INFOS,
                     SampleBatch.EPS_ID,
                     SampleBatch.AGENT_INDEX,
                     SampleBatch.ENV_ID,
@@ -455,11 +562,20 @@ class AgentCollector:
             # lists. These are monolithic items (infos is a dict that
             # should not be further split, same for state-out items, which
             # could be custom dicts as well).
+            should_flatten_action_key = (
+                col == SampleBatch.ACTIONS and not self.disable_action_flattening
+            )
+            # Note (Artur) RL Modules's states need no flattening
+            should_flatten_state_key = (
+                col.startswith("state_out") and not self._enable_new_api_stack
+            )
             if (
                 col == SampleBatch.INFOS
-                or col.startswith("state_out_")
-                or (col == SampleBatch.ACTIONS and not self.disable_action_flattening)
+                or should_flatten_state_key
+                or should_flatten_action_key
             ):
+                if should_flatten_action_key:
+                    data = flatten_to_single_ndarray(data)
                 self.buffers[col] = [[data for _ in range(shift)]]
             else:
                 self.buffers[col] = [
@@ -530,27 +646,32 @@ class AgentCollector:
         except KeyError:
             space = view_requirement.space
 
-        # special treatment for state_out_<i>
+        # special treatment for state_out
         # add them to the buffer in case they don't exist yet
         is_state = True
-        if data_col.startswith("state_out_"):
-            if not self.is_policy_recurrent:
-                raise ValueError(
-                    f"{data_col} is not available, because the given policy is"
-                    f"not recurrent according to the input model_inital_states."
-                    f"Have you forgotten to return non-empty lists in"
-                    f"policy.get_initial_states()?"
-                )
-            state_ind = int(data_col.split("_")[-1])
-            self._build_buffers({data_col: self.intial_states[state_ind]})
+        if data_col.startswith("state_out"):
+            if self._enable_new_api_stack:
+                self._build_buffers({data_col: self.initial_states})
+            else:
+                if not self.is_policy_recurrent:
+                    raise ValueError(
+                        f"{data_col} is not available, because the given policy is"
+                        f"not recurrent according to the input model_inital_states."
+                        f"Have you forgotten to return non-empty lists in"
+                        f"policy.get_initial_states()?"
+                    )
+                state_ind = int(data_col.split("_")[-1])
+                self._build_buffers({data_col: self.initial_states[state_ind]})
         else:
             is_state = False
             # only create dummy data during inference
             if build_for_inference:
                 if isinstance(space, Space):
+                    #  state_out assumes the values do not have a batch dimension
+                    #  (i.e. instead of being (1, d) it is of shape (d,).
                     fill_value = get_dummy_batch_for_space(
                         space,
-                        batch_size=1,
+                        batch_size=0,
                     )
                 else:
                     fill_value = space
@@ -558,3 +679,10 @@ class AgentCollector:
                 self._build_buffers({data_col: fill_value})
 
         return is_state
+
+    def _prepare_for_data_cols_with_dummy_values(self, data_col):
+        self.data_cols_with_dummy_values.add(data_col)
+        # For items gained during inference, we append a dummy value here so
+        # that view requirements viewing these is not shifted by 1
+        for b in self.buffers[data_col]:
+            b.append(b[-1])

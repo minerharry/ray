@@ -1,79 +1,69 @@
-from ray.data.datasource.binary_datasource import BinaryDatasource
-from ray.data.datasource.csv_datasource import CSVDatasource
+from ray.data._internal.datasource.sql_datasource import Connection
+from ray.data._internal.savemode import SaveMode
+from ray.data.datasource.datasink import (
+    Datasink,
+    DummyOutputDatasink,
+    WriteResult,
+    WriteReturnType,
+)
 from ray.data.datasource.datasource import (
     Datasource,
-    DummyOutputDatasource,
     RandomIntRowDatasource,
-    RangeDatasource,
-    ReadTask,
     Reader,
-    WriteResult,
+    ReadTask,
 )
 from ray.data.datasource.file_based_datasource import (
-    BlockWritePathProvider,
-    DefaultBlockWritePathProvider,
     FileBasedDatasource,
-    FileExtensionFilter,
+    FileShuffleConfig,
     _S3FileSystemWrapper,
+)
+from ray.data.datasource.file_datasink import (
+    BlockBasedFileDatasink,
+    RowBasedFileDatasink,
 )
 from ray.data.datasource.file_meta_provider import (
     BaseFileMetadataProvider,
     DefaultFileMetadataProvider,
-    DefaultParquetMetadataProvider,
     FastFileMetadataProvider,
     FileMetadataProvider,
-    ParquetMetadataProvider,
 )
-from ray.data.datasource.image_datasource import ImageDatasource
-from ray.data.datasource.json_datasource import JSONDatasource
-from ray.data.datasource.numpy_datasource import NumpyDatasource
-from ray.data.datasource.parquet_base_datasource import ParquetBaseDatasource
-from ray.data.datasource.parquet_datasource import ParquetDatasource
+from ray.data.datasource.filename_provider import FilenameProvider
+from ray.data.datasource.parquet_meta_provider import ParquetMetadataProvider
 from ray.data.datasource.partitioning import (
+    Partitioning,
     PartitionStyle,
-    PathPartitionEncoder,
     PathPartitionFilter,
     PathPartitionParser,
-    Partitioning,
 )
-from ray.data.datasource.tfrecords_datasource import TFRecordDatasource
-from ray.data.datasource.tensorflow_datasource import SimpleTensorFlowDatasource
-from ray.data.datasource.text_datasource import TextDatasource
-from ray.data.datasource.torch_datasource import SimpleTorchDatasource
 
+# Note: HuggingFaceDatasource should NOT be imported here, because
+# we want to only import the Hugging Face datasets library when we use
+# ray.data.from_huggingface() or HuggingFaceDatasource() directly.
 __all__ = [
     "BaseFileMetadataProvider",
-    "BinaryDatasource",
-    "BlockWritePathProvider",
-    "CSVDatasource",
+    "BlockBasedFileDatasink",
+    "Connection",
+    "Datasink",
     "Datasource",
-    "DefaultBlockWritePathProvider",
+    "DeltaSharingDatasource",
     "DefaultFileMetadataProvider",
-    "DefaultParquetMetadataProvider",
-    "DummyOutputDatasource",
+    "DummyOutputDatasink",
     "FastFileMetadataProvider",
     "FileBasedDatasource",
-    "FileExtensionFilter",
+    "FileShuffleConfig",
     "FileMetadataProvider",
-    "ImageDatasource",
-    "JSONDatasource",
-    "NumpyDatasource",
-    "ParquetBaseDatasource",
-    "ParquetDatasource",
+    "FilenameProvider",
     "ParquetMetadataProvider",
     "PartitionStyle",
-    "PathPartitionEncoder",
     "PathPartitionFilter",
     "PathPartitionParser",
     "Partitioning",
     "RandomIntRowDatasource",
-    "RangeDatasource",
     "ReadTask",
     "Reader",
-    "SimpleTensorFlowDatasource",
-    "SimpleTorchDatasource",
-    "TextDatasource",
-    "TFRecordDatasource",
-    "WriteResult",
+    "RowBasedFileDatasink",
     "_S3FileSystemWrapper",
+    "WriteResult",
+    "WriteReturnType",
+    "SaveMode",
 ]

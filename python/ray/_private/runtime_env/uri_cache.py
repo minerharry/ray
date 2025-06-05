@@ -1,5 +1,5 @@
 import logging
-from typing import Set, Callable
+from typing import Callable, Optional, Set
 
 default_logger = logging.getLogger(__name__)
 
@@ -7,11 +7,9 @@ DEFAULT_MAX_URI_CACHE_SIZE_BYTES = (1024**3) * 10  # 10 GB
 
 
 class URICache:
-    """
-    Caches URIs up to a specified total size limit.
+    """Caches URIs up to a specified total size limit.
 
-    URIs are represented by strings.  Each URI has an associated size on disk.
-
+    URIs are represented by strings. Each URI has an associated size on disk.
     When a URI is added to the URICache, it is marked as "in use".
     When a URI is no longer in use, the user of this class should call
     `mark_unused` to signal that the URI is safe for deletion.
@@ -29,14 +27,18 @@ class URICache:
 
     def __init__(
         self,
-        delete_fn: Callable[[str, logging.Logger], int] = lambda uri, logger: 0,
+        delete_fn: Optional[Callable[[str, logging.Logger], int]] = None,
         max_total_size_bytes: int = DEFAULT_MAX_URI_CACHE_SIZE_BYTES,
         debug_mode: bool = False,
     ):
         # Maps URIs to the size in bytes of their corresponding disk contents.
         self._used_uris: Set[str] = set()
         self._unused_uris: Set[str] = set()
-        self._delete_fn = delete_fn
+
+        if delete_fn is None:
+            self._delete_fn = lambda uri, logger: 0
+        else:
+            self._delete_fn = delete_fn
 
         # Total size of both used and unused URIs in the cache.
         self._total_size_bytes = 0
@@ -48,16 +50,16 @@ class URICache:
     def mark_unused(self, uri: str, logger: logging.Logger = default_logger):
         """Mark a URI as unused and okay to be deleted."""
         if uri not in self._used_uris:
-            logger.debug(f"URI {uri} is already unused.")
+            logger.info(f"URI {uri} is already unused.")
         else:
             self._unused_uris.add(uri)
             self._used_uris.remove(uri)
-        logger.debug(f"Marked URI {uri} unused.")
+        logger.info(f"Marked URI {uri} unused.")
         self._evict_if_needed(logger)
         self._check_valid()
 
     def mark_used(self, uri: str, logger: logging.Logger = default_logger):
-        """Mark a URI as in use.  URIs in use will not be deleted."""
+        """Mark a URI as in use. URIs in use will not be deleted."""
         if uri in self._used_uris:
             return
         elif uri in self._unused_uris:
@@ -68,7 +70,7 @@ class URICache:
                 f"Got request to mark URI {uri} used, but this "
                 "URI is not present in the cache."
             )
-        logger.debug(f"Marked URI {uri} used.")
+        logger.info(f"Marked URI {uri} used.")
         self._check_valid()
 
     def add(self, uri: str, size_bytes: int, logger: logging.Logger = default_logger):
@@ -81,7 +83,7 @@ class URICache:
 
         self._evict_if_needed(logger)
         self._check_valid()
-        logger.debug(f"Added URI {uri} with size {size_bytes}")
+        logger.info(f"Added URI {uri} with size {size_bytes}")
 
     def get_total_size_bytes(self) -> int:
         return self._total_size_bytes
@@ -97,6 +99,9 @@ class URICache:
             self._unused_uris.remove(arbitrary_unused_uri)
             num_bytes_deleted = self._delete_fn(arbitrary_unused_uri, logger)
             self._total_size_bytes -= num_bytes_deleted
+            logger.info(
+                f"Deleted URI {arbitrary_unused_uri} with size " f"{num_bytes_deleted}."
+            )
 
     def _check_valid(self):
         """(Debug mode only) Check "used" and "unused" sets are disjoint."""

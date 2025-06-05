@@ -4,15 +4,20 @@ import shutil
 import socket
 import string
 import sys
+import tempfile
 import uuid
 from filecmp import dircmp
 from pathlib import Path
 from shutil import copytree, make_archive, rmtree
+import zipfile
+import ray
 
 import pytest
 
-from ray._private.gcs_utils import GcsClient
-from ray._private.ray_constants import KV_NAMESPACE_PACKAGE
+from ray._private.ray_constants import (
+    KV_NAMESPACE_PACKAGE,
+    RAY_RUNTIME_ENV_IGNORE_GITIGNORE,
+)
 from ray._private.runtime_env.packaging import (
     GCS_STORAGE_MAX_SIZE,
     MAC_OS_ZIP_HIDDEN_DIR_NAME,
@@ -20,8 +25,10 @@ from ray._private.runtime_env.packaging import (
     _dir_travel,
     _get_excludes,
     _store_package_in_gcs,
+    download_and_unpack_package,
     get_local_dir_from_uri,
     get_top_level_dir_from_compressed_package,
+    get_uri_for_file,
     get_uri_for_directory,
     get_uri_for_package,
     is_whl_uri,
@@ -30,6 +37,8 @@ from ray._private.runtime_env.packaging import (
     remove_dir_from_filepaths,
     unzip_package,
     upload_package_if_needed,
+    _get_gitignore,
+    upload_package_to_gcs,
 )
 from ray.experimental.internal_kv import (
     _initialize_internal_kv,
@@ -42,9 +51,24 @@ from ray.experimental.internal_kv import (
 TOP_LEVEL_DIR_NAME = "top_level"
 ARCHIVE_NAME = "archive.zip"
 
+# This package contains a subdirectory called `test_module`.
+# Calling `test_module.one()` should return `2`.
+# If you find that confusing, take it up with @jiaodong...
+HTTPS_PACKAGE_URI = "https://github.com/shrekris-anyscale/test_module/archive/a885b80879665a49d5cd4c3ebd33bb6f865644e5.zip"
+S3_PACKAGE_URI = "s3://runtime-env-test/test_runtime_env.zip"
+S3_WHL_PACKAGE_URI = "s3://runtime-env-test/test_module-0.0.1-py3-none-any.whl"
+
 
 def random_string(size: int = 10):
     return "".join(random.choice(string.ascii_uppercase) for _ in range(size))
+
+
+@pytest.fixture
+def random_file(tmp_path) -> Path:
+    p = tmp_path / (random_string(10) + ".py")
+    with p.open("w") as f:
+        f.write(random_string(100))
+    yield p
 
 
 @pytest.fixture
@@ -116,6 +140,38 @@ def random_zip_file_with_top_level_dir(tmp_path):
         TOP_LEVEL_DIR_NAME,
     )
     yield str(path / ARCHIVE_NAME)
+
+
+class TestGetURIForFile:
+    def test_invalid_file(self):
+        with pytest.raises(ValueError):
+            get_uri_for_file("/does/not/exist.py")
+
+        with pytest.raises(ValueError):
+            get_uri_for_file("does/not/exist.py")
+
+    def test_determinism(self, random_file):
+        # Check that it's deterministic for same data.
+        uris = {get_uri_for_file(str(random_file)) for _ in range(10)}
+        assert len(uris) == 1
+
+        # Append one line, should be different now.
+        with open(random_file, "a") as f:
+            f.write(random_string())
+
+        assert {get_uri_for_file(str(random_file))} != uris
+
+    def test_relative_paths(self, random_file):
+        # Check that relative or absolute paths result in the same URI.
+        p = Path(random_file)
+        relative_uri = get_uri_for_file(os.path.relpath(p))
+        absolute_uri = get_uri_for_file(str(p.resolve()))
+        assert relative_uri == absolute_uri
+
+    def test_uri_hash_length(self, random_file):
+        uri = get_uri_for_file(str(random_file))
+        hex_hash = uri.split("_")[-1][: -len(".zip")]
+        assert len(hex_hash) == 16
 
 
 class TestGetURIForDirectory:
@@ -212,7 +268,7 @@ class TestUploadPackageIfNeeded:
 
 
 class TestStorePackageInGcs:
-    class DisconnectedClient(GcsClient):
+    class DisconnectedClient:
         """Mock GcsClient that fails cannot put in the GCS."""
 
         def __init__(self, *args, **kwargs):
@@ -434,9 +490,14 @@ class TestParseUri:
             ("s3://bucket/file.zip", Protocol.S3, "s3_bucket_file.zip"),
             ("https://test.com/file.zip", Protocol.HTTPS, "https_test_com_file.zip"),
             ("gs://bucket/file.zip", Protocol.GS, "gs_bucket_file.zip"),
+            (
+                "https://test.com/package-0.0.1-py2.py3-none-any.whl?param=value",
+                Protocol.HTTPS,
+                "package-0.0.1-py2.py3-none-any.whl",
+            ),
         ],
     )
-    def test_parsing_basic(self, parsing_tuple):
+    def test_parsing_remote_basic(self, parsing_tuple):
         uri, protocol, package_name = parsing_tuple
         parsed_protocol, parsed_package_name = parse_uri(uri)
 
@@ -468,14 +529,236 @@ class TestParseUri:
         assert parsed_protocol == Protocol.HTTPS
         assert parsed_package_name == parsed_uri
 
+    @pytest.mark.parametrize(
+        "parsing_tuple",
+        [
+            (
+                "https://username:PAT@github.com/repo/archive:2/commit_hash.zip",
+                Protocol.HTTPS,
+                "https_username_PAT_github_com_repo_archive_2_commit_hash.zip",
+            ),
+            (
+                "gs://fake/2022-10-21T13:11:35+00:00/package.zip",
+                Protocol.GS,
+                "gs_fake_2022-10-21T13_11_35_00_00_package.zip",
+            ),
+            (
+                "s3://fake/2022-10-21T13:11:35+00:00/package.zip",
+                Protocol.S3,
+                "s3_fake_2022-10-21T13_11_35_00_00_package.zip",
+            ),
+            (
+                "file:///fake/2022-10-21T13:11:35+00:00/package.zip",
+                Protocol.FILE,
+                "file__fake_2022-10-21T13_11_35_00_00_package.zip",
+            ),
+            (
+                "file:///fake/2022-10-21T13:11:35+00:00/(package).zip",
+                Protocol.FILE,
+                "file__fake_2022-10-21T13_11_35_00_00__package_.zip",
+            ),
+        ],
+    )
+    def test_parse_uris_with_disallowed_chars(self, parsing_tuple):
+        raw_uri, protocol, parsed_uri = parsing_tuple
+        parsed_protocol, parsed_package_name = parse_uri(raw_uri)
+        assert parsed_protocol == protocol
+        assert parsed_package_name == parsed_uri
 
+    @pytest.mark.parametrize(
+        "parsing_tuple",
+        [
+            (
+                "https://username:PAT@github.com/repo/archive:2/commit_hash.whl",
+                Protocol.HTTPS,
+                "commit_hash.whl",
+            ),
+            (
+                "gs://fake/2022-10-21T13:11:35+00:00/package.whl",
+                Protocol.GS,
+                "package.whl",
+            ),
+            (
+                "s3://fake/2022-10-21T13:11:35+00:00/package.whl",
+                Protocol.S3,
+                "package.whl",
+            ),
+            (
+                "file:///fake/2022-10-21T13:11:35+00:00/package.whl",
+                Protocol.FILE,
+                "package.whl",
+            ),
+        ],
+    )
+    def test_parse_remote_whl_uris(self, parsing_tuple):
+        raw_uri, protocol, parsed_uri = parsing_tuple
+        parsed_protocol, parsed_package_name = parse_uri(raw_uri)
+        assert parsed_protocol == protocol
+        assert parsed_package_name == parsed_uri
+
+    @pytest.mark.parametrize(
+        "gcs_uri",
+        ["gcs://pip_install_test-0.5-py3-none-any.whl", "gcs://storing@here.zip"],
+    )
+    def test_parse_gcs_uri(self, gcs_uri):
+        """GCS URIs should not be modified in this function."""
+        protocol, package_name = parse_uri(gcs_uri)
+        assert protocol == Protocol.GCS
+        assert package_name == gcs_uri.split("/")[-1]
+
+
+@pytest.mark.asyncio
+class TestDownloadAndUnpackPackage:
+    async def test_download_and_unpack_package_with_gcs_uri_without_gcs_client(
+        self, ray_start_regular
+    ):
+        # Test the guard clause for giving GCS URIs without a GCS client.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zipfile_path = Path(temp_dir) / "test-zip-file.zip"
+            with zipfile.ZipFile(zipfile_path, "x") as zip:
+                # Add a file to the zip file so we can verify the file was extracted.
+                zip.writestr("file.txt", "Hello, world!")
+
+            # upload the zip file to GCS pkg_uri
+            pkg_uri = "gcs://my-zipfile.zip"
+            upload_package_to_gcs(pkg_uri, zipfile_path.read_bytes())
+
+            with pytest.raises(ValueError):
+                # Download the zip file from GCS pkg_uri
+                await download_and_unpack_package(
+                    pkg_uri=pkg_uri,
+                    base_directory=temp_dir,
+                    gcs_client=None,
+                )
+
+    async def test_download_and_unpack_package_with_gcs_uri(self, ray_start_regular):
+        # Test downloading and unpacking a GCS package with a GCS client.
+
+        gcs_client = ray._private.worker.global_worker.gcs_client
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zipfile_path = Path(temp_dir) / "test-zip-file.zip"
+            with zipfile.ZipFile(zipfile_path, "x") as zip:
+                # Add a file to the zip file so we can verify the file was extracted.
+                zip.writestr("file.txt", "Hello, world!")
+
+            # upload the zip file to GCS pkg_uri
+            pkg_uri = "gcs://my-zipfile.zip"
+            upload_package_to_gcs(pkg_uri, zipfile_path.read_bytes())
+
+            # Download the zip file from GCS pkg_uri
+            local_dir = await download_and_unpack_package(
+                pkg_uri=pkg_uri,
+                base_directory=temp_dir,
+                gcs_client=gcs_client,
+            )
+
+            # Check that the file was extracted to the destination directory
+            assert (Path(local_dir) / "file.txt").exists()
+
+    async def test_download_and_unpack_package_with_https_uri(self):
+        with tempfile.TemporaryDirectory() as temp_dest_dir:
+            local_dir = await download_and_unpack_package(
+                pkg_uri=HTTPS_PACKAGE_URI, base_directory=temp_dest_dir
+            )
+            assert (Path(local_dir) / "test_module").exists()
+
+    async def test_download_and_unpack_package_with_s3_uri(self):
+        # Note: running this test requires AWS credentials to be set up
+        # any crediential will do, as long as it's valid
+
+        with tempfile.TemporaryDirectory() as temp_dest_dir:
+            local_dir = await download_and_unpack_package(
+                pkg_uri=S3_PACKAGE_URI, base_directory=temp_dest_dir
+            )
+            assert (Path(local_dir) / "test_module").exists()
+
+        # test download whl from remote S3
+        with tempfile.TemporaryDirectory() as temp_dest_dir:
+            wheel_uri = await download_and_unpack_package(
+                pkg_uri=S3_WHL_PACKAGE_URI, base_directory=temp_dest_dir
+            )
+            assert (Path(local_dir) / wheel_uri).exists()
+
+    async def test_download_and_unpack_package_with_file_uri(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zipfile_path = Path(temp_dir) / "test-zip-file.zip"
+            with zipfile.ZipFile(zipfile_path, "x") as zip:
+                # Add a file to the zip file so we can verify the file was extracted.
+                zip.writestr("file.txt", "Hello, world!")
+
+            from urllib.request import pathname2url
+            from urllib.parse import urljoin
+
+            # in windows, file_path = ///C:/Users/...
+            # in linux, file_path = /tmp/...
+            file_path = pathname2url(str(zipfile_path))
+
+            # remove the first slash in file_path to avoid invalid path in windows
+            pkg_uri = urljoin("file:", file_path[1:])
+
+            local_dir = await download_and_unpack_package(
+                pkg_uri=pkg_uri, base_directory=temp_dir
+            )
+
+            # Check that the file was extracted to the destination directory
+            assert (Path(local_dir) / "file.txt").exists()
+
+    @pytest.mark.parametrize(
+        "protocol",
+        [
+            Protocol.CONDA,
+            Protocol.PIP,
+        ],
+    )
+    async def test_download_and_unpack_package_with_unsupported_protocol(
+        self, protocol: Protocol
+    ):
+        # Test giving an unsupported protocol.
+        pkg_uri = f"{protocol.value}://some-package.zip"
+        with pytest.raises(NotImplementedError) as excinfo:
+            await download_and_unpack_package(pkg_uri=pkg_uri, base_directory="/tmp")
+
+        assert f"{protocol.name} is not supported" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "invalid_pkg_uri",
+        [
+            "gcs://gcs-cannot-have-a-folder/my-zipfile.zip",
+            "s3://file-wihout-file-extension",
+        ],
+    )
+    async def test_download_and_unpack_package_with_invalid_uri(
+        self, invalid_pkg_uri: str
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            await download_and_unpack_package(
+                pkg_uri=invalid_pkg_uri, base_directory="/tmp"
+            )
+
+        assert "Invalid package URI" in str(excinfo.value)
+
+
+def test_get_gitignore(tmp_path):
+    gitignore_path = tmp_path / ".gitignore"
+    gitignore_path.write_text("*.pyc")
+    assert _get_gitignore(tmp_path)(Path(tmp_path / "foo.pyc")) is True
+    assert _get_gitignore(tmp_path)(Path(tmp_path / "foo.py")) is False
+
+
+@pytest.mark.parametrize("ignore_gitignore", [True, False])
 @pytest.mark.skipif(sys.platform == "win32", reason="Fails on windows")
-def test_travel(tmp_path):
+def test_travel(tmp_path, ignore_gitignore, monkeypatch):
     dir_paths = set()
     file_paths = set()
     item_num = 0
     excludes = []
     root = tmp_path / "test"
+
+    if ignore_gitignore:
+        monkeypatch.setenv(RAY_RUNTIME_ENV_IGNORE_GITIGNORE, "1")
+    else:
+        monkeypatch.delenv(RAY_RUNTIME_ENV_IGNORE_GITIGNORE, raising=False)
 
     def construct(path, excluded=False, depth=0):
         nonlocal item_num
@@ -511,6 +794,18 @@ def test_travel(tmp_path):
                 else:
                     file_paths.add((str(path / uid), str(v)))
             item_num += 1
+
+        # Add gitignore file
+        gitignore = root / ".gitignore"
+        gitignore.write_text("*.pyc")
+        file_paths.add((str(gitignore), "*.pyc"))
+
+        # Add file that should be ignored by gitignore
+        with (root / "foo.pyc").open("w") as f:
+            f.write("foo")
+        if ignore_gitignore:
+            # If ignore_gitignore is True, then the file should be visited
+            file_paths.add((str(root / "foo.pyc"), "foo"))
 
     construct(root)
     exclude_spec = _get_excludes(root, excludes)
@@ -554,7 +849,4 @@ def test_get_local_dir_from_uri():
 
 
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

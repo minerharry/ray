@@ -1,5 +1,5 @@
 from collections import namedtuple, OrderedDict
-import gym
+import gymnasium as gym
 import logging
 import re
 import tree  # pip install dm_tree
@@ -14,10 +14,17 @@ from ray.rllib.policy.tf_policy import TFPolicy
 from ray.rllib.policy.view_requirement import ViewRequirement
 from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.utils import force_list
-from ray.rllib.utils.annotations import override, DeveloperAPI
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.debug import summarize
-from ray.rllib.utils.deprecation import deprecation_warning, DEPRECATED_VALUE
+from ray.rllib.utils.deprecation import (
+    deprecation_warning,
+    DEPRECATED_VALUE,
+)
 from ray.rllib.utils.framework import try_import_tf
+from ray.rllib.utils.metrics import (
+    DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY,
+    NUM_GRAD_UPDATES_LIFETIME,
+)
 from ray.rllib.utils.spaces.space_utils import get_dummy_batch_for_space
 from ray.rllib.utils.tf_utils import get_placeholder
 from ray.rllib.utils.typing import (
@@ -35,7 +42,7 @@ logger = logging.getLogger(__name__)
 TOWER_SCOPE_NAME = "tower"
 
 
-@DeveloperAPI
+@OldAPIStack
 class DynamicTFPolicy(TFPolicy):
     """A TFPolicy that auto-defines placeholders dynamically at runtime.
 
@@ -44,7 +51,6 @@ class DynamicTFPolicy(TFPolicy):
     to generate your custom tf (graph-mode or eager) Policy classes.
     """
 
-    @DeveloperAPI
     def __init__(
         self,
         obs_space: gym.spaces.Space,
@@ -325,7 +331,6 @@ class DynamicTFPolicy(TFPolicy):
             # Distribution generation is customized, e.g., DQN, DDPG.
             else:
                 if action_distribution_fn:
-
                     # Try new action_distribution_fn signature, supporting
                     # state_batches and seq_lens.
                     in_dict = self._input_dict
@@ -474,7 +479,6 @@ class DynamicTFPolicy(TFPolicy):
             self.get_session().run(tf1.global_variables_initializer())
 
     @override(TFPolicy)
-    @DeveloperAPI
     def copy(self, existing_inputs: List[Tuple[str, "tf1.placeholder"]]) -> TFPolicy:
         """Creates a copy of self using existing input placeholders."""
 
@@ -548,7 +552,6 @@ class DynamicTFPolicy(TFPolicy):
         return instance
 
     @override(Policy)
-    @DeveloperAPI
     def get_initial_state(self) -> List[TensorType]:
         if self.model:
             return self.model.get_initial_state()
@@ -556,7 +559,6 @@ class DynamicTFPolicy(TFPolicy):
             return []
 
     @override(Policy)
-    @DeveloperAPI
     def load_batch_into_buffer(
         self,
         batch: SampleBatch,
@@ -585,10 +587,10 @@ class DynamicTFPolicy(TFPolicy):
             sess=self.get_session(),
             inputs=inputs,
             state_inputs=state_inputs,
+            num_grad_updates=batch.num_grad_updates,
         )
 
     @override(Policy)
-    @DeveloperAPI
     def get_num_samples_loaded_into_buffer(self, buffer_index: int = 0) -> int:
         # Shortcut for 1 CPU only: Batch should already be stored in
         # `self._loaded_single_cpu_batch`.
@@ -603,7 +605,6 @@ class DynamicTFPolicy(TFPolicy):
         return self.multi_gpu_tower_stacks[buffer_index].num_tuples_loaded
 
     @override(Policy)
-    @DeveloperAPI
     def learn_on_loaded_batch(self, offset: int = 0, buffer_index: int = 0):
         # Shortcut for 1 CPU only: Batch should already be stored in
         # `self._loaded_single_cpu_batch`.
@@ -616,9 +617,11 @@ class DynamicTFPolicy(TFPolicy):
                 )
             # Get the correct slice of the already loaded batch to use,
             # based on offset and batch size.
-            batch_size = self.config.get(
-                "sgd_minibatch_size", self.config["train_batch_size"]
-            )
+            batch_size = self.config.get("minibatch_size")
+            if batch_size is None:
+                batch_size = self.config.get(
+                    "sgd_minibatch_size", self.config["train_batch_size"]
+                )
             if batch_size >= len(self._loaded_single_cpu_batch):
                 sliced_batch = self._loaded_single_cpu_batch
             else:
@@ -627,9 +630,21 @@ class DynamicTFPolicy(TFPolicy):
                 )
             return self.learn_on_batch(sliced_batch)
 
-        return self.multi_gpu_tower_stacks[buffer_index].optimize(
-            self.get_session(), offset
+        tower_stack = self.multi_gpu_tower_stacks[buffer_index]
+        results = tower_stack.optimize(self.get_session(), offset)
+        self.num_grad_updates += 1
+
+        results.update(
+            {
+                NUM_GRAD_UPDATES_LIFETIME: self.num_grad_updates,
+                # -1, b/c we have to measure this diff before we do the update above.
+                DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY: (
+                    self.num_grad_updates - 1 - (tower_stack.num_grad_updates or 0)
+                ),
+            }
         )
+
+        return results
 
     def _get_input_dict_and_dummy_batch(self, view_requirements, existing_inputs):
         """Creates input_dict and dummy_batch for loss initialization.
@@ -697,7 +712,6 @@ class DynamicTFPolicy(TFPolicy):
     def _initialize_loss_from_dummy_batch(
         self, auto_remove_unneeded_view_reqs: bool = True, stats_fn=None
     ) -> None:
-
         # Create the optimizer/exploration optimizer here. Some initialization
         # steps (e.g. exploration postprocessing) may need this.
         if not self._optimizers:
@@ -768,7 +782,7 @@ class DynamicTFPolicy(TFPolicy):
                 {SampleBatch.SEQ_LENS: train_batch[SampleBatch.SEQ_LENS]}
             )
 
-        self._loss_input_dict.update({k: v for k, v in train_batch.items()})
+        self._loss_input_dict.update(dict(train_batch))
 
         if log_once("loss_init"):
             logger.debug(
@@ -821,7 +835,8 @@ class DynamicTFPolicy(TFPolicy):
                         SampleBatch.EPS_ID,
                         SampleBatch.AGENT_INDEX,
                         SampleBatch.UNROLL_ID,
-                        SampleBatch.DONES,
+                        SampleBatch.TERMINATEDS,
+                        SampleBatch.TRUNCATEDS,
                         SampleBatch.REWARDS,
                         SampleBatch.INFOS,
                         SampleBatch.T,
@@ -834,7 +849,8 @@ class DynamicTFPolicy(TFPolicy):
                         del self._loss_input_dict[key]
             # Remove those not needed at all (leave those that are needed
             # by Sampler to properly execute sample collection).
-            # Also always leave DONES, REWARDS, and INFOS, no matter what.
+            # Also always leave TERMINATEDS, TRUNCATEDS, REWARDS, and INFOS,
+            # no matter what.
             for key in list(self.view_requirements.keys()):
                 if (
                     key not in all_accessed_keys
@@ -843,7 +859,8 @@ class DynamicTFPolicy(TFPolicy):
                         SampleBatch.EPS_ID,
                         SampleBatch.AGENT_INDEX,
                         SampleBatch.UNROLL_ID,
-                        SampleBatch.DONES,
+                        SampleBatch.TERMINATEDS,
+                        SampleBatch.TRUNCATEDS,
                         SampleBatch.REWARDS,
                         SampleBatch.INFOS,
                         SampleBatch.T,
@@ -899,7 +916,7 @@ class DynamicTFPolicy(TFPolicy):
         return losses
 
 
-@DeveloperAPI
+@OldAPIStack
 class TFMultiGPUTowerStack:
     """Optimizer that runs in parallel across multiple local devices.
 
@@ -957,7 +974,7 @@ class TFMultiGPUTowerStack:
             self.max_per_device_batch_size = (
                 max_per_device_batch_size
                 or policy.config.get(
-                    "sgd_minibatch_size", policy.config.get("train_batch_size", 999999)
+                    "minibatch_size", policy.config.get("train_batch_size", 999999)
                 )
             ) // len(self.devices)
             input_placeholders = tree.flatten(self.policy._loss_input_dict_no_rnn)
@@ -1064,7 +1081,12 @@ class TFMultiGPUTowerStack:
             with tf1.control_dependencies(self._update_ops):
                 self._train_op = self.optimizers[0].apply_gradients(avg)
 
-    def load_data(self, sess, inputs, state_inputs):
+        # The lifetime number of gradient updates that the policy having sent
+        # some data (SampleBatchType) into this tower stack's GPU buffer(s) has already
+        # undergone.
+        self.num_grad_updates = 0
+
+    def load_data(self, sess, inputs, state_inputs, num_grad_updates=None):
         """Bulk loads the specified inputs into device memory.
 
         The shape of the inputs must conform to the shapes of the input
@@ -1079,10 +1101,14 @@ class TFMultiGPUTowerStack:
                 [BATCH_SIZE, ...].
             state_inputs: List of RNN input arrays. These arrays have size
                 [BATCH_SIZE / MAX_SEQ_LEN, ...].
+            num_grad_updates: The lifetime number of gradient updates that the
+                policy having collected the data has already undergone.
 
         Returns:
             The number of tuples loaded per device.
         """
+        self.num_grad_updates = num_grad_updates
+
         if log_once("load_data"):
             logger.info(
                 "Training on concatenated sample batches:\n\n{}\n".format(
@@ -1157,7 +1183,7 @@ class TFMultiGPUTowerStack:
         if sequences_per_minibatch < len(self.devices):
             raise ValueError(
                 "Must load at least 1 tuple sequence per device. Try "
-                "increasing `sgd_minibatch_size` or reducing `max_seq_len` "
+                "increasing `minibatch_size` or reducing `max_seq_len` "
                 "to ensure that at least one sequence fits per device."
             )
         self._loaded_per_device_batch_size = (
@@ -1303,7 +1329,6 @@ def _average_gradients(tower_grads):
 
     average_grads = []
     for grad_and_vars in zip(*tower_grads):
-
         # Note that each grad_and_vars looks like the following:
         #   ((grad0_gpu0, var0_gpu0), ... , (grad0_gpuN, var0_gpuN))
         grads = []

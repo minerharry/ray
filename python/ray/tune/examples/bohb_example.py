@@ -6,15 +6,14 @@ Requires the HpBandSter and ConfigSpace libraries to be installed
 (`pip install hpbandster ConfigSpace`).
 """
 
-import argparse
 import json
-import time
 import os
+import time
 
 import numpy as np
 
 import ray
-from ray import air, tune
+from ray import tune
 from ray.tune import Trainable
 from ray.tune.schedulers.hb_bohb import HyperBandForBOHB
 from ray.tune.search.bohb import TuneBOHB
@@ -43,28 +42,21 @@ class MyTrainableClass(Trainable):
         path = os.path.join(checkpoint_dir, "checkpoint")
         with open(path, "w") as f:
             f.write(json.dumps({"timestep": self.timestep}))
-        return path
 
-    def load_checkpoint(self, checkpoint_path):
-        with open(checkpoint_path) as f:
+    def load_checkpoint(self, checkpoint_dir):
+        path = os.path.join(checkpoint_dir, "checkpoint")
+        with open(path, "r") as f:
             self.timestep = json.loads(f.read())["timestep"]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
-    args, _ = parser.parse_known_args()
+    import sys
 
-    if args.server_address:
-        ray.init(f"ray://{args.server_address}")
-    else:
-        ray.init(num_cpus=8)
+    if sys.version_info >= (3, 12):
+        # TuneBOHB is not compatible with Python 3.12
+        sys.exit(0)
+
+    ray.init(num_cpus=8)
 
     config = {
         "iterations": 100,
@@ -84,10 +76,11 @@ if __name__ == "__main__":
     #     CS.CategoricalHyperparameter(
     #         "activation", choices=["relu", "tanh"]))
 
+    max_iterations = 10
     bohb_hyperband = HyperBandForBOHB(
         time_attr="training_iteration",
-        max_t=100,
-        reduction_factor=4,
+        max_t=max_iterations,
+        reduction_factor=2,
         stop_last_trials=False,
     )
 
@@ -98,13 +91,15 @@ if __name__ == "__main__":
 
     tuner = tune.Tuner(
         MyTrainableClass,
-        run_config=air.RunConfig(name="bohb_test", stop={"training_iteration": 100}),
+        run_config=tune.RunConfig(
+            name="bohb_test", stop={"training_iteration": max_iterations}
+        ),
         tune_config=tune.TuneConfig(
             metric="episode_reward_mean",
             mode="max",
             scheduler=bohb_hyperband,
             search_alg=bohb_search,
-            num_samples=10,
+            num_samples=32,
         ),
         param_space=config,
     )

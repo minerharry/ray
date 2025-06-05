@@ -14,16 +14,20 @@
 
 #include "ray/core_worker/reference_count.h"
 
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/functional/bind_front.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "mock/ray/pubsub/publisher.h"
+#include "mock/ray/pubsub/subscriber.h"
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/asio/periodical_runner.h"
 #include "ray/common/ray_object.h"
 #include "ray/core_worker/store_provider/memory_store/memory_store.h"
-#include "ray/pubsub/mock_pubsub.h"
 #include "ray/pubsub/publisher.h"
 #include "ray/pubsub/subscriber.h"
 
@@ -38,8 +42,8 @@ class ReferenceCountTest : public ::testing::Test {
   std::unique_ptr<ReferenceCounter> rc;
   virtual void SetUp() {
     rpc::Address addr;
-    publisher_ = std::make_shared<mock_pubsub::MockPublisher>();
-    subscriber_ = std::make_shared<mock_pubsub::MockSubscriber>();
+    publisher_ = std::make_shared<pubsub::MockPublisher>();
+    subscriber_ = std::make_shared<pubsub::MockSubscriber>();
     rc = std::make_unique<ReferenceCounter>(
         addr, publisher_.get(), subscriber_.get(), [](const NodeID &node_id) {
           return true;
@@ -55,8 +59,8 @@ class ReferenceCountTest : public ::testing::Test {
 
   void AssertNoLeaks() { ASSERT_EQ(rc->NumObjectIDsInScope(), 0); }
 
-  std::shared_ptr<mock_pubsub::MockPublisher> publisher_;
-  std::shared_ptr<mock_pubsub::MockSubscriber> subscriber_;
+  std::shared_ptr<pubsub::MockPublisher> publisher_;
+  std::shared_ptr<pubsub::MockSubscriber> subscriber_;
 };
 
 class ReferenceCountLineageEnabledTest : public ::testing::Test {
@@ -64,8 +68,8 @@ class ReferenceCountLineageEnabledTest : public ::testing::Test {
   std::unique_ptr<ReferenceCounter> rc;
   virtual void SetUp() {
     rpc::Address addr;
-    publisher_ = std::make_shared<mock_pubsub::MockPublisher>();
-    subscriber_ = std::make_shared<mock_pubsub::MockSubscriber>();
+    publisher_ = std::make_shared<pubsub::MockPublisher>();
+    subscriber_ = std::make_shared<pubsub::MockSubscriber>();
     rc = std::make_unique<ReferenceCounter>(
         addr,
         publisher_.get(),
@@ -80,8 +84,8 @@ class ReferenceCountLineageEnabledTest : public ::testing::Test {
     rc.reset();
   }
 
-  std::shared_ptr<mock_pubsub::MockPublisher> publisher_;
-  std::shared_ptr<mock_pubsub::MockSubscriber> subscriber_;
+  std::shared_ptr<pubsub::MockPublisher> publisher_;
+  std::shared_ptr<pubsub::MockSubscriber> subscriber_;
 };
 
 /// The 2 classes below are implemented to support distributed mock test using
@@ -122,21 +126,21 @@ using PublisherFactoryFn =
 
 class MockDistributedSubscriber : public pubsub::SubscriberInterface {
  public:
-  MockDistributedSubscriber(
-      pubsub::pub_internal::SubscriptionIndex *directory,
-      SubscriptionCallbackMap *subscription_callback_map,
-      SubscriptionFailureCallbackMap *subscription_failure_callback_map,
-      pubsub::SubscriberID subscriber_id,
-      PublisherFactoryFn client_factory)
-      : directory_(directory),
-        subscription_callback_map_(subscription_callback_map),
-        subscription_failure_callback_map_(subscription_failure_callback_map),
+  MockDistributedSubscriber(pubsub::pub_internal::SubscriptionIndex *dict,
+                            SubscriptionCallbackMap *sub_callback_map,
+                            SubscriptionFailureCallbackMap *sub_failure_callback_map,
+                            pubsub::SubscriberID subscriber_id,
+                            PublisherFactoryFn client_factory)
+      : directory_(dict),
+        subscription_callback_map_(sub_callback_map),
+        subscription_failure_callback_map_(sub_failure_callback_map),
         subscriber_id_(subscriber_id),
         subscriber_(std::make_unique<pubsub::pub_internal::SubscriberState>(
             subscriber_id,
             /*get_time_ms=*/[]() { return 1.0; },
             /*subscriber_timeout_ms=*/1000,
-            /*publish_batch_size=*/1000)),
+            /*publish_batch_size=*/1000,
+            UniqueID::FromRandom())),
         client_factory_(client_factory) {}
 
   ~MockDistributedSubscriber() = default;
@@ -228,14 +232,13 @@ class MockDistributedSubscriber : public pubsub::SubscriberInterface {
 
 class MockDistributedPublisher : public pubsub::PublisherInterface {
  public:
-  MockDistributedPublisher(
-      pubsub::pub_internal::SubscriptionIndex *directory,
-      SubscriptionCallbackMap *subscription_callback_map,
-      SubscriptionFailureCallbackMap *subscription_failure_callback_map,
-      WorkerID publisher_id)
-      : directory_(directory),
-        subscription_callback_map_(subscription_callback_map),
-        subscription_failure_callback_map_(subscription_failure_callback_map),
+  MockDistributedPublisher(pubsub::pub_internal::SubscriptionIndex *dict,
+                           SubscriptionCallbackMap *sub_callback_map,
+                           SubscriptionFailureCallbackMap *sub_failure_callback_map,
+                           WorkerID publisher_id)
+      : directory_(dict),
+        subscription_callback_map_(sub_callback_map),
+        subscription_failure_callback_map_(sub_failure_callback_map),
         publisher_id_(publisher_id) {}
   ~MockDistributedPublisher() = default;
 
@@ -249,7 +252,7 @@ class MockDistributedPublisher : public pubsub::PublisherInterface {
   void PublishFailure(const rpc::ChannelType channel_type,
                       const std::string &key_id_binary) {}
 
-  void Publish(const rpc::PubMessage &pub_message) {
+  void Publish(rpc::PubMessage pub_message) {
     if (pub_message.channel_type() == rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL) {
       // TODO(swang): Test object locations pubsub too.
       return;
@@ -262,7 +265,8 @@ class MockDistributedPublisher : public pubsub::PublisherInterface {
       if (it != subscription_callback_map_->end()) {
         const auto callback_it = it->second.find(oid);
         RAY_CHECK(callback_it != it->second.end());
-        callback_it->second(pub_message);
+        rpc::PubMessage copied = pub_message;
+        callback_it->second(std::move(copied));
       }
     }
   }
@@ -290,7 +294,8 @@ class MockWorkerClient : public MockCoreWorkerClientInterface {
     return address;
   }
 
-  MockWorkerClient(const std::string &addr, PublisherFactoryFn client_factory = nullptr)
+  explicit MockWorkerClient(const std::string &addr,
+                            PublisherFactoryFn client_factory = nullptr)
       : address_(CreateRandomAddress(addr)),
         publisher_(std::make_shared<MockDistributedPublisher>(
             &directory,
@@ -304,12 +309,11 @@ class MockWorkerClient : public MockCoreWorkerClientInterface {
             WorkerID::FromBinary(address_.worker_id()),
             client_factory)),
         rc_(
-            rpc::WorkerAddress(address_),
+            address_,
             publisher_.get(),
             subscriber_.get(),
             [](const NodeID &node_id) { return true; },
-            /*lineage_pinning_enabled=*/false,
-            client_factory) {}
+            /*lineage_pinning_enabled=*/false) {}
 
   ~MockWorkerClient() override {
     if (!failed_) {
@@ -414,7 +418,7 @@ class MockWorkerClient : public MockCoreWorkerClientInterface {
       const ObjectID &arg_id,
       const ObjectID &return_id,
       const ObjectID *return_wrapped_id = nullptr,
-      const rpc::WorkerAddress *owner_address = nullptr) {
+      const rpc::Address *owner_address = nullptr) {
     if (return_wrapped_id) {
       rc_.AddNestedObjectIds(return_id, {*return_wrapped_id}, *owner_address);
     }
@@ -570,9 +574,9 @@ TEST_F(ReferenceCountTest, TestUnreconstructableObjectOutOfScope) {
 
   // The object goes out of scope once it has no more refs.
   std::vector<ObjectID> out;
-  ASSERT_FALSE(rc->SetDeleteCallback(id, callback));
+  ASSERT_FALSE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->AddOwnedObject(id, {}, address, "", 0, false, /*add_local_ref=*/true);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   ASSERT_FALSE(*out_of_scope);
   rc->RemoveLocalReference(id, &out);
   ASSERT_TRUE(*out_of_scope);
@@ -580,9 +584,9 @@ TEST_F(ReferenceCountTest, TestUnreconstructableObjectOutOfScope) {
   // Unreconstructable objects go out of scope even if they have a nonzero
   // lineage ref count.
   *out_of_scope = false;
-  ASSERT_FALSE(rc->SetDeleteCallback(id, callback));
+  ASSERT_FALSE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->AddOwnedObject(id, {}, address, "", 0, false, /*add_local_ref=*/false);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->UpdateSubmittedTaskReferences({}, {id});
   ASSERT_FALSE(*out_of_scope);
   rc->UpdateFinishedTaskReferences({}, {id}, false, empty_borrower, empty_refs, &out);
@@ -651,11 +655,10 @@ TEST_F(ReferenceCountTest, TestHandleObjectSpilled) {
                      object_size,
                      false,
                      /*add_local_ref=*/true,
-                     absl::optional<NodeID>(node1));
+                     std::optional<NodeID>(node1));
   rc->HandleObjectSpilled(obj1, "url1", node1);
   rpc::WorkerObjectLocationsPubMessage object_info;
-  Status status = rc->FillObjectInformation(obj1, &object_info);
-  ASSERT_TRUE(status.ok());
+  rc->FillObjectInformation(obj1, &object_info);
   ASSERT_EQ(object_info.object_size(), object_size);
   ASSERT_EQ(object_info.spilled_url(), "url1");
   ASSERT_EQ(object_info.spilled_node_id(), node1.Binary());
@@ -682,7 +685,7 @@ TEST_F(ReferenceCountTest, TestGetLocalityData) {
                      object_size,
                      false,
                      /*add_local_ref=*/true,
-                     absl::optional<NodeID>(node1));
+                     std::optional<NodeID>(node1));
   auto locality_data_obj1 = rc->GetLocalityData(obj1);
   ASSERT_TRUE(locality_data_obj1.has_value());
   ASSERT_EQ(locality_data_obj1->object_size, object_size);
@@ -757,7 +760,7 @@ TEST_F(ReferenceCountTest, TestGetLocalityData) {
                      -1,
                      false,
                      /*add_local_ref=*/true,
-                     absl::optional<NodeID>(node2));
+                     std::optional<NodeID>(node2));
   auto locality_data_obj2_no_object_size = rc->GetLocalityData(obj2);
   ASSERT_FALSE(locality_data_obj2_no_object_size.has_value());
 
@@ -820,14 +823,14 @@ TEST(MemoryStoreIntegrationTest, TestSimple) {
   uint8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8};
   RayObject buffer(std::make_shared<LocalMemoryBuffer>(data, sizeof(data)), nullptr, {});
 
-  auto publisher = std::make_shared<mock_pubsub::MockPublisher>();
-  auto subscriber = std::make_shared<mock_pubsub::MockSubscriber>();
-  auto rc = std::shared_ptr<ReferenceCounter>(
-      new ReferenceCounter(rpc::WorkerAddress(rpc::Address()),
-                           publisher.get(),
-                           subscriber.get(),
-                           [](const NodeID &node_id) { return true; }));
-  CoreWorkerMemoryStore store(rc);
+  auto publisher = std::make_shared<pubsub::MockPublisher>();
+  auto subscriber = std::make_shared<pubsub::MockSubscriber>();
+  auto rc = std::make_shared<ReferenceCounter>(
+      rpc::Address(), publisher.get(), subscriber.get(), [](const NodeID &node_id) {
+        return true;
+      });
+  InstrumentedIOContextWithThread io_context("TestSimple");
+  CoreWorkerMemoryStore store(io_context.GetIoService(), rc.get());
 
   // Tests putting an object with no references is ignored.
   RAY_CHECK(store.Put(buffer, id2));
@@ -1746,9 +1749,9 @@ TEST(DistributedReferenceCountTest, TestForeignOwner) {
   // Task returns inner_id as its return value.
   auto inner_id = ObjectID::FromRandom();
   owner->PutWithForeignOwner(inner_id, foreign_owner->address_);
-  rpc::WorkerAddress addr(caller->address_);
   ASSERT_FALSE(caller->rc_.HasReference(inner_id));
-  auto refs = owner->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs = owner->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &inner_id, &caller->address_);
   ASSERT_TRUE(refs.empty());
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
   ASSERT_FALSE(caller->rc_.HasReference(inner_id));
@@ -1907,8 +1910,8 @@ TEST(DistributedReferenceCountTest, TestReturnObjectIdNoBorrow) {
   // Task returns inner_id as its return value.
   auto inner_id = ObjectID::FromRandom();
   owner->Put(inner_id);
-  rpc::WorkerAddress addr(caller->address_);
-  auto refs = owner->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs = owner->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &inner_id, &caller->address_);
   owner->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(refs.empty());
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
@@ -1948,8 +1951,8 @@ TEST(DistributedReferenceCountTest, TestReturnObjectIdBorrow) {
   // Task returns inner_id as its return value.
   auto inner_id = ObjectID::FromRandom();
   owner->Put(inner_id);
-  rpc::WorkerAddress addr(caller->address_);
-  auto refs = owner->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs = owner->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &inner_id, &caller->address_);
   owner->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(refs.empty());
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
@@ -1997,8 +2000,8 @@ TEST(DistributedReferenceCountTest, TestReturnObjectIdBorrowChain) {
   // Task returns inner_id as its return value.
   auto inner_id = ObjectID::FromRandom();
   owner->Put(inner_id);
-  rpc::WorkerAddress addr(caller->address_);
-  auto refs = owner->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs = owner->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &inner_id, &caller->address_);
   owner->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(refs.empty());
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
@@ -2069,8 +2072,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedId) {
   // Task returns inner_id as its return value.
   auto inner_id = ObjectID::FromRandom();
   owner->Put(inner_id);
-  rpc::WorkerAddress addr(caller->address_);
-  auto refs = owner->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs = owner->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &inner_id, &caller->address_);
   owner->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(refs.empty());
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
@@ -2088,8 +2091,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedId) {
   // return value.
   borrower->ExecuteTaskWithArg(return_id, inner_id, owner->address_);
   ASSERT_TRUE(borrower->rc_.HasReference(inner_id));
-  auto borrower_refs =
-      borrower->FinishExecutingTask(return_id, borrower_return_id, &inner_id, &addr);
+  auto borrower_refs = borrower->FinishExecutingTask(
+      return_id, borrower_return_id, &inner_id, &caller->address_);
   ASSERT_TRUE(borrower->rc_.HasReference(inner_id));
 
   // Borrower merges ref count into the caller.
@@ -2157,8 +2160,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdDeserialize) {
   // Task returns inner_id as its return value.
   auto inner_id = ObjectID::FromRandom();
   owner->Put(inner_id);
-  rpc::WorkerAddress addr(caller->address_);
-  auto refs = owner->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs = owner->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &inner_id, &caller->address_);
   owner->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(refs.empty());
   ASSERT_TRUE(owner->rc_.HasReference(inner_id));
@@ -2175,8 +2178,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdDeserialize) {
   // return value.
   borrower->ExecuteTaskWithArg(return_id, inner_id, owner->address_);
   ASSERT_TRUE(borrower->rc_.HasReference(inner_id));
-  auto borrower_refs =
-      borrower->FinishExecutingTask(return_id, borrower_return_id, &inner_id, &addr);
+  auto borrower_refs = borrower->FinishExecutingTask(
+      return_id, borrower_return_id, &inner_id, &caller->address_);
   ASSERT_TRUE(borrower->rc_.HasReference(inner_id));
 
   // Borrower merges ref count into the caller.
@@ -2243,16 +2246,14 @@ TEST(DistributedReferenceCountTest, TestReturnIdChain) {
 
   // Task submits a nested task and returns the return ID.
   auto nested_return_id = worker->SubmitTaskWithArg(ObjectID::Nil());
-  rpc::WorkerAddress addr(root->address_);
-  auto refs =
-      worker->FinishExecutingTask(ObjectID::Nil(), return_id, &nested_return_id, &addr);
+  auto refs = worker->FinishExecutingTask(
+      ObjectID::Nil(), return_id, &nested_return_id, &root->address_);
 
   // The nested task returns an ObjectID that it owns.
   auto inner_id = ObjectID::FromRandom();
   nested_worker->Put(inner_id);
-  rpc::WorkerAddress worker_addr(worker->address_);
   auto nested_refs = nested_worker->FinishExecutingTask(
-      ObjectID::Nil(), nested_return_id, &inner_id, &worker_addr);
+      ObjectID::Nil(), nested_return_id, &inner_id, &worker->address_);
   nested_worker->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(nested_worker->rc_.HasReference(inner_id));
 
@@ -2312,9 +2313,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdChain) {
   // The nested task returns an ObjectID that it owns.
   auto inner_id = ObjectID::FromRandom();
   nested_worker->Put(inner_id);
-  rpc::WorkerAddress worker_addr(worker->address_);
   auto nested_refs = nested_worker->FinishExecutingTask(
-      ObjectID::Nil(), nested_return_id, &inner_id, &worker_addr);
+      ObjectID::Nil(), nested_return_id, &inner_id, &worker->address_);
   nested_worker->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(nested_worker->rc_.HasReference(inner_id));
 
@@ -2324,8 +2324,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdChain) {
   worker->FlushBorrowerCallbacks();
   // Worker deserializes the inner_id and returns it.
   worker->GetSerializedObjectId(nested_return_id, inner_id, nested_worker->address_);
-  rpc::WorkerAddress addr(root->address_);
-  auto refs = worker->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs =
+      worker->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &root->address_);
 
   // Worker no longer borrowers the inner ID.
   worker->rc_.RemoveLocalReference(inner_id, nullptr);
@@ -2392,9 +2392,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdChainOutOfOrder) {
   // The nested task returns an ObjectID that it owns.
   auto inner_id = ObjectID::FromRandom();
   nested_worker->Put(inner_id);
-  rpc::WorkerAddress worker_addr(worker->address_);
   auto nested_refs = nested_worker->FinishExecutingTask(
-      ObjectID::Nil(), nested_return_id, &inner_id, &worker_addr);
+      ObjectID::Nil(), nested_return_id, &inner_id, &worker->address_);
   nested_worker->rc_.RemoveLocalReference(inner_id, nullptr);
   ASSERT_TRUE(nested_worker->rc_.HasReference(inner_id));
 
@@ -2404,8 +2403,8 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdChainOutOfOrder) {
   worker->FlushBorrowerCallbacks();
   // Worker deserializes the inner_id and returns it.
   worker->GetSerializedObjectId(nested_return_id, inner_id, nested_worker->address_);
-  rpc::WorkerAddress addr(root->address_);
-  auto refs = worker->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &addr);
+  auto refs =
+      worker->FinishExecutingTask(ObjectID::Nil(), return_id, &inner_id, &root->address_);
 
   // Worker no longer borrowers the inner ID.
   worker->rc_.RemoveLocalReference(inner_id, nullptr);
@@ -2427,7 +2426,7 @@ TEST(DistributedReferenceCountTest, TestReturnBorrowedIdChainOutOfOrder) {
   ASSERT_FALSE(nested_worker->rc_.HasReference(inner_id));
 }
 
-// TODO: Test Pop and Merge individually.
+// TODO(swang): Test Pop and Merge individually.
 
 TEST_F(ReferenceCountLineageEnabledTest, TestUnreconstructableObjectOutOfScope) {
   ObjectID id = ObjectID::FromRandom();
@@ -2440,9 +2439,9 @@ TEST_F(ReferenceCountLineageEnabledTest, TestUnreconstructableObjectOutOfScope) 
 
   // The object goes out of scope once it has no more refs.
   std::vector<ObjectID> out;
-  ASSERT_FALSE(rc->SetDeleteCallback(id, callback));
+  ASSERT_FALSE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->AddOwnedObject(id, {}, address, "", 0, false, /*add_local_ref=*/true);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   ASSERT_FALSE(*out_of_scope);
   ASSERT_FALSE(*out_of_scope);
   rc->RemoveLocalReference(id, &out);
@@ -2453,9 +2452,9 @@ TEST_F(ReferenceCountLineageEnabledTest, TestUnreconstructableObjectOutOfScope) 
   // Unreconstructable objects stay in scope if they have a nonzero lineage ref
   // count.
   *out_of_scope = false;
-  ASSERT_FALSE(rc->SetDeleteCallback(id, callback));
+  ASSERT_FALSE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->AddOwnedObject(id, {}, address, "", 0, false, /*add_local_ref=*/false);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->UpdateSubmittedTaskReferences({return_id}, {id});
   ASSERT_TRUE(rc->IsObjectPendingCreation(return_id));
   ASSERT_FALSE(*out_of_scope);
@@ -2466,7 +2465,8 @@ TEST_F(ReferenceCountLineageEnabledTest, TestUnreconstructableObjectOutOfScope) 
 
   // Unreconstructable objects go out of scope once their lineage ref count
   // reaches 0.
-  rc->UpdateResubmittedTaskReferences({return_id}, {id});
+  rc->UpdateResubmittedTaskReferences({id});
+  rc->UpdateObjectPendingCreation(return_id, true);
   ASSERT_TRUE(rc->IsObjectPendingCreation(return_id));
   rc->UpdateFinishedTaskReferences(
       {return_id}, {id}, true, empty_borrower, empty_refs, &out);
@@ -2543,7 +2543,7 @@ TEST_F(ReferenceCountLineageEnabledTest, TestPinLineageRecursive) {
     rc->UpdateFinishedTaskReferences({}, {id}, false, empty_borrower, empty_refs, &out);
     // We should fail to set the deletion callback because the object has
     // already gone out of scope.
-    ASSERT_FALSE(rc->SetDeleteCallback(
+    ASSERT_FALSE(rc->AddObjectOutOfScopeOrFreedCallback(
         id, [&](const ObjectID &object_id) { ASSERT_FALSE(true); }));
 
     ASSERT_EQ(out.size(), 1);
@@ -2638,7 +2638,7 @@ TEST_F(ReferenceCountLineageEnabledTest, TestResubmittedTask) {
   ASSERT_TRUE(rc->HasReference(id));
 
   // Simulate retrying the task.
-  rc->UpdateResubmittedTaskReferences({}, {id});
+  rc->UpdateResubmittedTaskReferences({id});
   rc->UpdateFinishedTaskReferences({}, {id}, true, empty_borrower, empty_refs, &out);
   ASSERT_FALSE(rc->HasReference(id));
   ASSERT_EQ(lineage_deleted.size(), 1);
@@ -2660,7 +2660,7 @@ TEST_F(ReferenceCountLineageEnabledTest, TestPlasmaLocation) {
   ObjectID id = ObjectID::FromRandom();
   NodeID node_id = NodeID::FromRandom();
   rc->AddOwnedObject(id, {}, rpc::Address(), "", 0, true, /*add_local_ref=*/true);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   ASSERT_TRUE(rc->IsPlasmaObjectPinnedOrSpilled(id, &owned_by_us, &pinned_at, &spilled));
   ASSERT_TRUE(owned_by_us);
   ASSERT_TRUE(pinned_at.IsNil());
@@ -2672,11 +2672,11 @@ TEST_F(ReferenceCountLineageEnabledTest, TestPlasmaLocation) {
 
   rc->RemoveLocalReference(id, nullptr);
   ASSERT_FALSE(rc->IsPlasmaObjectPinnedOrSpilled(id, &owned_by_us, &pinned_at, &spilled));
-  ASSERT_TRUE(deleted->count(id) > 0);
+  ASSERT_GT(deleted->count(id), 0);
   deleted->clear();
 
   rc->AddOwnedObject(id, {}, rpc::Address(), "", 0, true, /*add_local_ref=*/true);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->UpdateObjectPinnedAtRaylet(id, node_id);
   rc->ResetObjectsOnRemovedNode(node_id);
   auto objects = rc->FlushObjectsToRecover();
@@ -2685,7 +2685,7 @@ TEST_F(ReferenceCountLineageEnabledTest, TestPlasmaLocation) {
   ASSERT_TRUE(rc->IsPlasmaObjectPinnedOrSpilled(id, &owned_by_us, &pinned_at, &spilled));
   ASSERT_TRUE(owned_by_us);
   ASSERT_TRUE(pinned_at.IsNil());
-  ASSERT_TRUE(deleted->count(id) > 0);
+  ASSERT_TRUE(deleted->empty());
   deleted->clear();
 }
 
@@ -2701,7 +2701,7 @@ TEST_F(ReferenceCountTest, TestFree) {
   ASSERT_FALSE(rc->IsPlasmaObjectFreed(id));
   rc->FreePlasmaObjects({id});
   ASSERT_TRUE(rc->IsPlasmaObjectFreed(id));
-  ASSERT_FALSE(rc->SetDeleteCallback(id, callback));
+  ASSERT_FALSE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   ASSERT_EQ(deleted->count(id), 0);
   rc->UpdateObjectPinnedAtRaylet(id, node_id);
   bool owned_by_us;
@@ -2716,12 +2716,12 @@ TEST_F(ReferenceCountTest, TestFree) {
 
   // Test free after receiving information about where the object is pinned.
   rc->AddOwnedObject(id, {}, rpc::Address(), "", 0, true, /*add_local_ref=*/true);
-  ASSERT_TRUE(rc->SetDeleteCallback(id, callback));
+  ASSERT_TRUE(rc->AddObjectOutOfScopeOrFreedCallback(id, callback));
   rc->UpdateObjectPinnedAtRaylet(id, node_id);
   ASSERT_FALSE(rc->IsPlasmaObjectFreed(id));
   rc->FreePlasmaObjects({id});
   ASSERT_TRUE(rc->IsPlasmaObjectFreed(id));
-  ASSERT_TRUE(deleted->count(id) > 0);
+  ASSERT_GT(deleted->count(id), 0);
   ASSERT_TRUE(rc->IsPlasmaObjectPinnedOrSpilled(id, &owned_by_us, &pinned_at, &spilled));
   ASSERT_TRUE(owned_by_us);
   ASSERT_TRUE(pinned_at.IsNil());
@@ -2943,6 +2943,57 @@ TEST_F(ReferenceCountTest, TestForwardNestedRefs) {
 
   ASSERT_TRUE(borrower2->FlushBorrowerCallbacks());
   borrower2->rc_.RemoveLocalReference(inner_id, nullptr);
+}
+
+TEST_F(ReferenceCountTest, TestOwnDynamicStreamingTaskReturnRef) {
+  auto object_id = ObjectID::FromRandom();
+  auto generator_id = ObjectID::FromRandom();
+  auto generator_id_2 = ObjectID::FromRandom();
+  rpc::Address added_address;
+
+  // Verify OwnDynamicStreamingTaskReturnRef is ignored
+  // when there's no generator id.
+  rc->OwnDynamicStreamingTaskReturnRef(object_id, generator_id);
+  ASSERT_FALSE(rc->GetOwner(generator_id, &added_address));
+  ASSERT_FALSE(rc->GetOwner(object_id, &added_address));
+  ASSERT_FALSE(rc->HasReference(object_id));
+  ASSERT_FALSE(rc->HasReference(generator_id));
+
+  // Add a generator id.
+  rpc::Address address;
+  address.set_ip_address("1234");
+  rc->AddOwnedObject(generator_id, {}, address, "", 0, false, /*add_local_ref=*/true);
+  ASSERT_TRUE(rc->HasReference(generator_id));
+
+  // Verify object id is not registered if the incorrect generator id is given.
+  rc->OwnDynamicStreamingTaskReturnRef(object_id, generator_id_2);
+  ASSERT_FALSE(rc->HasReference(object_id));
+
+  // Verify object is owned.
+  rc->OwnDynamicStreamingTaskReturnRef(object_id, generator_id);
+  ASSERT_TRUE(rc->HasReference(object_id));
+  // Verify the number of objects: Generator + object.
+  ASSERT_EQ(rc->NumObjectIDsInScope(), 2);
+  // Verify it is owned by us.
+  ASSERT_TRUE(rc->GetOwner(object_id, &added_address));
+  ASSERT_EQ(address.ip_address(), added_address.ip_address());
+  // Verify it had 1 local reference.
+  std::vector<ObjectID> deleted;
+  rc->RemoveLocalReference(object_id, &deleted);
+  ASSERT_EQ(rc->NumObjectIDsInScope(), 1);
+  ASSERT_EQ(deleted.size(), 1);
+  ASSERT_FALSE(rc->GetOwner(object_id, &added_address));
+
+  // Remove the generator.
+  rc->RemoveLocalReference(generator_id, nullptr);
+  ASSERT_EQ(rc->NumObjectIDsInScope(), 0);
+  ASSERT_FALSE(rc->GetOwner(generator_id, &added_address));
+
+  // Verify we cannot register a new object after the generator id is removed.
+  auto object_id_2 = ObjectID::FromRandom();
+  rc->OwnDynamicStreamingTaskReturnRef(object_id_2, generator_id);
+  ASSERT_FALSE(rc->GetOwner(object_id_2, &added_address));
+  ASSERT_FALSE(rc->HasReference(object_id_2));
 }
 
 }  // namespace core

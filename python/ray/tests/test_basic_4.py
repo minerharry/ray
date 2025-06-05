@@ -1,11 +1,12 @@
 # coding: utf-8
 import logging
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
-import numpy as np
 import pytest
 
 import ray
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def test_actor_scheduling(shutdown_only):
-    ray.init()
+    ray.init(num_cpus=1)
 
     @ray.remote
     class A:
@@ -31,7 +32,7 @@ def test_actor_scheduling(shutdown_only):
 
     a = A.remote()
     a.run_fail.remote()
-    with pytest.raises(Exception):
+    with pytest.raises(ray.exceptions.RayActorError, match="exit_actor"):
         ray.get([a.get.remote()])
 
 
@@ -57,11 +58,7 @@ def test_worker_startup_count(ray_start_cluster):
 
     # Flood a large scale lease worker requests.
     for i in range(10000):
-        # Use random cpu resources to make sure that all tasks are sent
-        # to the raylet. Because core worker will cache tasks with the
-        # same resource shape.
-        num_cpus = 0.24 + np.random.uniform(0, 0.01)
-        slow_function.options(num_cpus=num_cpus).remote()
+        slow_function.options(num_cpus=0.25).remote()
 
     # Check "debug_state.txt" to ensure no extra workers were started.
     session_dir = ray._private.worker.global_worker.node.address_info["session_dir"]
@@ -84,7 +81,11 @@ def test_worker_startup_count(ray_start_cluster):
     time_waited = time.time() - start
     print(f"Waited {time_waited} for debug_state.txt to be updated")
 
-    # Check that no more workers started for a while.
+    # Check that no more workers started for a while. Note at initializtion there can
+    # be more workers prestarted and then idle-killed, so we tolerate at most one spike
+    # in the number of workers.
+    high_watermark = 16
+    prev = high_watermark
     for i in range(100):
         # Sometimes the debug state file can be empty. Retry if needed.
         for _ in range(3):
@@ -94,34 +95,17 @@ def test_worker_startup_count(ray_start_cluster):
                 time.sleep(0.05)
             else:
                 break
-        assert num == 16
+        if num >= high_watermark:
+            # spike climbing
+            high_watermark = num
+            prev = num
+        else:
+            # spike falling
+            assert num <= prev
+            prev = num
         time.sleep(0.1)
-
-
-def test_function_import_without_importer_thread(shutdown_only):
-    """Test that without background importer thread, dependencies can still be
-    imported in workers."""
-    ray.init(
-        _system_config={
-            "start_python_importer_thread": False,
-        },
-    )
-
-    @ray.remote
-    def f():
-        import threading
-
-        assert threading.get_ident() == threading.main_thread().ident
-        # Make sure the importer thread is not running.
-        for thread in threading.enumerate():
-            assert "import" not in thread.name
-
-    @ray.remote
-    def g():
-        ray.get(f.remote())
-
-    ray.get(g.remote())
-    ray.get([g.remote() for _ in range(5)])
+    print(f"High watermark: {high_watermark}, prev: {prev}, num: {num}")
+    assert num == 16
 
 
 @pytest.mark.skipif(
@@ -163,6 +147,8 @@ def test_fork_support(shutdown_only):
     sys.platform not in ["win32", "darwin"],
     reason="Only listen on localhost by default on mac and windows.",
 )
+@mock.patch("ray._private.services.ray_constants.ENABLE_RAY_CLUSTER", False)
+@mock.patch.dict(os.environ, {"RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER": "0"})
 @pytest.mark.parametrize("start_ray", ["ray_start_regular", "call_ray_start"])
 def test_listen_on_localhost(start_ray, request):
     """All ray processes should listen on localhost by default
@@ -206,16 +192,16 @@ def test_job_id_consistency(ray_start_regular):
     @ray.remote
     def verify_job_id(job_id, new_thread):
         def verify():
-            current_task_id = ray.runtime_context.get_runtime_context().task_id
-            assert job_id == current_task_id.job_id()
+            current_job_id = ray.runtime_context.get_runtime_context().get_job_id()
+            assert job_id == current_job_id
             obj1 = foo.remote()
-            assert job_id == obj1.job_id()
+            assert job_id == obj1.job_id().hex()
             obj2 = ray.put(1)
-            assert job_id == obj2.job_id()
+            assert job_id == obj2.job_id().hex()
             a = Foo.remote()
-            assert job_id == a._actor_id.job_id
+            assert job_id == a._actor_id.job_id.hex()
             obj3 = a.ping.remote()
-            assert job_id == obj3.job_id()
+            assert job_id == obj3.job_id().hex()
 
         if not new_thread:
             verify()
@@ -236,7 +222,7 @@ def test_job_id_consistency(ray_start_regular):
             if len(exc) > 0:
                 raise exc[0]
 
-    job_id = ray.runtime_context.get_runtime_context().job_id
+    job_id = ray.runtime_context.get_runtime_context().get_job_id()
     ray.get(verify_job_id.remote(job_id, False))
     ray.get(verify_job_id.remote(job_id, True))
 
@@ -277,9 +263,4 @@ def test_fair_queueing(shutdown_only):
 
 
 if __name__ == "__main__":
-    import os
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

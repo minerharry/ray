@@ -3,14 +3,14 @@ from typing import Any
 from ray.rllib.connectors.connector import (
     ActionConnector,
     ConnectorContext,
-    register_connector,
 )
+from ray.rllib.connectors.registry import register_connector
 from ray.rllib.utils.spaces.space_utils import clip_action, get_base_struct_from_space
 from ray.rllib.utils.typing import ActionConnectorDataType
-from ray.util.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class ClipActionsConnector(ActionConnector):
     def __init__(self, ctx: ConnectorContext):
         super().__init__(ctx)

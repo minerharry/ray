@@ -1,6 +1,6 @@
 from functools import partial
-import gym
-from gym.spaces import Box, Dict, Discrete, MultiDiscrete, Tuple
+import gymnasium as gym
+from gymnasium.spaces import Box, Dict, Discrete, MultiDiscrete, Tuple
 import logging
 import numpy as np
 import tree  # pip install dm_tree
@@ -8,7 +8,6 @@ from typing import List, Optional, Type, Union
 
 from ray.tune.registry import (
     RLLIB_MODEL,
-    RLLIB_PREPROCESSOR,
     RLLIB_ACTION_DIST,
     _global_registry,
 )
@@ -26,13 +25,13 @@ from ray.rllib.models.tf.tf_action_dist import (
 from ray.rllib.models.torch.torch_action_dist import (
     TorchCategorical,
     TorchDeterministic,
+    TorchDirichlet,
     TorchDiagGaussian,
     TorchMultiActionDistribution,
     TorchMultiCategorical,
 )
 from ray.rllib.utils.annotations import DeveloperAPI, PublicAPI
 from ray.rllib.utils.deprecation import (
-    Deprecated,
     DEPRECATED_VALUE,
     deprecation_warning,
 )
@@ -51,160 +50,90 @@ logger = logging.getLogger(__name__)
 # fmt: off
 # __sphinx_doc_begin__
 MODEL_DEFAULTS: ModelConfigDict = {
-    # Experimental flag.
-    # If True, try to use a native (tf.keras.Model or torch.Module) default
-    # model instead of our built-in ModelV2 defaults.
-    # If False (default), use "classic" ModelV2 default models.
-    # Note that this currently only works for:
-    # 1) framework != torch AND
-    # 2) fully connected and CNN default networks as well as
-    # auto-wrapped LSTM- and attention nets.
-    "_use_default_native_models": False,
-    # Experimental flag.
-    # If True, user specified no preprocessor to be created
-    # (via config._disable_preprocessor_api=True). If True, observations
-    # will arrive in model as they are returned by the env.
-    "_disable_preprocessor_api": False,
-    # Experimental flag.
-    # If True, RLlib will no longer flatten the policy-computed actions into
-    # a single tensor (for storage in SampleCollectors/output files/etc..),
-    # but leave (possibly nested) actions as-is. Disabling flattening affects:
-    # - SampleCollectors: Have to store possibly nested action structs.
-    # - Models that have the previous action(s) as part of their input.
-    # - Algorithms reading from offline files (incl. action information).
-    "_disable_action_flattening": False,
-
-    # === Built-in options ===
-    # FullyConnectedNetwork (tf and torch): rllib.models.tf|torch.fcnet.py
-    # These are used if no custom model is specified and the input space is 1D.
-    # Number of hidden layers to be used.
     "fcnet_hiddens": [256, 256],
-    # Activation function descriptor.
-    # Supported values are: "tanh", "relu", "swish" (or "silu"),
-    # "linear" (or None).
     "fcnet_activation": "tanh",
-
-    # VisionNetwork (tf and torch): rllib.models.tf|torch.visionnet.py
-    # These are used if no custom model is specified and the input space is 2D.
-    # Filter config: List of [out_channels, kernel, stride] for each filter.
-    # Example:
-    # Use None for making RLlib try to find a default filter setup given the
-    # observation space.
+    "fcnet_weights_initializer": None,
+    "fcnet_weights_initializer_config": None,
+    "fcnet_bias_initializer": None,
+    "fcnet_bias_initializer_config": None,
     "conv_filters": None,
-    # Activation function descriptor.
-    # Supported values are: "tanh", "relu", "swish" (or "silu"),
-    # "linear" (or None).
     "conv_activation": "relu",
-
-    # Some default models support a final FC stack of n Dense layers with given
-    # activation:
-    # - Complex observation spaces: Image components are fed through
-    #   VisionNets, flat Boxes are left as-is, Discrete are one-hot'd, then
-    #   everything is concated and pushed through this final FC stack.
-    # - VisionNets (CNNs), e.g. after the CNN stack, there may be
-    #   additional Dense layers.
-    # - FullyConnectedNetworks will have this additional FCStack as well
-    # (that's why it's empty by default).
+    "conv_kernel_initializer": None,
+    "conv_kernel_initializer_config": None,
+    "conv_bias_initializer": None,
+    "conv_bias_initializer_config": None,
+    "conv_transpose_kernel_initializer": None,
+    "conv_transpose_kernel_initializer_config": None,
+    "conv_transpose_bias_initializer": None,
+    "conv_transpose_bias_initializer_config": None,
     "post_fcnet_hiddens": [],
     "post_fcnet_activation": "relu",
-
-    # For DiagGaussian action distributions, make the second half of the model
-    # outputs floating bias variables instead of state-dependent. This only
-    # has an effect is using the default fully connected net.
+    "post_fcnet_weights_initializer": None,
+    "post_fcnet_weights_initializer_config": None,
+    "post_fcnet_bias_initializer": None,
+    "post_fcnet_bias_initializer_config": None,
     "free_log_std": False,
-    # Whether to skip the final linear layer used to resize the hidden layer
-    # outputs to size `num_outputs`. If True, then the last hidden layer
-    # should already match num_outputs.
+    "log_std_clip_param": 20.0,
     "no_final_linear": False,
-    # Whether layers should be shared for the value function.
     "vf_share_layers": True,
-
-    # == LSTM ==
-    # Whether to wrap the model with an LSTM.
     "use_lstm": False,
-    # Max seq len for training the LSTM, defaults to 20.
     "max_seq_len": 20,
-    # Size of the LSTM cell.
     "lstm_cell_size": 256,
-    # Whether to feed a_{t-1} to LSTM (one-hot encoded if discrete).
     "lstm_use_prev_action": False,
-    # Whether to feed r_{t-1} to LSTM.
     "lstm_use_prev_reward": False,
-    # Whether the LSTM is time-major (TxBx..) or batch-major (BxTx..).
+    "lstm_weights_initializer": None,
+    "lstm_weights_initializer_config": None,
+    "lstm_bias_initializer": None,
+    "lstm_bias_initializer_config": None,
     "_time_major": False,
-
-    # == Attention Nets (experimental: torch-version is untested) ==
-    # Whether to use a GTrXL ("Gru transformer XL"; attention net) as the
-    # wrapper Model around the default Model.
     "use_attention": False,
-    # The number of transformer units within GTrXL.
-    # A transformer unit in GTrXL consists of a) MultiHeadAttention module and
-    # b) a position-wise MLP.
     "attention_num_transformer_units": 1,
-    # The input and output size of each transformer unit.
     "attention_dim": 64,
-    # The number of attention heads within the MultiHeadAttention units.
     "attention_num_heads": 1,
-    # The dim of a single head (within the MultiHeadAttention units).
     "attention_head_dim": 32,
-    # The memory sizes for inference and training.
     "attention_memory_inference": 50,
     "attention_memory_training": 50,
-    # The output dim of the position-wise MLP.
     "attention_position_wise_mlp_dim": 32,
-    # The initial bias values for the 2 GRU gates within a transformer unit.
     "attention_init_gru_gate_bias": 2.0,
-    # Whether to feed a_{t-n:t-1} to GTrXL (one-hot encoded if discrete).
     "attention_use_n_prev_actions": 0,
-    # Whether to feed r_{t-n:t-1} to GTrXL.
     "attention_use_n_prev_rewards": 0,
-
-    # == Atari ==
-    # Set to True to enable 4x stacking behavior.
     "framestack": True,
-    # Final resized frame dimension
     "dim": 84,
-    # (deprecated) Converts ATARI frame to 1 Channel Grayscale image
     "grayscale": False,
-    # (deprecated) Changes frame to range from [-1, 1] if true
     "zero_mean": True,
-
-    # === Options for custom models ===
-    # Name of a custom model to use
     "custom_model": None,
-    # Extra options to pass to the custom classes. These will be available to
-    # the Model's constructor in the model_config field. Also, they will be
-    # attempted to be passed as **kwargs to ModelV2 models. For an example,
-    # see rllib/models/[tf|torch]/attention_net.py.
     "custom_model_config": {},
-    # Name of a custom action distribution to use.
     "custom_action_dist": None,
-    # Custom preprocessors are deprecated. Please use a wrapper class around
-    # your environment instead to preprocess observations.
     "custom_preprocessor": None,
+    "encoder_latent_dim": None,
+    "always_check_shapes": False,
 
     # Deprecated keys:
-    # Use `lstm_use_prev_action` or `lstm_use_prev_reward` instead.
     "lstm_use_prev_action_reward": DEPRECATED_VALUE,
+    "_use_default_native_models": DEPRECATED_VALUE,
+    "_disable_preprocessor_api": False,
+    "_disable_action_flattening": False,
 }
 # __sphinx_doc_end__
 # fmt: on
 
 
-@PublicAPI
+@DeveloperAPI
 class ModelCatalog:
     """Registry of models, preprocessors, and action distributions for envs.
 
-    Examples:
-        >>> prep = ModelCatalog.get_preprocessor(env)
-        >>> observation = prep.transform(raw_observation)
+    .. testcode::
+        :skipif: True
 
-        >>> dist_class, dist_dim = ModelCatalog.get_action_dist(
-        ...     env.action_space, {})
-        >>> model = ModelCatalog.get_model_v2(
-        ...     obs_space, action_space, num_outputs, options)
-        >>> dist = dist_class(model.outputs, model)
-        >>> action = dist.sample()
+        prep = ModelCatalog.get_preprocessor(env)
+        observation = prep.transform(raw_observation)
+
+        dist_class, dist_dim = ModelCatalog.get_action_dist(
+            env.action_space, {})
+        model = ModelCatalog.get_model_v2(
+            obs_space, action_space, num_outputs, options)
+        dist = dist_class(model.outputs, model)
+        action = dist.sample()
     """
 
     @staticmethod
@@ -263,7 +192,7 @@ class ModelCatalog:
                 dist_cls = (
                     TorchMultiCategorical if framework == "torch" else MultiCategorical
                 )
-                num_cats = int(np.product(action_space.shape))
+                num_cats = int(np.prod(action_space.shape))
                 return (
                     partial(
                         dist_cls,
@@ -321,12 +250,7 @@ class ModelCatalog:
             )
         # Simplex -> Dirichlet.
         elif isinstance(action_space, Simplex):
-            if framework == "torch":
-                # TODO(sven): implement
-                raise NotImplementedError(
-                    "Simplex action spaces not supported for torch."
-                )
-            dist_cls = Dirichlet
+            dist_cls = TorchDirichlet if framework == "torch" else Dirichlet
         # MultiDiscrete -> MultiCategorical.
         elif isinstance(action_space, MultiDiscrete):
             dist_cls = (
@@ -341,7 +265,7 @@ class ModelCatalog:
                 "Unsupported args: {} {}".format(action_space, dist_type)
             )
 
-        return dist_cls, dist_cls.required_model_output_shape(action_space, config)
+        return dist_cls, int(dist_cls.required_model_output_shape(action_space, config))
 
     @staticmethod
     @DeveloperAPI
@@ -378,7 +302,7 @@ class ModelCatalog:
                     size += 1
                 else:
                     all_discrete = False
-                    size += np.product(flat_action_space[i].shape)
+                    size += np.prod(flat_action_space[i].shape)
             size = int(size)
             return dl_lib.int32 if all_discrete else dl_lib.float32, (None, size)
         else:
@@ -427,7 +351,7 @@ class ModelCatalog:
             action_space: Action space of the target gym env.
             num_outputs: The size of the output vector of the model.
             model_config: The "model" sub-config dict
-                within the Trainer's config dict.
+                within the Algorithm's config dict.
             framework: One of "tf2", "tf", "torch", or "jax".
             name: Name (scope) for the model.
             model_interface: Interface required for the model
@@ -488,34 +412,20 @@ class ModelCatalog:
                 if model_config.get("use_lstm") or model_config.get("use_attention"):
                     from ray.rllib.models.tf.attention_net import (
                         AttentionWrapper,
-                        Keras_AttentionWrapper,
                     )
                     from ray.rllib.models.tf.recurrent_net import (
                         LSTMWrapper,
-                        Keras_LSTMWrapper,
                     )
 
                     wrapped_cls = model_cls
-                    # Wrapped (custom) model is itself a keras Model ->
-                    # wrap with keras LSTM/GTrXL (attention) wrappers.
-                    if issubclass(wrapped_cls, tf.keras.Model):
-                        model_cls = (
-                            Keras_LSTMWrapper
-                            if model_config.get("use_lstm")
-                            else Keras_AttentionWrapper
-                        )
-                        model_config["wrapped_cls"] = wrapped_cls
-                    # Wrapped (custom) model is ModelV2 ->
-                    # wrap with ModelV2 LSTM/GTrXL (attention) wrappers.
-                    else:
-                        forward = wrapped_cls.forward
-                        model_cls = ModelCatalog._wrap_if_needed(
-                            wrapped_cls,
-                            LSTMWrapper
-                            if model_config.get("use_lstm")
-                            else AttentionWrapper,
-                        )
-                        model_cls._wrapped_forward = forward
+                    forward = wrapped_cls.forward
+                    model_cls = ModelCatalog._wrap_if_needed(
+                        wrapped_cls,
+                        LSTMWrapper
+                        if model_config.get("use_lstm")
+                        else AttentionWrapper,
+                    )
+                    model_cls._wrapped_forward = forward
 
                 # Obsolete: Track and warn if vars were created but not
                 # registered. Only still do this, if users do register their
@@ -663,35 +573,22 @@ class ModelCatalog:
                 raise ValueError("ModelV2 class could not be determined!")
 
             if model_config.get("use_lstm") or model_config.get("use_attention"):
-
                 from ray.rllib.models.tf.attention_net import (
                     AttentionWrapper,
-                    Keras_AttentionWrapper,
                 )
                 from ray.rllib.models.tf.recurrent_net import (
                     LSTMWrapper,
-                    Keras_LSTMWrapper,
                 )
 
                 wrapped_cls = v2_class
                 if model_config.get("use_lstm"):
-                    if issubclass(wrapped_cls, tf.keras.Model):
-                        v2_class = Keras_LSTMWrapper
-                        model_config["wrapped_cls"] = wrapped_cls
-                    else:
-                        v2_class = ModelCatalog._wrap_if_needed(
-                            wrapped_cls, LSTMWrapper
-                        )
-                        v2_class._wrapped_forward = wrapped_cls.forward
+                    v2_class = ModelCatalog._wrap_if_needed(wrapped_cls, LSTMWrapper)
+                    v2_class._wrapped_forward = wrapped_cls.forward
                 else:
-                    if issubclass(wrapped_cls, tf.keras.Model):
-                        v2_class = Keras_AttentionWrapper
-                        model_config["wrapped_cls"] = wrapped_cls
-                    else:
-                        v2_class = ModelCatalog._wrap_if_needed(
-                            wrapped_cls, AttentionWrapper
-                        )
-                        v2_class._wrapped_forward = wrapped_cls.forward
+                    v2_class = ModelCatalog._wrap_if_needed(
+                        wrapped_cls, AttentionWrapper
+                    )
+                    v2_class._wrapped_forward = wrapped_cls.forward
 
             # Wrap in the requested interface.
             wrapper = ModelCatalog._wrap_if_needed(v2_class, model_interface)
@@ -722,7 +619,6 @@ class ModelCatalog:
                 raise ValueError("ModelV2 class could not be determined!")
 
             if model_config.get("use_lstm") or model_config.get("use_attention"):
-
                 from ray.rllib.models.torch.attention_net import AttentionWrapper
                 from ray.rllib.models.torch.recurrent_net import LSTMWrapper
 
@@ -755,29 +651,37 @@ class ModelCatalog:
             )
         else:
             raise NotImplementedError(
-                "`framework` must be 'tf2|tf|torch', but is " "{}!".format(framework)
+                "`framework` must be 'tf2|tf|torch', but is {}!".format(framework)
             )
 
     @staticmethod
     @DeveloperAPI
-    def get_preprocessor(env: gym.Env, options: Optional[dict] = None) -> Preprocessor:
+    def get_preprocessor(
+        env: gym.Env, options: Optional[dict] = None, include_multi_binary: bool = False
+    ) -> Preprocessor:
         """Returns a suitable preprocessor for the given env.
 
         This is a wrapper for get_preprocessor_for_space().
         """
 
-        return ModelCatalog.get_preprocessor_for_space(env.observation_space, options)
+        return ModelCatalog.get_preprocessor_for_space(
+            env.observation_space, options, include_multi_binary
+        )
 
     @staticmethod
     @DeveloperAPI
     def get_preprocessor_for_space(
-        observation_space: gym.Space, options: dict = None
+        observation_space: gym.Space,
+        options: dict = None,
+        include_multi_binary: bool = False,
     ) -> Preprocessor:
         """Returns a suitable preprocessor for the given observation space.
 
         Args:
             observation_space: The input observation space.
             options: Options to pass to the preprocessor.
+            include_multi_binary: Whether to include the MultiBinaryPreprocessor in
+                the possible preprocessors returned by this method.
 
         Returns:
             preprocessor: Preprocessor for the observations.
@@ -792,22 +696,10 @@ class ModelCatalog:
                     )
                 )
 
-        if options.get("custom_preprocessor"):
-            preprocessor = options["custom_preprocessor"]
-            logger.info("Using custom preprocessor {}".format(preprocessor))
-            logger.warning(
-                "DeprecationWarning: Custom preprocessors are deprecated, "
-                "since they sometimes conflict with the built-in "
-                "preprocessors for handling complex observation spaces. "
-                "Please use wrapper classes around your environment "
-                "instead of preprocessors."
-            )
-            prep = _global_registry.get(RLLIB_PREPROCESSOR, preprocessor)(
-                observation_space, options
-            )
-        else:
-            cls = get_preprocessor(observation_space)
-            prep = cls(observation_space, options)
+        cls = get_preprocessor(
+            observation_space, include_multi_binary=include_multi_binary
+        )
+        prep = cls(observation_space, options)
 
         if prep is not None:
             logger.debug(
@@ -816,24 +708,6 @@ class ModelCatalog:
                 )
             )
         return prep
-
-    @staticmethod
-    @Deprecated(error=True)
-    def register_custom_preprocessor(
-        preprocessor_name: str, preprocessor_class: type
-    ) -> None:
-        """Register a custom preprocessor class by name.
-
-        The preprocessor can be later used by specifying
-        {"custom_preprocessor": preprocesor_name} in the model config.
-
-        Args:
-            preprocessor_name: Name to register the preprocessor under.
-            preprocessor_class: Python class of the preprocessor.
-        """
-        _global_registry.register(
-            RLLIB_PREPROCESSOR, preprocessor_name, preprocessor_class
-        )
 
     @staticmethod
     @PublicAPI
@@ -890,20 +764,15 @@ class ModelCatalog:
     def _get_v2_model_class(
         input_space: gym.Space, model_config: ModelConfigDict, framework: str = "tf"
     ) -> Type[ModelV2]:
-
         VisionNet = None
         ComplexNet = None
-        Keras_FCNet = None
-        Keras_VisionNet = None
 
         if framework in ["tf2", "tf"]:
             from ray.rllib.models.tf.fcnet import (
                 FullyConnectedNetwork as FCNet,
-                Keras_FullyConnectedNetwork as Keras_FCNet,
             )
             from ray.rllib.models.tf.visionnet import (
                 VisionNetwork as VisionNet,
-                Keras_VisionNetwork as Keras_VisionNet,
             )
             from ray.rllib.models.tf.complex_input_net import (
                 ComplexInputNetwork as ComplexNet,
@@ -932,8 +801,6 @@ class ModelCatalog:
         if isinstance(input_space, Box) and len(input_space.shape) == 3:
             if framework == "jax":
                 raise NotImplementedError("No non-FC default net for JAX yet!")
-            elif model_config.get("_use_default_native_models") and Keras_VisionNet:
-                return Keras_VisionNet
             return VisionNet
         # `input_space` is 1D Box -> FCNet.
         elif (
@@ -947,12 +814,7 @@ class ModelCatalog:
                 )
             )
         ):
-            # Keras native requested AND no auto-rnn-wrapping.
-            if model_config.get("_use_default_native_models") and Keras_FCNet:
-                return Keras_FCNet
-            # Classic ModelV2 FCNet.
-            else:
-                return FCNet
+            return FCNet
         # Complex (Dict, Tuple, 2D Box (flatten), Discrete, MultiDiscrete).
         else:
             if framework == "jax":
@@ -994,7 +856,7 @@ class ModelCatalog:
 
         Args:
             config: The "model" sub-config dict
-                within the Trainer's config dict.
+                within the Algorithm's config dict.
             action_space: The action space of the model, whose config are
                     validated.
             framework: One of "jax", "tf2", "tf", or "torch".

@@ -8,9 +8,8 @@ import numpy as np
 from ray.rllib.policy.rnn_sequencing import timeslice_along_seq_lens_with_overlap
 from ray.rllib.policy.sample_batch import (
     DEFAULT_POLICY_ID,
-    MultiAgentBatch,
     SampleBatch,
-    concat_samples,
+    concat_samples_into_ma_batch,
 )
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.replay_buffers.multi_agent_prioritized_replay_buffer import (
@@ -42,34 +41,65 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
     in between, all newly added batches are returned (plus some older samples
     according to the "replay ratio").
 
-    Examples:
-        # replay ratio 0.66 (2/3 replayed, 1/3 new samples):
-        >>> buffer = MultiAgentMixInReplayBuffer(capacity=100,
-        ...                                      replay_ratio=0.66)
-        >>> buffer.add(<A>)
-        >>> buffer.add(<B>)
-        >>> buffer.sample(1)
-        ... [<A>, <B>, <B>]
-        >>> buffer.add(<C>)
-        >>> buffer.sample(1)
-        ... [<C>, <A>, <B>]
-        >>> # or: [<C>, <A>, <A>], [<C>, <B>, <A>] or [<C>, <B>, <B>],
-        >>> # but always <C> as it is the newest sample
+    .. testcode::
+        :skipif: True
 
-        >>> buffer.add(<D>)
-        >>> buffer.sample(1)
-        ... [<D>, <A>, <C>]
-        >>> # or: [<D>, <A>, <A>], [<D>, <B>, <A>] or [<D>, <B>, <C>], etc..
-        >>> # but always <D> as it is the newest sample
+        # replay ratio 0.66 (2/3 replayed, 1/3 new samples):
+        buffer = MultiAgentMixInReplayBuffer(capacity=100,
+                                             replay_ratio=0.66)
+        buffer.add(<A>)
+        buffer.add(<B>)
+        buffer.sample(1)
+
+    .. testoutput::
+
+        ..[<A>, <B>, <B>]
+
+    .. testcode::
+        :skipif: True
+
+        buffer.add(<C>)
+        buffer.sample(1)
+
+    .. testoutput::
+
+        [<C>, <A>, <B>]
+        or: [<C>, <A>, <A>], [<C>, <B>, <A>] or [<C>, <B>, <B>],
+        but always <C> as it is the newest sample
+
+    .. testcode::
+        :skipif: True
+
+        buffer.add(<D>)
+        buffer.sample(1)
+
+    .. testoutput::
+
+        [<D>, <A>, <C>]
+        or [<D>, <A>, <A>], [<D>, <B>, <A>] or [<D>, <B>, <C>], etc..
+        but always <D> as it is the newest sample
+
+    .. testcode::
+        :skipif: True
 
         # replay proportion 0.0 -> replay disabled:
-        >>> buffer = MixInReplay(capacity=100, replay_ratio=0.0)
-        >>> buffer.add(<A>)
-        >>> buffer.sample()
-        ... [<A>]
-        >>> buffer.add(<B>)
-        >>> buffer.sample()
-        ... [<B>]
+        buffer = MixInReplay(capacity=100, replay_ratio=0.0)
+        buffer.add(<A>)
+        buffer.sample()
+
+    .. testoutput::
+
+        [<A>]
+
+    .. testcode::
+        :skipif: True
+
+        buffer.add(<B>)
+        buffer.sample()
+
+    .. testoutput::
+
+        [<B>]
     """
 
     def __init__(
@@ -87,7 +117,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
         prioritized_replay_alpha: float = 0.6,
         prioritized_replay_beta: float = 0.4,
         prioritized_replay_eps: float = 1e-6,
-        **kwargs
+        **kwargs,
     ):
         """Initializes MultiAgentMixInReplayBuffer instance.
 
@@ -157,7 +187,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
             prioritized_replay_alpha=prioritized_replay_alpha,
             prioritized_replay_beta=prioritized_replay_beta,
             prioritized_replay_eps=prioritized_replay_eps,
-            **kwargs
+            **kwargs,
         )
 
         self.replay_ratio = replay_ratio
@@ -216,9 +246,9 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
                 for policy_id, sample_batch in pids_and_batches.items():
                     for eps in sample_batch.split_by_episode():
                         # Only add full episodes to the buffer
-                        if (
-                            eps.get(SampleBatch.T)[0] == 0
-                            and eps.get(SampleBatch.DONES)[-1] == True  # noqa E712
+                        if eps.get(SampleBatch.T)[0] == 0 and (
+                            eps.get(SampleBatch.TERMINATEDS, [True])[-1]
+                            or eps.get(SampleBatch.TRUNCATEDS, [False])[-1]
                         ):
                             self.replay_buffers[policy_id].add(eps, **kwargs)
                             self.last_added_batches[policy_id].append(eps)
@@ -252,7 +282,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
         Args:
             num_items: Number of items to sample from this buffer.
             policy_id: ID of the policy that produced the experiences to be
-            sampled.
+                sampled.
             **kwargs: Forward compatibility kwargs.
 
         Returns:
@@ -291,7 +321,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
 
             # No replay desired
             if self.replay_ratio == 0.0:
-                return concat_samples(output_batches)
+                return concat_samples_into_ma_batch(output_batches)
             # Only replay desired
             elif self.replay_ratio == 1.0:
                 return _buffer.sample(num_items, **kwargs)
@@ -315,7 +345,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
             # Depending on the implementation of underlying buffers, samples
             # might be SampleBatches
             output_batches = [batch.as_multi_agent() for batch in output_batches]
-            return MultiAgentBatch.concat_samples(output_batches)
+            return concat_samples_into_ma_batch(output_batches)
 
         def check_buffer_is_ready(_policy_id):
             if (
@@ -344,7 +374,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
                     if check_buffer_is_ready(policy_id):
                         samples.append(mix_batches(policy_id).as_multi_agent())
 
-            return MultiAgentBatch.concat_samples(samples)
+            return concat_samples_into_ma_batch(samples)
 
     @DeveloperAPI
     @override(MultiAgentPrioritizedReplayBuffer)

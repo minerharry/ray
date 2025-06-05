@@ -1,18 +1,12 @@
-from abc import ABCMeta, abstractmethod
-import gym
-from gym.spaces import Box
 import json
 import logging
-import numpy as np
 import os
-from packaging import version
 import platform
-import tree  # pip install dm_tree
+from abc import ABCMeta, abstractmethod
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
-    Container,
+    Collection,
     Dict,
     List,
     Optional,
@@ -21,38 +15,51 @@ from typing import (
     Union,
 )
 
+import gymnasium as gym
+import numpy as np
+import tree  # pip install dm_tree
+from gymnasium.spaces import Box
+from packaging import version
+
 import ray
-from ray.actor import ActorHandle
-from ray.air.checkpoint import Checkpoint
 import ray.cloudpickle as pickle
+from ray.actor import ActorHandle
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy.view_requirement import ViewRequirement
 from ray.rllib.utils.annotations import (
-    DeveloperAPI,
-    ExperimentalAPI,
+    OldAPIStack,
     OverrideToImplementCustomLogic,
     OverrideToImplementCustomLogic_CallToSuperRecommended,
     is_overridden,
 )
+from ray.rllib.utils.checkpoints import (
+    CHECKPOINT_VERSION,
+    get_checkpoint_info,
+    try_import_msgpack,
+)
 from ray.rllib.utils.deprecation import (
-    Deprecated,
     DEPRECATED_VALUE,
     deprecation_warning,
 )
-from ray.rllib.utils.checkpoints import CHECKPOINT_VERSION, get_checkpoint_info
 from ray.rllib.utils.exploration.exploration import Exploration
 from ray.rllib.utils.framework import try_import_tf, try_import_torch
 from ray.rllib.utils.from_config import from_config
 from ray.rllib.utils.numpy import convert_to_numpy
-from ray.rllib.utils.serialization import space_from_dict, space_to_dict
+from ray.rllib.utils.serialization import (
+    deserialize_type,
+    space_from_dict,
+    space_to_dict,
+)
 from ray.rllib.utils.spaces.space_utils import (
     get_base_struct_from_space,
     get_dummy_batch_for_space,
     unbatch,
 )
+from ray.rllib.utils.tensor_dtype import get_np_dtype
+from ray.rllib.utils.tf_utils import get_tf_eager_cls_if_necessary
 from ray.rllib.utils.typing import (
     AgentID,
     AlgorithmConfigDict,
@@ -64,18 +71,16 @@ from ray.rllib.utils.typing import (
     TensorStructType,
     TensorType,
 )
-from ray.util.annotations import PublicAPI
+from ray.tune import Checkpoint
 
 tf1, tf, tfv = try_import_tf()
 torch, _ = try_import_torch()
 
-if TYPE_CHECKING:
-    from ray.rllib.evaluation import Episode
 
 logger = logging.getLogger(__name__)
 
 
-@PublicAPI
+@OldAPIStack
 class PolicySpec:
     """A policy spec used in the "config.multiagent.policies" specification dict.
 
@@ -112,6 +117,23 @@ class PolicySpec:
             and self.config == other.config
         )
 
+    def get_state(self) -> Dict[str, Any]:
+        """Returns the state of a `PolicyDict` as a dict."""
+        return (
+            self.policy_class,
+            self.observation_space,
+            self.action_space,
+            self.config,
+        )
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "PolicySpec":
+        """Builds a `PolicySpec` from a state."""
+        policy_spec = PolicySpec()
+        policy_spec.__dict__.update(state)
+
+        return policy_spec
+
     def serialize(self) -> Dict:
         from ray.rllib.algorithms.registry import get_policy_class_name
 
@@ -132,7 +154,7 @@ class PolicySpec:
             "observation_space": space_to_dict(self.observation_space),
             "action_space": space_to_dict(self.action_space),
             # TODO(jungong) : try making the config dict durable by maybe
-            # getting rid of all the fields that are not JSON serializable.
+            #  getting rid of all the fields that are not JSON serializable.
             "config": self.config,
         }
 
@@ -157,35 +179,99 @@ class PolicySpec:
         )
 
 
-@DeveloperAPI
+@OldAPIStack
 class Policy(metaclass=ABCMeta):
-    """Policy base class: Calculates actions, losses, and holds NN models.
+    """RLlib's base class for all Policy implementations.
 
     Policy is the abstract superclass for all DL-framework specific sub-classes
     (e.g. TFPolicy or TorchPolicy). It exposes APIs to
 
-    1) Compute actions from observation (and possibly other) inputs.
-    2) Manage the Policy's NN model(s), like exporting and loading their
-       weights.
-    3) Postprocess a given trajectory from the environment or other input
-       via the `postprocess_trajectory` method.
-    4) Compute losses from a train batch.
-    5) Perform updates from a train batch on the NN-models (this normally
-       includes loss calculations) either a) in one monolithic step
-       (`train_on_batch`) or b) via batch pre-loading, then n steps of actual
-       loss computations and updates (`load_batch_into_buffer` +
-       `learn_on_loaded_batch`).
+    1. Compute actions from observation (and possibly other) inputs.
 
-    Note: It is not recommended to sub-class Policy directly, but rather use
-    one of the following two convenience methods:
-    `rllib.policy.policy_template::build_policy_class` (PyTorch) or
-    `rllib.policy.tf_policy_template::build_tf_policy_class` (TF).
+    2. Manage the Policy's NN model(s), like exporting and loading their weights.
+
+    3. Postprocess a given trajectory from the environment or other input via the
+        `postprocess_trajectory` method.
+
+    4. Compute losses from a train batch.
+
+    5. Perform updates from a train batch on the NN-models (this normally includes loss
+        calculations) either:
+
+        a. in one monolithic step (`learn_on_batch`)
+
+        b. via batch pre-loading, then n steps of actual loss computations  and updates
+            (`load_batch_into_buffer` + `learn_on_loaded_batch`).
     """
+
+    def __init__(
+        self,
+        observation_space: gym.Space,
+        action_space: gym.Space,
+        config: AlgorithmConfigDict,
+    ):
+        """Initializes a Policy instance.
+
+        Args:
+            observation_space: Observation space of the policy.
+            action_space: Action space of the policy.
+            config: A complete Algorithm/Policy config dict. For the default
+                config keys and values, see rllib/algorithm/algorithm.py.
+        """
+        self.observation_space: gym.Space = observation_space
+        self.action_space: gym.Space = action_space
+        # the policy id in the global context.
+        self.__policy_id = config.get("__policy_id")
+        # The base struct of the observation/action spaces.
+        # E.g. action-space = gym.spaces.Dict({"a": Discrete(2)}) ->
+        # action_space_struct = {"a": Discrete(2)}
+        self.observation_space_struct = get_base_struct_from_space(observation_space)
+        self.action_space_struct = get_base_struct_from_space(action_space)
+
+        self.config: AlgorithmConfigDict = config
+        self.framework = self.config.get("framework")
+
+        # Create the callbacks object to use for handling custom callbacks.
+        from ray.rllib.callbacks.callbacks import RLlibCallback
+
+        callbacks = self.config.get("callbacks")
+        if isinstance(callbacks, RLlibCallback):
+            self.callbacks = callbacks()
+        elif isinstance(callbacks, (str, type)):
+            try:
+                self.callbacks: "RLlibCallback" = deserialize_type(
+                    self.config.get("callbacks")
+                )()
+            except Exception:
+                pass  # TEST
+        else:
+            self.callbacks: "RLlibCallback" = RLlibCallback()
+
+        # The global timestep, broadcast down from time to time from the
+        # local worker to all remote workers.
+        self.global_timestep: int = 0
+        # The number of gradient updates this policy has undergone.
+        self.num_grad_updates: int = 0
+
+        # The action distribution class to use for action sampling, if any.
+        # Child classes may set this.
+        self.dist_class: Optional[Type] = None
+
+        # Initialize view requirements.
+        self.init_view_requirements()
+
+        # Whether the Model's initial state (method) has been added
+        # automatically based on the given view requirements of the model.
+        self._model_init_state_automatically_added = False
+
+        # Connectors.
+        self.agent_connectors = None
+        self.action_connectors = None
 
     @staticmethod
     def from_checkpoint(
         checkpoint: Union[str, Checkpoint],
-        policy_ids: Optional[Container[PolicyID]] = None,
+        policy_ids: Optional[Collection[PolicyID]] = None,
     ) -> Union["Policy", Dict[PolicyID, "Policy"]]:
         """Creates new Policy instance(s) from a given Policy or Algorithm checkpoint.
 
@@ -234,7 +320,7 @@ class Policy(metaclass=ABCMeta):
                 for pid, policy_state in policy_states.items():
                     # Get spec and config, merge config with
                     serialized_policy_spec = worker_state["policy_specs"][pid]
-                    policy_config = Algorithm.merge_trainer_configs(
+                    policy_config = Algorithm.merge_algorithm_configs(
                         worker_state["policy_config"], serialized_policy_spec["config"]
                     )
                     serialized_policy_spec.update({"config": policy_config})
@@ -259,8 +345,15 @@ class Policy(metaclass=ABCMeta):
 
         # Policy checkpoint: Return a single Policy instance.
         else:
+            msgpack = None
+            if checkpoint_info.get("format") == "msgpack":
+                msgpack = try_import_msgpack(error=True)
+
             with open(checkpoint_info["state_file"], "rb") as f:
-                state = pickle.load(f)
+                if msgpack is not None:
+                    state = msgpack.load(f)
+                else:
+                    state = pickle.load(f)
             return Policy.from_state(state)
 
     @staticmethod
@@ -286,6 +379,10 @@ class Policy(metaclass=ABCMeta):
                 "Cannot create new Policy."
             )
         pol_spec = PolicySpec.deserialize(serialized_pol_spec)
+        actual_class = get_tf_eager_cls_if_necessary(
+            pol_spec.policy_class,
+            pol_spec.config,
+        )
 
         if pol_spec.config["framework"] == "tf":
             from ray.rllib.policy.tf_policy import TFPolicy
@@ -293,7 +390,7 @@ class Policy(metaclass=ABCMeta):
             return TFPolicy._tf1_from_state_helper(state)
 
         # Create the new policy.
-        new_policy = pol_spec.policy_class(
+        new_policy = actual_class(
             # Note(jungong) : we are intentionally not using keyward arguments here
             # because some policies name the observation space parameter obs_space,
             # and some others name it observation_space.
@@ -308,59 +405,6 @@ class Policy(metaclass=ABCMeta):
         # Return the new policy.
         return new_policy
 
-    @DeveloperAPI
-    def __init__(
-        self,
-        observation_space: gym.Space,
-        action_space: gym.Space,
-        config: AlgorithmConfigDict,
-    ):
-        """Initializes a Policy instance.
-
-        Args:
-            observation_space: Observation space of the policy.
-            action_space: Action space of the policy.
-            config: A complete Algorithm/Policy config dict. For the default
-                config keys and values, see rllib/trainer/trainer.py.
-        """
-        self.observation_space: gym.Space = observation_space
-        self.action_space: gym.Space = action_space
-        # The base struct of the observation/action spaces.
-        # E.g. action-space = gym.spaces.Dict({"a": Discrete(2)}) ->
-        # action_space_struct = {"a": Discrete(2)}
-        self.observation_space_struct = get_base_struct_from_space(observation_space)
-        self.action_space_struct = get_base_struct_from_space(action_space)
-
-        self.config: AlgorithmConfigDict = config
-        self.framework = self.config.get("framework")
-        # Create the callbacks object to use for handling custom callbacks.
-        if self.config.get("callbacks"):
-            self.callbacks: "DefaultCallbacks" = self.config.get("callbacks")()
-        else:
-            from ray.rllib.algorithms.callbacks import DefaultCallbacks
-
-            self.callbacks: "DefaultCallbacks" = DefaultCallbacks()
-
-        # The global timestep, broadcast down from time to time from the
-        # local worker to all remote workers.
-        self.global_timestep: int = 0
-
-        # The action distribution class to use for action sampling, if any.
-        # Child classes may set this.
-        self.dist_class: Optional[Type] = None
-
-        # Initialize view requirements.
-        self.init_view_requirements()
-
-        # Whether the Model's initial state (method) has been added
-        # automatically based on the given view requirements of the model.
-        self._model_init_state_automatically_added = False
-
-        # Connectors.
-        self.agent_connectors = None
-        self.action_connectors = None
-
-    @DeveloperAPI
     def init_view_requirements(self):
         """Maximal view requirements dict for `learn_on_batch()` and
         `compute_actions` calls.
@@ -380,7 +424,24 @@ class Policy(metaclass=ABCMeta):
                 if k not in self.view_requirements:
                     self.view_requirements[k] = v
 
-    @DeveloperAPI
+    def get_connector_metrics(self) -> Dict:
+        """Get metrics on timing from connectors."""
+        return {
+            "agent_connectors": {
+                name + "_ms": 1000 * timer.mean
+                for name, timer in self.agent_connectors.timers.items()
+            },
+            "action_connectors": {
+                name + "_ms": 1000 * timer.mean
+                for name, timer in self.agent_connectors.timers.items()
+            },
+        }
+
+    def reset_connectors(self, env_id) -> None:
+        """Reset action- and agent-connectors for this policy."""
+        self.agent_connectors.reset(env_id=env_id)
+        self.action_connectors.reset(env_id=env_id)
+
     def compute_single_action(
         self,
         obs: Optional[TensorStructType] = None,
@@ -390,7 +451,7 @@ class Policy(metaclass=ABCMeta):
         prev_reward: Optional[TensorStructType] = None,
         info: dict = None,
         input_dict: Optional[SampleBatch] = None,
-        episode: Optional["Episode"] = None,
+        episode=None,
         explore: Optional[bool] = None,
         timestep: Optional[int] = None,
         # Kwars placeholder for future compatibility.
@@ -484,17 +545,16 @@ class Policy(metaclass=ABCMeta):
         # Return action, internal state(s), infos.
         return (
             single_action,
-            [s[0] for s in state_out],
-            {k: v[0] for k, v in info.items()},
+            tree.map_structure(lambda x: x[0], state_out),
+            tree.map_structure(lambda x: x[0], info),
         )
 
-    @DeveloperAPI
     def compute_actions_from_input_dict(
         self,
         input_dict: Union[SampleBatch, Dict[str, TensorStructType]],
-        explore: bool = None,
+        explore: Optional[bool] = None,
         timestep: Optional[int] = None,
-        episodes: Optional[List["Episode"]] = None,
+        episodes=None,
         **kwargs,
     ) -> Tuple[TensorType, List[TensorType], Dict[str, TensorType]]:
         """Computes actions from collected samples (across multiple-agents).
@@ -530,7 +590,7 @@ class Policy(metaclass=ABCMeta):
         """
         # Default implementation just passes obs, prev-a/r, and states on to
         # `self.compute_actions()`.
-        state_batches = [s for k, s in input_dict.items() if k[:9] == "state_in_"]
+        state_batches = [s for k, s in input_dict.items() if k.startswith("state_in")]
         return self.compute_actions(
             input_dict[SampleBatch.OBS],
             state_batches,
@@ -544,7 +604,6 @@ class Policy(metaclass=ABCMeta):
         )
 
     @abstractmethod
-    @DeveloperAPI
     def compute_actions(
         self,
         obs_batch: Union[List[TensorStructType], TensorStructType],
@@ -552,7 +611,7 @@ class Policy(metaclass=ABCMeta):
         prev_action_batch: Union[List[TensorStructType], TensorStructType] = None,
         prev_reward_batch: Union[List[TensorStructType], TensorStructType] = None,
         info_batch: Optional[Dict[str, list]] = None,
-        episodes: Optional[List["Episode"]] = None,
+        episodes: Optional[List] = None,
         explore: Optional[bool] = None,
         timestep: Optional[int] = None,
         **kwargs,
@@ -588,7 +647,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def compute_log_likelihoods(
         self,
         actions: Union[List[TensorType], TensorType],
@@ -597,6 +655,7 @@ class Policy(metaclass=ABCMeta):
         prev_action_batch: Optional[Union[List[TensorType], TensorType]] = None,
         prev_reward_batch: Optional[Union[List[TensorType], TensorType]] = None,
         actions_normalized: bool = True,
+        in_training: bool = True,
     ) -> TensorType:
         """Computes the log-prob/likelihood for a given action and observation.
 
@@ -615,13 +674,13 @@ class Policy(metaclass=ABCMeta):
                 (between -1.0 and 1.0) or not? If not and
                 `normalize_actions=True`, we need to normalize the given
                 actions first, before calculating log likelihoods.
-
+            in_training: Whether to use the forward_train() or forward_exploration() of
+                the underlying RLModule.
         Returns:
             Batch of log probs/likelihoods, with shape: [BATCH_SIZE].
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     @OverrideToImplementCustomLogic_CallToSuperRecommended
     def postprocess_trajectory(
         self,
@@ -629,7 +688,7 @@ class Policy(metaclass=ABCMeta):
         other_agent_batches: Optional[
             Dict[AgentID, Tuple["Policy", SampleBatch]]
         ] = None,
-        episode: Optional["Episode"] = None,
+        episode=None,
     ) -> SampleBatch:
         """Implements algorithm-specific trajectory postprocessing.
 
@@ -655,7 +714,6 @@ class Policy(metaclass=ABCMeta):
         # The default implementation just returns the same, unaltered batch.
         return sample_batch
 
-    @ExperimentalAPI
     @OverrideToImplementCustomLogic
     def loss(
         self, model: ModelV2, dist_class: ActionDistribution, train_batch: SampleBatch
@@ -675,7 +733,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def learn_on_batch(self, samples: SampleBatch) -> Dict[str, TensorType]:
         """Perform one learning update, given `samples`.
 
@@ -688,9 +745,11 @@ class Policy(metaclass=ABCMeta):
         Returns:
             Dictionary of extra metadata from `compute_gradients()`.
 
-        Examples:
-            >>> policy, sample_batch = ... # doctest: +SKIP
-            >>> policy.learn_on_batch(sample_batch) # doctest: +SKIP
+        .. testcode::
+            :skipif: True
+
+            policy, sample_batch = ...
+            policy.learn_on_batch(sample_batch)
         """
         # The default implementation is simply a fused `compute_gradients` plus
         # `apply_gradients` call.
@@ -698,7 +757,6 @@ class Policy(metaclass=ABCMeta):
         self.apply_gradients(grads)
         return grad_info
 
-    @ExperimentalAPI
     def learn_on_batch_from_replay_buffer(
         self, replay_actor: ActorHandle, policy_id: PolicyID
     ) -> Dict[str, TensorType]:
@@ -728,7 +786,6 @@ class Policy(metaclass=ABCMeta):
         else:
             return self.learn_on_batch(batch)
 
-    @DeveloperAPI
     def load_batch_into_buffer(self, batch: SampleBatch, buffer_index: int = 0) -> int:
         """Bulk-loads the given SampleBatch into the devices' memories.
 
@@ -747,7 +804,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def get_num_samples_loaded_into_buffer(self, buffer_index: int = 0) -> int:
         """Returns the number of currently loaded samples in the given buffer.
 
@@ -762,7 +818,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def learn_on_loaded_batch(self, offset: int = 0, buffer_index: int = 0):
         """Runs a single step of SGD on an already loaded data in a buffer.
 
@@ -786,7 +841,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def compute_gradients(
         self, postprocessed_batch: SampleBatch
     ) -> Tuple[ModelGradients, Dict[str, TensorType]]:
@@ -805,7 +859,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def apply_gradients(self, gradients: ModelGradients) -> None:
         """Applies the (previously) computed gradients.
 
@@ -818,7 +871,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def get_weights(self) -> ModelWeights:
         """Returns model weights.
 
@@ -833,7 +885,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def set_weights(self, weights: ModelWeights) -> None:
         """Sets this Policy's model's weights.
 
@@ -846,7 +897,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def get_exploration_state(self) -> Dict[str, TensorType]:
         """Returns the state of this Policy's exploration component.
 
@@ -855,7 +905,6 @@ class Policy(metaclass=ABCMeta):
         """
         return self.exploration.get_state()
 
-    @DeveloperAPI
     def is_recurrent(self) -> bool:
         """Whether this Policy holds a recurrent Model.
 
@@ -864,7 +913,6 @@ class Policy(metaclass=ABCMeta):
         """
         return False
 
-    @DeveloperAPI
     def num_state_tensors(self) -> int:
         """The number of internal states needed by the RNN-Model of the Policy.
 
@@ -873,7 +921,6 @@ class Policy(metaclass=ABCMeta):
         """
         return 0
 
-    @DeveloperAPI
     def get_initial_state(self) -> List[TensorType]:
         """Returns initial RNN state for the current policy.
 
@@ -882,7 +929,6 @@ class Policy(metaclass=ABCMeta):
         """
         return []
 
-    @DeveloperAPI
     @OverrideToImplementCustomLogic_CallToSuperRecommended
     def get_state(self) -> PolicyState:
         """Returns the entire current state of this Policy.
@@ -892,6 +938,9 @@ class Policy(metaclass=ABCMeta):
         the exploration component's state, as well as global variables, such
         as sampling timesteps.
 
+        Note that the state may contain references to the original variables.
+        This means that you may need to deepcopy() the state before mutating it.
+
         Returns:
             Serialized local state.
         """
@@ -900,6 +949,8 @@ class Policy(metaclass=ABCMeta):
             "weights": self.get_weights(),
             # The current global timestep.
             "global_timestep": self.global_timestep,
+            # The current num_grad_updates counter.
+            "num_grad_updates": self.num_grad_updates,
         }
 
         # Add this Policy's spec so it can be retreived w/o access to the original
@@ -912,18 +963,16 @@ class Policy(metaclass=ABCMeta):
         )
         state["policy_spec"] = policy_spec.serialize()
 
-        if self.config.get("enable_connectors", False):
-            # Checkpoint connectors state as well if enabled.
-            connector_configs = {}
-            if self.agent_connectors:
-                connector_configs["agent"] = self.agent_connectors.to_state()
-            if self.action_connectors:
-                connector_configs["action"] = self.action_connectors.to_state()
-            state["connector_configs"] = connector_configs
+        # Checkpoint connectors state as well if enabled.
+        connector_configs = {}
+        if self.agent_connectors:
+            connector_configs["agent"] = self.agent_connectors.to_state()
+        if self.action_connectors:
+            connector_configs["action"] = self.action_connectors.to_state()
+        state["connector_configs"] = connector_configs
 
         return state
 
-    @PublicAPI(stability="alpha")
     def restore_connectors(self, state: PolicyState):
         """Restore agent and action connectors if configs available.
 
@@ -934,25 +983,20 @@ class Policy(metaclass=ABCMeta):
         # To avoid a circular dependency problem cause by SampleBatch.
         from ray.rllib.connectors.util import restore_connectors_for_policy
 
-        # No-op if connector is not enabled.
-        if not self.config.get("enable_connectors", False):
-            return
-
         connector_configs = state.get("connector_configs", {})
         if "agent" in connector_configs:
             self.agent_connectors = restore_connectors_for_policy(
                 self, connector_configs["agent"]
             )
-            logger.info("restoring agent connectors:")
-            logger.info(self.agent_connectors.__str__(indentation=4))
+            logger.debug("restoring agent connectors:")
+            logger.debug(self.agent_connectors.__str__(indentation=4))
         if "action" in connector_configs:
             self.action_connectors = restore_connectors_for_policy(
                 self, connector_configs["action"]
             )
-            logger.info("restoring action connectors:")
-            logger.info(self.action_connectors.__str__(indentation=4))
+            logger.debug("restoring action connectors:")
+            logger.debug(self.action_connectors.__str__(indentation=4))
 
-    @DeveloperAPI
     @OverrideToImplementCustomLogic_CallToSuperRecommended
     def set_state(self, state: PolicyState) -> None:
         """Restores the entire current state of this Policy from `state`.
@@ -961,10 +1005,35 @@ class Policy(metaclass=ABCMeta):
             state: The new state to set this policy to. Can be
                 obtained by calling `self.get_state()`.
         """
+        if "policy_spec" in state:
+            policy_spec = PolicySpec.deserialize(state["policy_spec"])
+            # Assert spaces remained the same.
+            if (
+                policy_spec.observation_space is not None
+                and policy_spec.observation_space != self.observation_space
+            ):
+                logger.warning(
+                    "`observation_space` in given policy state ("
+                    f"{policy_spec.observation_space}) does not match this Policy's "
+                    f"observation space ({self.observation_space})."
+                )
+            if (
+                policy_spec.action_space is not None
+                and policy_spec.action_space != self.action_space
+            ):
+                logger.warning(
+                    "`action_space` in given policy state ("
+                    f"{policy_spec.action_space}) does not match this Policy's "
+                    f"action space ({self.action_space})."
+                )
+            # Override config, if part of the spec.
+            if policy_spec.config:
+                self.config = policy_spec.config
+
+        # Override NN weights.
         self.set_weights(state["weights"])
         self.restore_connectors(state)
 
-    @ExperimentalAPI
     def apply(
         self,
         func: Callable[["Policy", Optional[Any], Optional[Any]], T],
@@ -988,7 +1057,6 @@ class Policy(metaclass=ABCMeta):
         """
         return func(self, *args, **kwargs)
 
-    @DeveloperAPI
     def on_global_var_update(self, global_vars: Dict[str, TensorType]) -> None:
         """Called on an update to global vars.
 
@@ -1004,14 +1072,18 @@ class Policy(metaclass=ABCMeta):
             self.global_timestep.assign(global_vars["timestep"])
         else:
             self.global_timestep = global_vars["timestep"]
+        # Update our lifetime gradient update counter.
+        num_grad_updates = global_vars.get("num_grad_updates")
+        if num_grad_updates is not None:
+            self.num_grad_updates = num_grad_updates
 
-    @DeveloperAPI
     def export_checkpoint(
         self,
         export_dir: str,
         filename_prefix=DEPRECATED_VALUE,
         *,
         policy_state: Optional[PolicyState] = None,
+        checkpoint_format: str = "cloudpickle",
     ) -> None:
         """Exports Policy checkpoint to a local directory and returns an AIR Checkpoint.
 
@@ -1021,11 +1093,14 @@ class Policy(metaclass=ABCMeta):
             policy_state: An optional PolicyState to write to disk. Used by
                 `Algorithm.save_checkpoint()` to save on the additional
                 `self.get_state()` calls of its different Policies.
+            checkpoint_format: Either one of 'cloudpickle' or 'msgpack'.
 
-        Example:
-            >>> from ray.rllib.algorithms.ppo import PPOTorchPolicy
-            >>> policy = PPOTorchPolicy(...) # doctest: +SKIP
-            >>> policy.export_checkpoint("/tmp/export_dir") # doctest: +SKIP
+        .. testcode::
+            :skipif: True
+
+            from ray.rllib.algorithms.ppo import PPOTorchPolicy
+            policy = PPOTorchPolicy(...)
+            policy.export_checkpoint("/tmp/export_dir")
         """
         # `filename_prefix` should not longer be used as new Policy checkpoints
         # contain more than one file with a fixed filename structure.
@@ -1034,14 +1109,34 @@ class Policy(metaclass=ABCMeta):
                 old="Policy.export_checkpoint(filename_prefix=...)",
                 error=True,
             )
+        if checkpoint_format not in ["cloudpickle", "msgpack"]:
+            raise ValueError(
+                f"Value of `checkpoint_format` ({checkpoint_format}) must either be "
+                "'cloudpickle' or 'msgpack'!"
+            )
+
         if policy_state is None:
             policy_state = self.get_state()
-        policy_state["checkpoint_version"] = CHECKPOINT_VERSION
 
         # Write main policy state file.
         os.makedirs(export_dir, exist_ok=True)
-        with open(os.path.join(export_dir, "policy_state.pkl"), "w+b") as f:
-            pickle.dump(policy_state, f)
+        if checkpoint_format == "cloudpickle":
+            policy_state["checkpoint_version"] = CHECKPOINT_VERSION
+            state_file = "policy_state.pkl"
+            with open(os.path.join(export_dir, state_file), "w+b") as f:
+                pickle.dump(policy_state, f)
+        else:
+            from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+
+            msgpack = try_import_msgpack(error=True)
+            policy_state["checkpoint_version"] = str(CHECKPOINT_VERSION)
+            # Serialize the config for msgpack dump'ing.
+            policy_state["policy_spec"]["config"] = AlgorithmConfig._serialize_dict(
+                policy_state["policy_spec"]["config"]
+            )
+            state_file = "policy_state.msgpck"
+            with open(os.path.join(export_dir, state_file), "w+b") as f:
+                msgpack.dump(policy_state, f)
 
         # Write RLlib checkpoint json.
         with open(os.path.join(export_dir, "rllib_checkpoint.json"), "w") as f:
@@ -1049,6 +1144,8 @@ class Policy(metaclass=ABCMeta):
                 {
                     "type": "Policy",
                     "checkpoint_version": str(policy_state["checkpoint_version"]),
+                    "format": checkpoint_format,
+                    "state_file": state_file,
                     "ray_version": ray.__version__,
                     "ray_commit": ray.__commit__,
                 },
@@ -1059,7 +1156,6 @@ class Policy(metaclass=ABCMeta):
         if self.config["export_native_model_files"]:
             self.export_model(os.path.join(export_dir, "model"))
 
-    @DeveloperAPI
     def export_model(self, export_dir: str, onnx: Optional[int] = None) -> None:
         """Exports the Policy's Model to local directory for serving.
 
@@ -1074,11 +1170,10 @@ class Policy(metaclass=ABCMeta):
 
         Raises:
             ValueError: If a native DL-framework based model (e.g. a keras Model)
-            cannot be saved to disk for various reasons.
+                cannot be saved to disk for various reasons.
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def import_model_from_h5(self, import_file: str) -> None:
         """Imports Policy from local file.
 
@@ -1087,7 +1182,6 @@ class Policy(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    @DeveloperAPI
     def get_session(self) -> Optional["tf1.Session"]:
         """Returns tf.Session object to use for computing actions or None.
 
@@ -1118,6 +1212,7 @@ class Policy(metaclass=ABCMeta):
         """
         worker_idx = self.config.get("worker_index", 0)
         fake_gpus = self.config.get("_fake_gpus", False)
+
         if (
             ray._private.worker._mode() == ray._private.worker.LOCAL_MODE
             and not fake_gpus
@@ -1128,8 +1223,8 @@ class Policy(metaclass=ABCMeta):
             # If head node, take num_gpus.
             num_gpus = self.config["num_gpus"]
         else:
-            # If worker node, take num_gpus_per_worker
-            num_gpus = self.config["num_gpus_per_worker"]
+            # If worker node, take `num_gpus_per_env_runner`.
+            num_gpus = self.config["num_gpus_per_env_runner"]
 
         if num_gpus == 0:
             dev = "CPU"
@@ -1147,10 +1242,9 @@ class Policy(metaclass=ABCMeta):
     def _create_exploration(self) -> Exploration:
         """Creates the Policy's Exploration object.
 
-        This method only exists b/c some Trainers do not use TfPolicy nor
+        This method only exists b/c some Algorithms do not use TfPolicy nor
         TorchPolicy, but inherit directly from Policy. Others inherit from
         TfPolicy w/o using DynamicTFPolicy.
-        TODO(sven): unify these cases.
 
         Returns:
             Exploration: The Exploration object to be used by this Policy.
@@ -1164,7 +1258,7 @@ class Policy(metaclass=ABCMeta):
             action_space=self.action_space,
             policy_config=self.config,
             model=getattr(self, "model", None),
-            num_workers=self.config.get("num_workers", 0),
+            num_workers=self.config.get("num_env_runners", 0),
             worker_index=self.config.get("worker_index", 0),
             framework=getattr(self, "framework", self.config.get("framework", "tf")),
         )
@@ -1205,9 +1299,9 @@ class Policy(metaclass=ABCMeta):
             SampleBatch.PREV_REWARDS: ViewRequirement(
                 data_col=SampleBatch.REWARDS, shift=-1
             ),
-            SampleBatch.DONES: ViewRequirement(),
+            SampleBatch.TERMINATEDS: ViewRequirement(),
+            SampleBatch.TRUNCATEDS: ViewRequirement(),
             SampleBatch.INFOS: ViewRequirement(used_for_compute_actions=False),
-            SampleBatch.T: ViewRequirement(),
             SampleBatch.EPS_ID: ViewRequirement(),
             SampleBatch.UNROLL_ID: ViewRequirement(),
             SampleBatch.AGENT_INDEX: ViewRequirement(),
@@ -1233,10 +1327,13 @@ class Policy(metaclass=ABCMeta):
             auto_remove_unneeded_view_reqs: Whether to automatically
                 remove those ViewRequirements records from
                 self.view_requirements that are not needed.
-            stats_fn (Optional[Callable[[Policy, SampleBatch], Dict[str,
-                TensorType]]]): An optional stats function to be called after
-                the loss.
+                stats_fn (Optional[Callable[[Policy, SampleBatch], Dict[str,
+                    TensorType]]]): An optional stats function to be called after
+                    the loss.
         """
+
+        if self.config.get("_disable_initialize_loss_from_dummy_batch", False):
+            return
         # Signal Policy that currently we do not like to eager/jit trace
         # any function calls. This is to be able to track, which columns
         # in the dummy batch are accessed by the different function (e.g.
@@ -1245,13 +1342,17 @@ class Policy(metaclass=ABCMeta):
         # Save for later so that loss init does not change global timestep
         global_ts_before_init = int(convert_to_numpy(self.global_timestep))
 
-        sample_batch_size = max(self.batch_divisibility_req * 4, 32)
+        sample_batch_size = min(
+            max(self.batch_divisibility_req * 4, 32),
+            self.config["train_batch_size"],  # Don't go over the asked batch size.
+        )
         self._dummy_batch = self._get_dummy_batch_from_view_requirements(
             sample_batch_size
         )
         self._lazy_tensor_dict(self._dummy_batch)
+        explore = False
         actions, state_outs, extra_outs = self.compute_actions_from_input_dict(
-            self._dummy_batch, explore=False
+            self._dummy_batch, explore=explore
         )
         for key, view_req in self.view_requirements.items():
             if key not in self._dummy_batch.accessed_keys:
@@ -1261,21 +1362,43 @@ class Policy(metaclass=ABCMeta):
         for key, value in extra_outs.items():
             self._dummy_batch[key] = value
             if key not in self.view_requirements:
-                self.view_requirements[key] = ViewRequirement(
-                    space=gym.spaces.Box(
-                        -1.0, 1.0, shape=value.shape[1:], dtype=value.dtype
-                    ),
-                    used_for_compute_actions=False,
-                )
+                if isinstance(value, (dict, np.ndarray)):
+                    # the assumption is that value is a nested_dict of np.arrays leaves
+                    space = get_gym_space_from_struct_of_tensors(value)
+                    self.view_requirements[key] = ViewRequirement(
+                        space=space, used_for_compute_actions=False
+                    )
+                else:
+                    raise ValueError(
+                        "policy.compute_actions_from_input_dict() returns an "
+                        "extra action output that is neither a numpy array nor a dict."
+                    )
+
         for key in self._dummy_batch.accessed_keys:
             if key not in self.view_requirements:
                 self.view_requirements[key] = ViewRequirement()
-            self.view_requirements[key].used_for_compute_actions = True
-        self._dummy_batch = self._get_dummy_batch_from_view_requirements(
-            sample_batch_size
-        )
+                self.view_requirements[key].used_for_compute_actions = False
+            # TODO (kourosh) Why did we use to make used_for_compute_actions True here?
+        new_batch = self._get_dummy_batch_from_view_requirements(sample_batch_size)
+        # Make sure the dummy_batch will return numpy arrays when accessed
         self._dummy_batch.set_get_interceptor(None)
-        self.exploration.postprocess_trajectory(self, self._dummy_batch)
+
+        # try to re-use the output of the previous run to avoid overriding things that
+        # would break (e.g. scale = 0 of Normal distribution cannot be zero)
+        for k in new_batch:
+            if k not in self._dummy_batch:
+                self._dummy_batch[k] = new_batch[k]
+
+        # Make sure the book-keeping of dummy_batch keys are reset to correcly track
+        # what is accessed, what is added and what's deleted from now on.
+        self._dummy_batch.accessed_keys.clear()
+        self._dummy_batch.deleted_keys.clear()
+        self._dummy_batch.added_keys.clear()
+
+        if self.exploration:
+            # Policies with RLModules don't have an exploration object.
+            self.exploration.postprocess_trajectory(self, self._dummy_batch)
+
         postprocessed_batch = self.postprocess_trajectory(self._dummy_batch)
         seq_lens = None
         if state_outs:
@@ -1290,9 +1413,11 @@ class Policy(metaclass=ABCMeta):
                         "state_out_{}".format(i)
                     ][:B]
                 i += 1
+
             seq_len = sample_batch_size // B
             seq_lens = np.array([seq_len for _ in range(B)], dtype=np.int32)
             postprocessed_batch[SampleBatch.SEQ_LENS] = seq_lens
+
         # Switch on lazy to-tensor conversion on `postprocessed_batch`.
         train_batch = self._lazy_tensor_dict(postprocessed_batch)
         # Calling loss, so set `is_training` to True.
@@ -1300,6 +1425,7 @@ class Policy(metaclass=ABCMeta):
         if seq_lens is not None:
             train_batch[SampleBatch.SEQ_LENS] = seq_lens
         train_batch.count = self._dummy_batch.count
+
         # Call the loss function, if it exists.
         # TODO(jungong) : clean up after all agents get migrated.
         # We should simply do self.loss(...) here.
@@ -1344,7 +1470,8 @@ class Policy(metaclass=ABCMeta):
                             SampleBatch.EPS_ID,
                             SampleBatch.AGENT_INDEX,
                             SampleBatch.UNROLL_ID,
-                            SampleBatch.DONES,
+                            SampleBatch.TERMINATEDS,
+                            SampleBatch.TRUNCATEDS,
                             SampleBatch.REWARDS,
                             SampleBatch.INFOS,
                             SampleBatch.T,
@@ -1352,8 +1479,8 @@ class Policy(metaclass=ABCMeta):
                     ):
                         self.view_requirements[key].used_for_training = False
                 # Remove those not needed at all (leave those that are needed
-                # by Sampler to properly execute sample collection).
-                # Also always leave DONES, REWARDS, INFOS, no matter what.
+                # by Sampler to properly execute sample collection). Also always leave
+                # TERMINATEDS, TRUNCATEDS, REWARDS, INFOS, no matter what.
                 for key in list(self.view_requirements.keys()):
                     if (
                         key not in all_accessed_keys
@@ -1362,7 +1489,8 @@ class Policy(metaclass=ABCMeta):
                             SampleBatch.EPS_ID,
                             SampleBatch.AGENT_INDEX,
                             SampleBatch.UNROLL_ID,
-                            SampleBatch.DONES,
+                            SampleBatch.TERMINATEDS,
+                            SampleBatch.TRUNCATEDS,
                             SampleBatch.REWARDS,
                             SampleBatch.INFOS,
                             SampleBatch.T,
@@ -1395,6 +1523,17 @@ class Policy(metaclass=ABCMeta):
                 "either of type `int` or `tf.Variable`, "
                 "but is of type {}.".format(self, type(self.global_timestep))
             )
+
+    def maybe_remove_time_dimension(self, input_dict: Dict[str, TensorType]):
+        """Removes a time dimension for recurrent RLModules.
+
+        Args:
+            input_dict: The input dict.
+
+        Returns:
+            The input dict with a possibly removed time dimension.
+        """
+        raise NotImplementedError
 
     def _get_dummy_batch_from_view_requirements(
         self, batch_size: int = 1
@@ -1521,10 +1660,37 @@ class Policy(metaclass=ABCMeta):
                         space=space, used_for_training=True
                     )
 
-    @DeveloperAPI
     def __repr__(self):
         return type(self).__name__
 
-    @Deprecated(new="get_exploration_state", error=True)
-    def get_exploration_info(self) -> Dict[str, TensorType]:
-        return self.get_exploration_state()
+
+@OldAPIStack
+def get_gym_space_from_struct_of_tensors(
+    value: Union[Dict, Tuple, List, TensorType],
+    batched_input=True,
+) -> gym.Space:
+    start_idx = 1 if batched_input else 0
+    struct = tree.map_structure(
+        lambda x: gym.spaces.Box(
+            -1.0, 1.0, shape=x.shape[start_idx:], dtype=get_np_dtype(x)
+        ),
+        value,
+    )
+    space = get_gym_space_from_struct_of_spaces(struct)
+    return space
+
+
+@OldAPIStack
+def get_gym_space_from_struct_of_spaces(value: Union[Dict, Tuple]) -> gym.spaces.Dict:
+    if isinstance(value, dict):
+        return gym.spaces.Dict(
+            {k: get_gym_space_from_struct_of_spaces(v) for k, v in value.items()}
+        )
+    elif isinstance(value, (tuple, list)):
+        return gym.spaces.Tuple([get_gym_space_from_struct_of_spaces(v) for v in value])
+    else:
+        assert isinstance(value, gym.spaces.Space), (
+            f"The struct of spaces should only contain dicts, tiples and primitive "
+            f"gym spaces. Space is of type {type(value)}"
+        )
+        return value

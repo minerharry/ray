@@ -7,10 +7,10 @@ cc_binary(
     name = "libray_api.so",
     copts = COPTS,
     linkopts = select({
-        "@bazel_tools//src/conditions:darwin": [
+        "@platforms//os:osx": [
             #TODO(larry): Hide the symbols when we make it work on mac.
         ],
-        "@bazel_tools//src/conditions:windows": [
+        "@platforms//os:windows": [
             #TODO(larry): Hide the symbols when we make it work on Windows.
         ],
         "//conditions:default": [
@@ -21,14 +21,13 @@ cc_binary(
     linkstatic = 1,
     visibility = ["//visibility:public"],
     deps = [
-        ":ray_api",
+        ":ray_api_lib",
         ":symbols/ray_api_exported_symbols_linux.lds",
-        ":symbols/ray_api_exported_symbols_mac.lds",
     ],
 )
 
 cc_library(
-    name = "ray_api",
+    name = "ray_api_lib",
     srcs = glob([
         "src/ray/api.cc",
         "src/ray/api/*.cc",
@@ -57,10 +56,12 @@ cc_library(
     strip_include_prefix = "include",
     visibility = ["//visibility:public"],
     deps = [
-        "//:core_worker_lib",
-        "//:global_state_accessor_lib",
+        "//src/ray/gcs/gcs_client:global_state_accessor_lib",
         "//:ray_common",
-        "//:ray_util",
+        "//src/ray/core_worker:core_worker_lib",
+        "//src/ray/util",
+        "//src/ray/util:process",
+        "//src/ray/util:cmd_line_utils",
         "@boost//:callable_traits",
         "@boost//:dll",
         "@com_google_absl//absl/flags:flag",
@@ -93,10 +94,10 @@ cc_binary(
     copts = COPTS,
     linkstatic = True,
     deps = select({
-        "@bazel_tools//src/conditions:windows": [
+        "@platforms//os:windows": [
             # TODO(SongGuyang): Change to use dynamic library
             # "ray_cpp_lib" when we make it work on Windows.
-            "ray_api",
+            "ray_api_lib",
         ],
         "//conditions:default": [
             "ray_cpp_lib",
@@ -112,7 +113,6 @@ genrule(
     name = "ray_cpp_pkg",
     srcs = [
         "default_worker",
-        "ray_api",
         "libray_api.so",
     ],
     outs = ["ray_cpp_pkg.out"],
@@ -176,7 +176,7 @@ cc_test(
     linkstatic = True,
     tags = ["team:core"],
     deps = [
-        "ray_api",
+        "ray_api_lib",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -206,7 +206,7 @@ cc_test(
     linkstatic = True,
     tags = ["team:core"],
     deps = [
-        "ray_api",
+        "ray_api_lib",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -229,7 +229,7 @@ cc_test(
     linkstatic = True,
     tags = ["team:core"],
     deps = [
-        "ray_api",
+        "ray_api_lib",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -294,7 +294,7 @@ cc_test(
     linkstatic = True,
     tags = ["team:core"],
     deps = [
-        "ray_api",
+        "ray_api_lib",
     ],
 )
 
@@ -328,7 +328,7 @@ cc_binary(
     linkstatic = True,
     tags = ["team:core"],
     deps = [
-        ":ray_api",
+        ":ray_api_lib",
     ],
 )
 
@@ -344,6 +344,49 @@ cc_binary(
         "ray_cpp_lib",
         "@boost//:callable_traits",
         "@boost//:optional",
+        "@msgpack",
+        "@nlohmann_json",
+    ],
+)
+
+cc_test(
+    name = "metric_example",
+    srcs = glob([
+        "src/ray/test/examples/metric_example.cc",
+    ]),
+    args = [
+        "--ray_code_search_path $(location metric_example.so)",
+    ],
+    data = [
+        "metric_example.so",
+    ],
+    linkstatic = True,
+    tags = ["team:core"],
+    deps = [
+        "ray_cpp_lib",
+        "@boost//:callable_traits",
+        "@boost//:optional",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@msgpack",
+        "@nlohmann_json",
+    ],
+)
+
+cc_binary(
+    name = "metric_example.so",
+    testonly = True,
+    srcs = glob([
+        "src/ray/test/examples/metric_example.cc",
+    ]),
+    linkopts = ["-shared"],
+    linkstatic = True,
+    deps = [
+        "ray_cpp_lib",
+        "@boost//:callable_traits",
+        "@boost//:optional",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
         "@msgpack",
         "@nlohmann_json",
     ],

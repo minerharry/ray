@@ -1,5 +1,5 @@
 from collections import OrderedDict
-import gym
+import gymnasium as gym
 from typing import Dict, List, Optional
 
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
@@ -58,9 +58,6 @@ class GroupAgentsWrapper(MultiAgentEnv):
         """
         super().__init__()
         self.env = env
-        # Inherit wrapped env's `_skip_env_checking` flag.
-        if hasattr(self.env, "_skip_env_checking"):
-            self._skip_env_checking = self.env._skip_env_checking
         self.groups = groups
         self.agent_id_to_group = {}
         for group_id, agent_ids in groups.items():
@@ -77,32 +74,39 @@ class GroupAgentsWrapper(MultiAgentEnv):
         for group_id in groups.keys():
             self._agent_ids.add(group_id)
 
-    def seed(self, seed=None):
-        if not hasattr(self.env, "seed"):
-            # This is a silent fail. However, OpenAI gyms also silently fail
-            # here.
-            return
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        obs, info = self.env.reset(seed=seed, options=options)
 
-        self.env.seed(seed)
-
-    def reset(self):
-        obs = self.env.reset()
-        return self._group_items(obs)
+        return (
+            self._group_items(obs),
+            self._group_items(
+                info,
+                agg_fn=lambda gvals: {GROUP_INFO: list(gvals.values())},
+            ),
+        )
 
     def step(self, action_dict):
-        # Ungroup and send actions
+        # Ungroup and send actions.
         action_dict = self._ungroup_items(action_dict)
-        obs, rewards, dones, infos = self.env.step(action_dict)
+        obs, rewards, terminateds, truncateds, infos = self.env.step(action_dict)
 
         # Apply grouping transforms to the env outputs
         obs = self._group_items(obs)
         rewards = self._group_items(rewards, agg_fn=lambda gvals: list(gvals.values()))
-        dones = self._group_items(dones, agg_fn=lambda gvals: all(gvals.values()))
+        # Only if all of the agents are terminated, the group is terminated as well.
+        terminateds = self._group_items(
+            terminateds, agg_fn=lambda gvals: all(gvals.values())
+        )
+        # If all of the agents are truncated, the group is truncated as well.
+        truncateds = self._group_items(
+            truncateds,
+            agg_fn=lambda gvals: all(gvals.values()),
+        )
         infos = self._group_items(
             infos, agg_fn=lambda gvals: {GROUP_INFO: list(gvals.values())}
         )
 
-        # Aggregate rewards, but preserve the original values in infos
+        # Aggregate rewards, but preserve the original values in infos.
         for agent_id, rew in rewards.items():
             if isinstance(rew, list):
                 rewards[agent_id] = sum(rew)
@@ -110,7 +114,7 @@ class GroupAgentsWrapper(MultiAgentEnv):
                     infos[agent_id] = {}
                 infos[agent_id][GROUP_REWARDS] = rew
 
-        return obs, rewards, dones, infos
+        return obs, rewards, terminateds, truncateds, infos
 
     def _ungroup_items(self, items):
         out = {}
@@ -127,7 +131,10 @@ class GroupAgentsWrapper(MultiAgentEnv):
                 out[agent_id] = value
         return out
 
-    def _group_items(self, items, agg_fn=lambda gvals: list(gvals.values())):
+    def _group_items(self, items, agg_fn=None):
+        if agg_fn is None:
+            agg_fn = lambda gvals: list(gvals.values())  # noqa: E731
+
         grouped_items = {}
         for agent_id, item in items.items():
             if agent_id in self.agent_id_to_group:

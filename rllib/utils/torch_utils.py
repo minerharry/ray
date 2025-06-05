@@ -1,25 +1,28 @@
-import os
 import logging
+import os
 import warnings
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import Dict, List, Optional, TYPE_CHECKING, Union
 
-import gym
+import gymnasium as gym
+from gymnasium.spaces import Discrete, MultiDiscrete
 import numpy as np
+from packaging import version
 import tree  # pip install dm_tree
-from gym.spaces import Discrete, MultiDiscrete
 
-import ray
 from ray.rllib.models.repeated_values import RepeatedValues
-from ray.rllib.utils.annotations import Deprecated, PublicAPI, DeveloperAPI
+from ray.rllib.utils.annotations import PublicAPI, DeveloperAPI, OldAPIStack
 from ray.rllib.utils.framework import try_import_torch
+from ray.rllib.utils.numpy import SMALL_NUMBER
 from ray.rllib.utils.typing import (
     LocalOptimizer,
+    NetworkType,
     SpaceStruct,
     TensorStructType,
     TensorType,
 )
 
 if TYPE_CHECKING:
+    from ray.rllib.core.learner.learner import ParamDict, ParamList
     from ray.rllib.policy.torch_policy import TorchPolicy
     from ray.rllib.policy.torch_policy_v2 import TorchPolicyV2
 
@@ -31,12 +34,24 @@ torch, nn = try_import_torch()
 FLOAT_MIN = -3.4e38
 FLOAT_MAX = 3.4e38
 
+if torch:
+    TORCH_COMPILE_REQUIRED_VERSION = version.parse("2.0.0")
+else:
+    TORCH_COMPILE_REQUIRED_VERSION = ValueError(
+        "torch is not installed. TORCH_COMPILE_REQUIRED_VERSION is not defined."
+    )
 
-@PublicAPI
+
+@OldAPIStack
 def apply_grad_clipping(
     policy: "TorchPolicy", optimizer: LocalOptimizer, loss: TensorType
 ) -> Dict[str, TensorType]:
     """Applies gradient clipping to already computed grads inside `optimizer`.
+
+    Note: This function does NOT perform an analogous operation as
+    tf.clip_by_global_norm. It merely clips by norm (per gradient tensor) and
+    then computes the global norm across all given tensors (but without clipping
+    by that global norm).
 
     Args:
         policy: The TorchPolicy, which calculated `loss`.
@@ -53,6 +68,7 @@ def apply_grad_clipping(
     else:
         clip_value = np.inf
 
+    num_none_grads = 0
     for param_group in optimizer.param_groups:
         # Make sure we only pass params with grad != None into torch
         # clip_grad_norm_. Would fail otherwise.
@@ -66,20 +82,122 @@ def apply_grad_clipping(
                 global_norm = global_norm.cpu().numpy()
 
             grad_gnorm += min(global_norm, clip_value)
+        else:
+            num_none_grads += 1
 
-    if grad_gnorm > 0:
-        return {"grad_gnorm": grad_gnorm}
-    else:
+    # Note (Kourosh): grads could indeed be zero. This method should still return
+    # grad_gnorm in that case.
+    if num_none_grads == len(optimizer.param_groups):
         # No grads available
         return {}
-
-
-@Deprecated(old="ray.rllib.utils.torch_utils.atanh", new="torch.math.atanh", error=True)
-def atanh(x: TensorType) -> TensorType:
-    pass
+    return {"grad_gnorm": grad_gnorm}
 
 
 @PublicAPI
+def clip_gradients(
+    gradients_dict: "ParamDict",
+    *,
+    grad_clip: Optional[float] = None,
+    grad_clip_by: str = "value",
+) -> TensorType:
+    """Performs gradient clipping on a grad-dict based on a clip value and clip mode.
+
+    Changes the provided gradient dict in place.
+
+    Args:
+        gradients_dict: The gradients dict, mapping str to gradient tensors.
+        grad_clip: The value to clip with. The way gradients are clipped is defined
+            by the `grad_clip_by` arg (see below).
+        grad_clip_by: One of 'value', 'norm', or 'global_norm'.
+
+    Returns:
+        If `grad_clip_by`="global_norm" and `grad_clip` is not None, returns the global
+        norm of all tensors, otherwise returns None.
+    """
+    # No clipping, return.
+    if grad_clip is None:
+        return
+
+    if grad_clip_by not in ["value", "norm", "global_norm"]:
+        raise ValueError(
+            f"`grad_clip_by` ({grad_clip_by}) must be one of [value|norm|global_norm]!"
+        )
+
+    # Clip by value (each gradient individually).
+    if grad_clip_by == "value":
+        for k, v in gradients_dict.items():
+            gradients_dict[k] = (
+                None if v is None else torch.clip(v, -grad_clip, grad_clip)
+            )
+
+    # Clip by L2-norm (per gradient tensor).
+    elif grad_clip_by == "norm":
+        for k, v in gradients_dict.items():
+            if v is not None:
+                # Compute the L2-norm of the gradient tensor.
+                norm = v.norm(2).nan_to_num(neginf=-10e8, posinf=10e8)
+                # Clip all the gradients.
+                if norm > grad_clip:
+                    v.mul_(grad_clip / norm)
+
+    # Clip by global L2-norm (across all gradient tensors).
+    else:
+        gradients_list = list(gradients_dict.values())
+        total_norm = compute_global_norm(gradients_list)
+        if len(gradients_list) == 0:
+            return total_norm
+        # We do want the coefficient to be in between 0.0 and 1.0, therefore
+        # if the global_norm is smaller than the clip value, we use the clip value
+        # as normalization constant.
+        clip_coeff = grad_clip / torch.clamp(total_norm + 1e-6, min=grad_clip)
+        # Note: multiplying by the clamped coefficient is redundant when the coefficient
+        # is clamped to 1, but doing so avoids a `if clip_coeff < 1:` conditional which
+        # can require a CPU <=> device synchronization when the gradients reside in GPU
+        # memory.
+        clip_coeff_clamped = torch.clamp(clip_coeff, max=1.0)
+        for g in gradients_list:
+            if g is not None:
+                g.detach().mul_(clip_coeff_clamped.to(g.device))
+        return total_norm
+
+
+@PublicAPI
+def compute_global_norm(gradients_list: "ParamList") -> TensorType:
+    """Computes the global norm for a gradients dict.
+
+    Args:
+        gradients_list: The gradients list containing parameters.
+
+    Returns:
+        Returns the global norm of all tensors in `gradients_list`.
+    """
+    # Define the norm type to be L2.
+    norm_type = 2.0
+    # If we have no grads, return zero.
+    if len(gradients_list) == 0:
+        return torch.tensor(0.0)
+
+    # Compute the global norm.
+    total_norm = torch.norm(
+        torch.stack(
+            [
+                torch.norm(g.detach(), norm_type)
+                # Note, we want to avoid overflow in the norm computation, this does
+                # not affect the gradients themselves as we clamp by multiplying and
+                # not by overriding tensor values.
+                .nan_to_num(neginf=-10e8, posinf=10e8)
+                for g in gradients_list
+                if g is not None
+            ]
+        ),
+        norm_type,
+    ).nan_to_num(neginf=-10e8, posinf=10e8)
+
+    # Return the global norm.
+    return total_norm
+
+
+@OldAPIStack
 def concat_multi_gpu_td_errors(
     policy: Union["TorchPolicy", "TorchPolicyV2"]
 ) -> Dict[str, TensorType]:
@@ -108,61 +226,130 @@ def concat_multi_gpu_td_errors(
     }
 
 
-@Deprecated(new="ray/rllib/utils/numpy.py::convert_to_numpy", error=True)
-def convert_to_non_torch_type(stats: TensorStructType) -> TensorStructType:
-    pass
-
-
 @PublicAPI
-def convert_to_torch_tensor(x: TensorStructType, device: Optional[str] = None):
-    """Converts any struct to torch.Tensors.
+def convert_to_torch_tensor(
+    x,
+    device: Optional[str] = None,
+    pin_memory: bool = False,
+    use_stream: bool = False,
+    stream: Optional[Union["torch.cuda.Stream", "torch.cuda.classes.Stream"]] = None,
+):
+    """
+    Converts any (possibly nested) structure to torch.Tensors.
 
-    x: Any (possibly nested) struct, the values in which will be
-        converted and returned as a new struct with all leaves converted
-        to torch tensors.
+    Args:
+        x: The input structure whose leaves will be converted.
+        device: The device to create the tensor on (e.g. "cuda:0" or "cpu").
+        pin_memory: If True, calls `pin_memory()` on the created tensors.
+        use_stream: If True, uses a separate CUDA stream for `Tensor.to()`.
+        stream: An optional CUDA stream for the host-to-device copy in `Tensor.to()`.
 
     Returns:
-        Any: A new struct with the same structure as `x`, but with all
-            values converted to torch Tensor types.
+        A new structure with the same layout as `x` but with all leaves converted
+        to torch.Tensors. Leaves that are None are left unchanged.
     """
 
-    def mapping(item):
-        if item is None:
-            # returns None with dtype=np.obj
-            return np.asarray(item)
+    # Convert the provided device (if any) to a torch.device; default to CPU.
+    device = torch.device(device) if device is not None else torch.device("cpu")
+    is_cuda = (device.type == "cuda") and torch.cuda.is_available()
 
-        # Special handling of "Repeated" values.
+    # Determine the appropriate stream.
+    if is_cuda:
+        if use_stream:
+            if stream is not None:
+                # Ensure the provided stream is of an acceptable type.
+                assert isinstance(
+                    stream, (torch.cuda.Stream, torch.cuda.classes.Stream)
+                ), f"`stream` must be a torch.cuda.Stream but got {type(stream)}."
+            else:
+                stream = torch.cuda.Stream()
+        else:
+            stream = torch.cuda.default_stream(device=device)
+    else:
+        stream = None
+
+    def mapping(item):
+        # Pass through None values.
+        if item is None:
+            return item
+
+        # Special handling for "RepeatedValues" types.
         if isinstance(item, RepeatedValues):
             return RepeatedValues(
-                tree.map_structure(mapping, item.values), item.lengths, item.max_len
+                tree.map_structure(mapping, item.values),
+                item.lengths,
+                item.max_len,
             )
 
-        tensor = None
-        # Already torch tensor -> make sure it's on right device.
+        # Convert to a tensor if not already one.
         if torch.is_tensor(item):
             tensor = item
-        # Numpy arrays.
         elif isinstance(item, np.ndarray):
-            # Object type (e.g. info dicts in train batch): leave as-is.
-            if item.dtype == object:
+            # Leave object or string arrays as is.
+            if item.dtype == object or item.dtype.type is np.str_:
                 return item
-            # Non-writable numpy-arrays will cause PyTorch warning.
-            elif item.flags.writeable is False:
+            # If the numpy array is not writable, suppress warnings.
+            if not item.flags.writeable:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     tensor = torch.from_numpy(item)
-            # Already numpy: Wrap as torch tensor.
             else:
                 tensor = torch.from_numpy(item)
-        # Everything else: Convert to numpy, then wrap as torch tensor.
         else:
             tensor = torch.from_numpy(np.asarray(item))
 
-        # Floatify all float64 tensors.
-        if tensor.is_floating_point():
+        # Convert floating-point tensors from float64 to float32 (unless they are float16).
+        if tensor.is_floating_point() and tensor.dtype != torch.float16:
             tensor = tensor.float()
 
-        return tensor if device is None else tensor.to(device)
+        # Optionally pin memory for faster host-to-GPU copies.
+        if pin_memory and is_cuda:
+            tensor = tensor.pin_memory()
+
+        # Move the tensor to the desired device.
+        # For CUDA devices, use the provided stream context if available.
+        if is_cuda:
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    tensor = tensor.to(device, non_blocking=True)
+            else:
+                tensor = tensor.to(device, non_blocking=True)
+        else:
+            # For CPU (or non-CUDA), this is a no-op if already on the target device.
+            tensor = tensor.to(device)
+
+        return tensor
+
+    return tree.map_structure(mapping, x)
+
+
+@PublicAPI
+def copy_torch_tensors(x: TensorStructType, device: Optional[str] = None):
+    """Creates a copy of `x` and makes deep copies torch.Tensors in x.
+
+    Also moves the copied tensors to the specified device (if not None).
+
+    Note if an object in x is not a torch.Tensor, it will be shallow-copied.
+
+    Args:
+        x : Any (possibly nested) struct possibly containing torch.Tensors.
+        device : The device to move the tensors to.
+
+    Returns:
+        Any: A new struct with the same structure as `x`, but with all
+            torch.Tensors deep-copied and moved to the specified device.
+
+    """
+
+    def mapping(item):
+        if isinstance(item, torch.Tensor):
+            return (
+                torch.clone(item.detach())
+                if device is None
+                else item.detach().to(device)
+            )
+        else:
+            return item
 
     return tree.map_structure(mapping, x)
 
@@ -182,12 +369,9 @@ def explained_variance(y: TensorType, pred: TensorType) -> TensorType:
         The explained variance given a pair of labels and predictions.
     """
     y_var = torch.var(y, dim=[0])
-    if y_var == 0.0:
-        # Model case in which y does not vary with explained variance of -1
-        return torch.tensor(-1.0).to(pred.device)
     diff_var = torch.var(y - pred, dim=[0])
     min_ = torch.tensor([-1.0]).to(pred.device)
-    return torch.max(min_, 1 - (diff_var / y_var))[0]
+    return torch.max(min_, 1 - (diff_var / (y_var + SMALL_NUMBER)))[0]
 
 
 @PublicAPI
@@ -223,27 +407,43 @@ def flatten_inputs_to_1d_tensor(
         flattened/one-hot'd input components. Depending on the time_axis flag,
         the shape is (B, n) or (B, T, n).
 
-    Examples:
-        >>> # B=2
-        >>> from ray.rllib.utils.tf_utils import flatten_inputs_to_1d_tensor
-        >>> from gym.spaces import Discrete, Box
-        >>> out = flatten_inputs_to_1d_tensor( # doctest: +SKIP
-        ...     {"a": [1, 0], "b": [[[0.0], [0.1]], [1.0], [1.1]]},
-        ...     spaces_struct=dict(a=Discrete(2), b=Box(shape=(2, 1))))
-        ... ) # doctest: +SKIP
-        >>> print(out) # doctest: +SKIP
-        [[0.0, 1.0,  0.0, 0.1], [1.0, 0.0,  1.0, 1.1]]  # B=2 n=4
+    .. testcode::
 
-        >>> # B=2; T=2
-        >>> out = flatten_inputs_to_1d_tensor( # doctest: +SKIP
-        ...     ([[1, 0], [0, 1]],
-        ...      [[[0.0, 0.1], [1.0, 1.1]], [[2.0, 2.1], [3.0, 3.1]]]),
-        ...     spaces_struct=tuple([Discrete(2), Box(shape=(2, ))]),
-        ...     time_axis=True
-        ... ) # doctest: +SKIP
-        >>> print(out) # doctest: +SKIP
-        [[[0.0, 1.0, 0.0, 0.1], [1.0, 0.0, 1.0, 1.1]],\
-        [[1.0, 0.0, 2.0, 2.1], [0.0, 1.0, 3.0, 3.1]]]  # B=2 T=2 n=4
+        from gymnasium.spaces import Discrete, Box
+        from ray.rllib.utils.torch_utils import flatten_inputs_to_1d_tensor
+        import torch
+        struct = {
+            "a": np.array([1, 3]),
+            "b": (
+                np.array([[1.0, 2.0], [4.0, 5.0]]),
+                np.array(
+                    [[[8.0], [7.0]], [[5.0], [4.0]]]
+                ),
+            ),
+                "c": {
+                    "cb": np.array([1.0, 2.0]),
+                },
+        }
+        struct_torch = tree.map_structure(lambda s: torch.from_numpy(s), struct)
+        spaces = dict(
+            {
+                "a": gym.spaces.Discrete(4),
+                "b": (gym.spaces.Box(-1.0, 10.0, (2,)), gym.spaces.Box(-1.0, 1.0, (2,
+                        1))),
+                "c": dict(
+                    {
+                        "cb": gym.spaces.Box(-1.0, 1.0, ()),
+                    }
+                ),
+            }
+        )
+        print(flatten_inputs_to_1d_tensor(struct_torch, spaces_struct=spaces))
+
+    .. testoutput::
+
+        tensor([[0., 1., 0., 0., 1., 2., 8., 7., 1.],
+                [0., 0., 0., 1., 4., 5., 5., 4., 2.]])
+
     """
 
     flat_inputs = tree.flatten(inputs)
@@ -290,50 +490,6 @@ def flatten_inputs_to_1d_tensor(
 
 
 @PublicAPI
-def get_device(config):
-    """Returns a torch device edepending on a config and current worker index."""
-
-    # Figure out the number of GPUs to use on the local side (index=0) or on
-    # the remote workers (index > 0).
-    worker_idx = config.get("worker_index", 0)
-    if (
-        not config["_fake_gpus"]
-        and ray._private.worker._mode() == ray._private.worker.LOCAL_MODE
-    ):
-        num_gpus = 0
-    elif worker_idx == 0:
-        num_gpus = config["num_gpus"]
-    else:
-        num_gpus = config["num_gpus_per_worker"]
-    # All GPU IDs, if any.
-    gpu_ids = list(range(torch.cuda.device_count()))
-
-    # Place on one or more CPU(s) when either:
-    # - Fake GPU mode.
-    # - num_gpus=0 (either set by user or we are in local_mode=True).
-    # - No GPUs available.
-    if config["_fake_gpus"] or num_gpus == 0 or not gpu_ids:
-        return torch.device("cpu")
-    # Place on one or more actual GPU(s), when:
-    # - num_gpus > 0 (set by user) AND
-    # - local_mode=False AND
-    # - actual GPUs available AND
-    # - non-fake GPU mode.
-    else:
-        # We are a remote worker (WORKER_MODE=1):
-        # GPUs should be assigned to us by ray.
-        if ray._private.worker._mode() == ray._private.worker.WORKER_MODE:
-            gpu_ids = ray.get_gpu_ids()
-
-        if len(gpu_ids) < num_gpus:
-            raise ValueError(
-                "TorchPolicy was not able to find enough GPU IDs! Found "
-                f"{gpu_ids}, but num_gpus={num_gpus}."
-            )
-        return torch.device("cuda")
-
-
-@PublicAPI
 def global_norm(tensors: List[TensorType]) -> TensorType:
     """Returns the global L2 norm over a list of tensors.
 
@@ -352,7 +508,7 @@ def global_norm(tensors: List[TensorType]) -> TensorType:
     return torch.pow(sum(torch.pow(l2, 2.0) for l2 in single_l2s), 0.5)
 
 
-@PublicAPI
+@OldAPIStack
 def huber_loss(x: TensorType, delta: float = 1.0) -> TensorType:
     """Computes the huber loss for a given term and delta parameter.
 
@@ -377,7 +533,7 @@ def huber_loss(x: TensorType, delta: float = 1.0) -> TensorType:
     )
 
 
-@PublicAPI
+@OldAPIStack
 def l2_loss(x: TensorType) -> TensorType:
     """Computes half the L2 norm over a tensor's values without the sqrt.
 
@@ -390,27 +546,6 @@ def l2_loss(x: TensorType) -> TensorType:
         0.5 times the L2 norm over the given tensor's values (w/o sqrt).
     """
     return 0.5 * torch.sum(torch.pow(x, 2.0))
-
-
-@PublicAPI
-def minimize_and_clip(
-    optimizer: "torch.optim.Optimizer", clip_val: float = 10.0
-) -> None:
-    """Clips grads found in `optimizer.param_groups` to given value in place.
-
-    Ensures the norm of the gradients for each variable is clipped to
-    `clip_val`.
-
-    Args:
-        optimizer: The torch.optim.Optimizer to get the variables from.
-        clip_val: The global norm clip value. Will clip around -clip_val and
-            +clip_val.
-    """
-    # Loop through optimizer's variables and norm per variable.
-    for param_group in optimizer.param_groups:
-        for p in param_group["params"]:
-            if p.grad is not None:
-                torch.nn.utils.clip_grad_norm_(p.grad, clip_val)
 
 
 @PublicAPI
@@ -429,24 +564,26 @@ def one_hot(x: TensorType, space: gym.Space) -> TensorType:
     Raises:
         ValueError: If the given space is not a discrete one.
 
-    Examples:
-        >>> import torch
-        >>> import gym
-        >>> from ray.rllib.utils.torch_utils import one_hot
-        >>> x = torch.IntTensor([0, 3])  # batch-dim=2
-        >>> # Discrete space with 4 (one-hot) slots per batch item.
-        >>> s = gym.spaces.Discrete(4)
-        >>> one_hot(x, s) # doctest: +SKIP
-        tensor([[1, 0, 0, 0], [0, 0, 0, 1]])
-        >>> x = torch.IntTensor([[0, 1, 2, 3]])  # batch-dim=1
-        >>> # MultiDiscrete space with 5 + 4 + 4 + 7 = 20 (one-hot) slots
-        >>> # per batch item.
-        >>> s = gym.spaces.MultiDiscrete([5, 4, 4, 7])
-        >>> one_hot(x, s) # doctest: +SKIP
-        tensor([[1, 0, 0, 0, 0,
-                 0, 1, 0, 0,
-                 0, 0, 1, 0,
-                 0, 0, 0, 1, 0, 0, 0]])
+    .. testcode::
+
+        import torch
+        import gymnasium as gym
+        from ray.rllib.utils.torch_utils import one_hot
+        x = torch.IntTensor([0, 3])  # batch-dim=2
+        # Discrete space with 4 (one-hot) slots per batch item.
+        s = gym.spaces.Discrete(4)
+        print(one_hot(x, s))
+        x = torch.IntTensor([[0, 1, 2, 3]])  # batch-dim=1
+        # MultiDiscrete space with 5 + 4 + 4 + 7 = 20 (one-hot) slots
+        # per batch item.
+        s = gym.spaces.MultiDiscrete([5, 4, 4, 7])
+        print(one_hot(x, s))
+
+    .. testoutput::
+
+        tensor([[1, 0, 0, 0],
+                [0, 0, 0, 1]])
+        tensor([[1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0]])
     """
     if isinstance(space, Discrete):
         return nn.functional.one_hot(x.long(), space.n)
@@ -506,12 +643,11 @@ def sequence_mask(
     """
     # If maxlen not given, use the longest lengths in the `lengths` tensor.
     if maxlen is None:
-        maxlen = int(lengths.max())
+        maxlen = lengths.max()
 
-    mask = ~(
-        torch.ones((len(lengths), maxlen)).to(lengths.device).cumsum(dim=1).t()
-        > lengths
-    )
+    mask = torch.ones(tuple(lengths.shape) + (int(maxlen),))
+
+    mask = ~(mask.to(lengths.device).cumsum(dim=1).t() > lengths)
     # Time major transformation.
     if not time_major:
         mask = mask.t()
@@ -520,6 +656,36 @@ def sequence_mask(
     mask.type(dtype or torch.bool)
 
     return mask
+
+
+@PublicAPI
+def update_target_network(
+    main_net: NetworkType,
+    target_net: NetworkType,
+    tau: float,
+) -> None:
+    """Updates a torch.nn.Module target network using Polyak averaging.
+
+    .. code-block:: text
+
+        new_target_net_weight = (
+            tau * main_net_weight + (1.0 - tau) * current_target_net_weight
+        )
+
+    Args:
+        main_net: The nn.Module to update from.
+        target_net: The target network to update.
+        tau: The tau value to use in the Polyak averaging formula.
+    """
+    # Get the current parameters from the Q network.
+    state_dict = main_net.state_dict()
+    # Use here Polyak averaging.
+    new_state_dict = {
+        k: tau * state_dict[k] + (1 - tau) * v
+        for k, v in target_net.state_dict().items()
+    }
+    # Apply the new parameters to the target Q network.
+    target_net.load_state_dict(new_state_dict)
 
 
 @DeveloperAPI
@@ -575,11 +741,12 @@ def softmax_cross_entropy_with_logits(
     return torch.sum(-labels * nn.functional.log_softmax(logits, -1), -1)
 
 
-@PublicAPI
-class Swish(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._beta = nn.Parameter(torch.tensor(1.0))
+def _dynamo_is_available():
+    # This only works if torch._dynamo is available
+    try:
+        # TODO(Artur): Remove this once torch._dynamo is available on CI
+        import torch._dynamo as dynamo  # noqa: F401
 
-    def forward(self, input_tensor):
-        return input_tensor * torch.sigmoid(self._beta * input_tensor)
+        return True
+    except ImportError:
+        return False

@@ -6,27 +6,39 @@ import functools
 import logging
 import os
 import threading
-import tree  # pip install dm_tree
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
-from ray.rllib.evaluation.episode import Episode
+import tree  # pip install dm_tree
+
 from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.models.repeated_values import RepeatedValues
 from ray.rllib.policy.policy import Policy, PolicyState
 from ray.rllib.policy.rnn_sequencing import pad_batch_to_sequences_of_same_size
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils import add_mixins, force_list
-from ray.rllib.utils.annotations import DeveloperAPI, override
-from ray.rllib.utils.deprecation import DEPRECATED_VALUE, deprecation_warning
+from ray.rllib.utils.annotations import OldAPIStack, override
+from ray.rllib.utils.deprecation import (
+    DEPRECATED_VALUE,
+    deprecation_warning,
+)
 from ray.rllib.utils.error import ERR_MSG_TF_POLICY_CANNOT_SAVE_KERAS_MODEL
 from ray.rllib.utils.framework import try_import_tf
-from ray.rllib.utils.metrics import NUM_AGENT_STEPS_TRAINED
+from ray.rllib.utils.metrics import (
+    DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY,
+    NUM_AGENT_STEPS_TRAINED,
+    NUM_GRAD_UPDATES_LIFETIME,
+)
 from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
 from ray.rllib.utils.numpy import convert_to_numpy
 from ray.rllib.utils.spaces.space_utils import normalize_action
 from ray.rllib.utils.tf_utils import get_gpu_devices
 from ray.rllib.utils.threading import with_lock
-from ray.rllib.utils.typing import LocalOptimizer, ModelGradients, TensorType
+from ray.rllib.utils.typing import (
+    LocalOptimizer,
+    ModelGradients,
+    TensorType,
+    TensorStructType,
+)
 from ray.util.debug import log_once
 
 tf1, tf, tfv = try_import_tf()
@@ -131,7 +143,7 @@ def _check_too_many_retraces(obj):
     return _func
 
 
-@DeveloperAPI
+@OldAPIStack
 class EagerTFPolicy(Policy):
     """Dummy class to recognize any eagerized TFPolicy by its inheritance."""
 
@@ -160,7 +172,7 @@ def _traced_eager_policy(eager_policy_cls):
             input_dict: Dict[str, TensorType],
             explore: bool = None,
             timestep: Optional[int] = None,
-            episodes: Optional[List[Episode]] = None,
+            episodes=None,
             **kwargs,
         ) -> Tuple[TensorType, List[TensorType], Dict[str, TensorType]]:
             """Traced version of Policy.compute_actions_from_input_dict."""
@@ -171,7 +183,7 @@ def _traced_eager_policy(eager_policy_cls):
                     tf.function(
                         super(TracedEagerPolicy, self)._compute_actions_helper,
                         autograph=False,
-                        experimental_relax_shapes=True,
+                        reduce_retracing=True,
                     )
                 )
                 self._traced_compute_actions_helper = True
@@ -197,7 +209,7 @@ def _traced_eager_policy(eager_policy_cls):
                     tf.function(
                         super(TracedEagerPolicy, self)._learn_on_batch_helper,
                         autograph=False,
-                        experimental_relax_shapes=True,
+                        reduce_retracing=True,
                     )
                 )
                 self._traced_learn_on_batch_helper = True
@@ -217,7 +229,7 @@ def _traced_eager_policy(eager_policy_cls):
                     tf.function(
                         super(TracedEagerPolicy, self)._compute_gradients_helper,
                         autograph=False,
-                        experimental_relax_shapes=True,
+                        reduce_retracing=True,
                     )
                 )
                 self._traced_compute_gradients_helper = True
@@ -237,7 +249,7 @@ def _traced_eager_policy(eager_policy_cls):
                     tf.function(
                         super(TracedEagerPolicy, self)._apply_gradients_helper,
                         autograph=False,
-                        experimental_relax_shapes=True,
+                        reduce_retracing=True,
                     )
                 )
                 self._traced_apply_gradients_helper = True
@@ -264,6 +276,7 @@ class _OptimizerWrapper:
         return list(zip(self.tape.gradient(loss, var_list), var_list))
 
 
+@OldAPIStack
 def _build_eager_tf_policy(
     name,
     loss_fn,
@@ -304,17 +317,15 @@ def _build_eager_tf_policy(
     base = add_mixins(EagerTFPolicy, mixins)
 
     if obs_include_prev_action_reward != DEPRECATED_VALUE:
-        deprecation_warning(old="obs_include_prev_action_reward", error=False)
+        deprecation_warning(old="obs_include_prev_action_reward", error=True)
 
     if extra_action_fetches_fn is not None:
         deprecation_warning(
-            old="extra_action_fetches_fn", new="extra_action_out_fn", error=False
+            old="extra_action_fetches_fn", new="extra_action_out_fn", error=True
         )
-        extra_action_out_fn = extra_action_fetches_fn
 
     if gradients_fn is not None:
-        deprecation_warning(old="gradients_fn", new="compute_gradients_fn", error=False)
-        compute_gradients_fn = gradients_fn
+        deprecation_warning(old="gradients_fn", new="compute_gradients_fn", error=True)
 
     class eager_policy_cls(base):
         def __init__(self, observation_space, action_space, config):
@@ -370,9 +381,6 @@ def _build_eager_tf_policy(
             )
             self._max_seq_len = config["model"]["max_seq_len"]
 
-            if get_default_config:
-                config = dict(get_default_config(), **config)
-
             if validate_spaces:
                 validate_spaces(self, observation_space, action_space, config)
 
@@ -411,13 +419,12 @@ def _build_eager_tf_policy(
 
             # Auto-update model's inference view requirements, if recurrent.
             self._update_model_view_requirements_from_init_state()
+            # Combine view_requirements for Model and Policy.
+            self.view_requirements.update(self.model.view_requirements)
 
             self.exploration = self._create_exploration()
             self._state_inputs = self.model.get_initial_state()
             self._is_recurrent = len(self._state_inputs) > 0
-
-            # Combine view_requirements for Model and Policy.
-            self.view_requirements.update(self.model.view_requirements)
 
             if before_loss_init:
                 before_loss_init(self, observation_space, action_space, config)
@@ -427,7 +434,7 @@ def _build_eager_tf_policy(
             else:
                 optimizers = tf.keras.optimizers.Adam(config["lr"])
             optimizers = force_list(optimizers)
-            if getattr(self, "exploration", None):
+            if self.exploration:
                 optimizers = self.exploration.get_exploration_optimizer(optimizers)
 
             # The list of local (tf) optimizers (one per loss term).
@@ -454,10 +461,9 @@ def _build_eager_tf_policy(
             input_dict: Dict[str, TensorType],
             explore: bool = None,
             timestep: Optional[int] = None,
-            episodes: Optional[List[Episode]] = None,
+            episodes=None,
             **kwargs,
         ) -> Tuple[TensorType, List[TensorType], Dict[str, TensorType]]:
-
             if not self.config.get("eager_tracing") and not tf1.executing_eagerly():
                 tf1.enable_eager_execution()
 
@@ -499,16 +505,16 @@ def _build_eager_tf_policy(
         @override(Policy)
         def compute_actions(
             self,
-            obs_batch,
-            state_batches=None,
-            prev_action_batch=None,
-            prev_reward_batch=None,
-            info_batch=None,
-            episodes=None,
-            explore=None,
-            timestep=None,
+            obs_batch: Union[List[TensorStructType], TensorStructType],
+            state_batches: Optional[List[TensorType]] = None,
+            prev_action_batch: Union[List[TensorStructType], TensorStructType] = None,
+            prev_reward_batch: Union[List[TensorStructType], TensorStructType] = None,
+            info_batch: Optional[Dict[str, list]] = None,
+            episodes: Optional[List] = None,
+            explore: Optional[bool] = None,
+            timestep: Optional[int] = None,
             **kwargs,
-        ):
+        ) -> Tuple[TensorType, List[TensorType], Dict[str, TensorType]]:
             # Create input dict to simply pass the entire call to
             # self.compute_actions_from_input_dict().
             input_dict = SampleBatch(
@@ -545,6 +551,7 @@ def _build_eager_tf_policy(
             prev_action_batch=None,
             prev_reward_batch=None,
             actions_normalized=True,
+            **kwargs,
         ):
             if action_sampler_fn and action_distribution_fn is None:
                 raise ValueError(
@@ -567,8 +574,9 @@ def _build_eager_tf_policy(
                     prev_reward_batch
                 )
 
-            # Exploration hook before each forward pass.
-            self.exploration.before_compute_actions(explore=False)
+            if self.exploration:
+                # Exploration hook before each forward pass.
+                self.exploration.before_compute_actions(explore=False)
 
             # Action dist class and inputs are generated via custom function.
             if action_distribution_fn:
@@ -622,10 +630,20 @@ def _build_eager_tf_policy(
             postprocessed_batch = self._lazy_tensor_dict(postprocessed_batch)
             postprocessed_batch.set_training(True)
             stats = self._learn_on_batch_helper(postprocessed_batch)
+            self.num_grad_updates += 1
+
             stats.update(
                 {
                     "custom_metrics": learn_stats,
                     NUM_AGENT_STEPS_TRAINED: postprocessed_batch.count,
+                    NUM_GRAD_UPDATES_LIFETIME: self.num_grad_updates,
+                    # -1, b/c we have to measure this diff before we do the update
+                    # above.
+                    DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY: (
+                        self.num_grad_updates
+                        - 1
+                        - (postprocessed_batch.num_grad_updates or 0)
+                    ),
                 }
             )
             return convert_to_numpy(stats)
@@ -634,7 +652,6 @@ def _build_eager_tf_policy(
         def compute_gradients(
             self, postprocessed_batch: SampleBatch
         ) -> Tuple[ModelGradients, Dict[str, TensorType]]:
-
             pad_batch_to_sequences_of_same_size(
                 postprocessed_batch,
                 shuffle=False,
@@ -706,7 +723,10 @@ def _build_eager_tf_policy(
             if self._optimizer and len(self._optimizer.variables()) > 0:
                 state["_optimizer_variables"] = self._optimizer.variables()
             # Add exploration state.
-            state["_exploration_state"] = self.exploration.get_state()
+            if self.exploration:
+                # This is not compatible with RLModules, which have a method
+                # `forward_exploration` to specify custom exploration behavior.
+                state["_exploration_state"] = self.exploration.get_state()
             return state
 
         @override(Policy)
@@ -714,12 +734,15 @@ def _build_eager_tf_policy(
             # Set optimizer vars first.
             optimizer_vars = state.get("_optimizer_variables", None)
             if optimizer_vars and self._optimizer.variables():
-                logger.warning(
-                    "Cannot restore an optimizer's state for tf eager! Keras "
-                    "is not able to save the v1.x optimizers (from "
-                    "tf.compat.v1.train) since they aren't compatible with "
-                    "checkpoints."
-                )
+                if not type(self).__name__.endswith("_traced") and log_once(
+                    "set_state_optimizer_vars_tf_eager_policy_v2"
+                ):
+                    logger.warning(
+                        "Cannot restore an optimizer's state for tf eager! Keras "
+                        "is not able to save the v1.x optimizers (from "
+                        "tf.compat.v1.train) since they aren't compatible with "
+                        "checkpoints."
+                    )
                 for opt_var, value in zip(self._optimizer.variables(), optimizer_vars):
                     opt_var.assign(value)
             # Set exploration's state.
@@ -741,7 +764,7 @@ def _build_eager_tf_policy(
             within this TfModelV2 class that is-a tf.keras.Model. This base model
             will be used here for the export.
             TODO (kourosh): This restriction will be resolved once we move Policy and
-             ModelV2 to the new RLTrainer/RLModule APIs.
+            ModelV2 to the new Learner/RLModule APIs.
 
             Args:
                 export_dir: Local writable directory.
@@ -824,7 +847,6 @@ def _build_eager_tf_policy(
                         actions, logp = action_sampler_outputs
                 else:
                     if action_distribution_fn:
-
                         # Try new action_distribution_fn signature, supporting
                         # state_batches and seq_lens.
                         try:
@@ -1001,21 +1023,16 @@ def _build_eager_tf_policy(
                     )
 
         def _stats(self, outputs, samples, grads):
-
             fetches = {}
             if stats_fn:
-                fetches[LEARNER_STATS_KEY] = {
-                    k: v for k, v in stats_fn(outputs, samples).items()
-                }
+                fetches[LEARNER_STATS_KEY] = dict(stats_fn(outputs, samples))
             else:
                 fetches[LEARNER_STATS_KEY] = {}
 
             if extra_learn_fetches_fn:
-                fetches.update({k: v for k, v in extra_learn_fetches_fn(self).items()})
+                fetches.update(dict(extra_learn_fetches_fn(self)))
             if grad_stats_fn:
-                fetches.update(
-                    {k: v for k, v in grad_stats_fn(self, samples, grads).items()}
-                )
+                fetches.update(dict(grad_stats_fn(self, samples, grads)))
             return fetches
 
         def _lazy_tensor_dict(self, postprocessed_batch: SampleBatch):

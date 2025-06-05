@@ -24,6 +24,8 @@
 
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/asio/periodical_runner.h"
+#include "ray/util/event.h"
+#include "ray/util/event_label.h"
 
 namespace ray {
 /// Monitor the filesystem capacity ray is using.
@@ -68,7 +70,7 @@ class FileSystemMonitor {
   std::atomic<bool> over_capacity_;
   instrumented_io_context io_context_;
   std::thread monitor_thread_;
-  PeriodicalRunner runner_;
+  std::shared_ptr<PeriodicalRunner> runner_;
 };
 
 std::vector<std::string> ParseSpillingPaths(const std::string &spilling_config);

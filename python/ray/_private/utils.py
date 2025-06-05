@@ -1,47 +1,56 @@
 import binascii
+import contextlib
 import errno
 import functools
-import hashlib
 import importlib
 import inspect
+import json
 import logging
 import multiprocessing
 import os
+import platform
+import random
 import re
 import signal
+import string
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import uuid
 import warnings
+from collections import defaultdict
 from inspect import signature
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
+from subprocess import list2cmdline
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
-import grpc
-import numpy as np
-
-# Import psutil after ray so the packaged version is used.
-import psutil
 from google.protobuf import json_format
 
 import ray
 import ray._private.ray_constants as ray_constants
-from ray._private.tls_utils import load_certs_from_env
-from ray.core.generated.gcs_pb2 import ErrorTableData
 from ray.core.generated.runtime_env_common_pb2 import (
     RuntimeEnvInfo as ProtoRuntimeEnvInfo,
 )
 
+# Import psutil after ray so the packaged version is used.
+import psutil
+
 if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
 
-try:
-    from grpc import aio as aiogrpc
-except ImportError:
-    from grpc.experimental import aio as aiogrpc
+
+INT32_MAX = (2**31) - 1
 
 
 pwd = None
@@ -59,8 +68,28 @@ linux_prctl = None
 win32_job = None
 win32_AssignProcessToJobObject = None
 
-
 ENV_DISABLE_DOCKER_CPU_WARNING = "RAY_DISABLE_DOCKER_CPU_WARNING" in os.environ
+
+# This global variable is used for testing only
+_CALLED_FREQ = defaultdict(lambda: 0)
+_CALLED_FREQ_LOCK = threading.Lock()
+
+PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN = re.compile(
+    r"(.+)_group_(\d+)_([0-9a-zA-Z]+)"
+)
+PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN = re.compile(r"(.+)_group_([0-9a-zA-Z]+)")
+
+
+# Match the standard alphabet used for UUIDs.
+RANDOM_STRING_ALPHABET = string.ascii_lowercase + string.digits
+
+
+def get_random_alphanumeric_string(length: int):
+    """Generates random string of length consisting exclusively of
+    - Lower-case ASCII chars
+    - Digits
+    """
+    return "".join(random.choices(RANDOM_STRING_ALPHABET, k=length))
 
 
 def get_user_temp_dir():
@@ -123,14 +152,6 @@ def read_ray_address(temp_dir: Optional[str] = None) -> str:
         return f.read().strip()
 
 
-def _random_string():
-    id_hash = hashlib.shake_128()
-    id_hash.update(uuid.uuid4().bytes)
-    id_bytes = id_hash.digest(ray_constants.ID_SIZE)
-    assert len(id_bytes) == ray_constants.ID_SIZE
-    return id_bytes
-
-
 def format_error_message(exception_message: str, task_exception: bool = False):
     """Improve the formatting of an exception thrown by a remote function.
 
@@ -172,31 +193,10 @@ def push_error_to_driver(
     worker.core_worker.push_error(job_id, error_type, message, time.time())
 
 
-def construct_error_message(job_id, error_type, message, timestamp):
-    """Construct an ErrorTableData object.
-
-    Args:
-        job_id: The ID of the job that the error should go to. If this is
-            nil, then the error will go to all drivers.
-        error_type: The type of the error.
-        message: The error message.
-        timestamp: The time of the error.
-
-    Returns:
-        The ErrorTableData object.
-    """
-    data = ErrorTableData()
-    data.job_id = job_id.binary()
-    data.type = error_type
-    data.error_message = message
-    data.timestamp = timestamp
-    return data
-
-
 def publish_error_to_driver(
     error_type: str,
     message: str,
-    gcs_publisher,
+    gcs_client,
     job_id=None,
 ):
     """Push an error message to the driver to be printed in the background.
@@ -210,44 +210,17 @@ def publish_error_to_driver(
         error_type: The type of the error.
         message: The message that will be printed in the background
             on the driver.
-        gcs_publisher: The GCS publisher to use.
+        gcs_client: The GCS client to use.
         job_id: The ID of the driver to push the error message to. If this
             is None, then the message will be pushed to all drivers.
     """
     if job_id is None:
         job_id = ray.JobID.nil()
     assert isinstance(job_id, ray.JobID)
-    error_data = construct_error_message(job_id, error_type, message, time.time())
     try:
-        gcs_publisher.publish_error(job_id.hex().encode(), error_data)
+        gcs_client.publish_error(job_id.hex().encode(), error_type, message, job_id, 60)
     except Exception:
-        logger.exception(f"Failed to publish error {error_data}")
-
-
-def random_string():
-    """Generate a random string to use as an ID.
-
-    Note that users may seed numpy, which could cause this function to generate
-    duplicate IDs. Therefore, we need to seed numpy ourselves, but we can't
-    interfere with the state of the user's random number generator, so we
-    extract the state of the random number generator and reset it after we are
-    done.
-
-    TODO(rkn): If we want to later guarantee that these are generated in a
-    deterministic manner, then we will need to make some changes here.
-
-    Returns:
-        A random byte string of length ray_constants.ID_SIZE.
-    """
-    # Get the state of the numpy random number generator.
-    numpy_state = np.random.get_state()
-    # Try to use true randomness.
-    np.random.seed(None)
-    # Generate the random ID.
-    random_id = np.random.bytes(ray_constants.ID_SIZE)
-    # Reset the state of the numpy random number generator.
-    np.random.set_state(numpy_state)
-    return random_id
+        logger.exception(f"Failed to publish error: {message} [type {error_type}]")
 
 
 def decode(byte_str: str, allow_none: bool = False, encode_type: str = "utf-8"):
@@ -267,10 +240,7 @@ def decode(byte_str: str, allow_none: bool = False, encode_type: str = "utf-8"):
 
     if not isinstance(byte_str, bytes):
         raise ValueError(f"The argument {byte_str} must be a bytes object.")
-    if sys.version_info >= (3, 0):
-        return byte_str.decode(encode_type)
-    else:
-        return byte_str
+    return byte_str.decode(encode_type)
 
 
 def ensure_str(s, encoding="utf-8", errors="strict"):
@@ -282,7 +252,7 @@ def ensure_str(s, encoding="utf-8", errors="strict"):
     if isinstance(s, str):
         return s
     else:
-        assert isinstance(s, bytes)
+        assert isinstance(s, bytes), f"Expected str or bytes, got {type(s)}"
         return s.decode(encoding, errors)
 
 
@@ -296,8 +266,7 @@ def binary_to_task_id(binary_task_id):
 
 def binary_to_hex(identifier):
     hex_identifier = binascii.hexlify(identifier)
-    if sys.version_info >= (3, 0):
-        hex_identifier = hex_identifier.decode()
+    hex_identifier = hex_identifier.decode()
     return hex_identifier
 
 
@@ -319,48 +288,74 @@ def compute_driver_id_from_job(job_id):
     return ray.WorkerID(driver_id_str)
 
 
-def get_cuda_visible_devices():
-    """Get the device IDs in the CUDA_VISIBLE_DEVICES environment variable.
+def get_visible_accelerator_ids() -> Mapping[str, Optional[List[str]]]:
+    """Get the mapping from accelerator resource name
+    to the visible ids."""
 
-    Returns:
-        devices (List[str]): If CUDA_VISIBLE_DEVICES is set, returns a
-            list of strings representing the IDs of the visible GPUs.
-            If it is not set or is set to NoDevFiles, returns empty list.
+    from ray._private.accelerators import (
+        get_accelerator_manager_for_resource,
+        get_all_accelerator_resource_names,
+    )
+
+    return {
+        accelerator_resource_name: get_accelerator_manager_for_resource(
+            accelerator_resource_name
+        ).get_current_process_visible_accelerator_ids()
+        for accelerator_resource_name in get_all_accelerator_resource_names()
+    }
+
+
+def set_omp_num_threads_if_unset() -> bool:
+    """Set the OMP_NUM_THREADS to default to num cpus assigned to the worker
+
+    This function sets the environment variable OMP_NUM_THREADS for the worker,
+    if the env is not previously set and it's running in worker (WORKER_MODE).
+
+    Returns True if OMP_NUM_THREADS is set in this function.
+
     """
-    gpu_ids_str = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    num_threads_from_env = os.environ.get("OMP_NUM_THREADS")
+    if num_threads_from_env is not None:
+        # No ops if it's set
+        return False
 
-    if gpu_ids_str is None:
-        return None
+    # If unset, try setting the correct CPU count assigned.
+    runtime_ctx = ray.get_runtime_context()
+    if runtime_ctx.worker.mode != ray._private.worker.WORKER_MODE:
+        # Non worker mode, no ops.
+        return False
 
-    if gpu_ids_str == "":
-        return []
+    num_assigned_cpus = runtime_ctx.get_assigned_resources().get("CPU")
 
-    if gpu_ids_str == "NoDevFiles":
-        return []
+    if num_assigned_cpus is None:
+        # This is an actor task w/o any num_cpus specified, set it to 1
+        logger.debug(
+            "[ray] Forcing OMP_NUM_THREADS=1 to avoid performance "
+            "degradation with many workers (issue #6998). You can override this "
+            "by explicitly setting OMP_NUM_THREADS, or changing num_cpus."
+        )
+        num_assigned_cpus = 1
 
-    # GPU identifiers are given as strings representing integers or UUIDs.
-    return list(gpu_ids_str.split(","))
+    import math
+
+    # For num_cpu < 1: Set to 1.
+    # For num_cpus >= 1: Set to the floor of the actual assigned cpus.
+    omp_num_threads = max(math.floor(num_assigned_cpus), 1)
+    os.environ["OMP_NUM_THREADS"] = str(omp_num_threads)
+    return True
 
 
-last_set_gpu_ids = None
-
-
-def set_cuda_visible_devices(gpu_ids):
-    """Set the CUDA_VISIBLE_DEVICES environment variable.
-
-    Args:
-        gpu_ids (List[str]): List of strings representing GPU IDs.
+def set_visible_accelerator_ids() -> None:
+    """Set (CUDA_VISIBLE_DEVICES, ONEAPI_DEVICE_SELECTOR, HIP_VISIBLE_DEVICES,
+    NEURON_RT_VISIBLE_CORES, TPU_VISIBLE_CHIPS , HABANA_VISIBLE_MODULES ,...)
+    environment variables based on the accelerator runtime.
     """
-
-    if os.environ.get(ray_constants.NOSET_CUDA_VISIBLE_DEVICES_ENV_VAR):
-        return
-
-    global last_set_gpu_ids
-    if last_set_gpu_ids == gpu_ids:
-        return  # optimization: already set
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in gpu_ids])
-    last_set_gpu_ids = gpu_ids
+    for resource_name, accelerator_ids in (
+        ray.get_runtime_context().get_accelerator_ids().items()
+    ):
+        ray._private.accelerators.get_accelerator_manager_for_resource(
+            resource_name
+        ).set_current_process_visible_accelerator_ids(accelerator_ids)
 
 
 def resources_from_ray_options(options_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -383,6 +378,11 @@ def resources_from_ray_options(options_dict: Dict[str, Any]) -> Dict[str, Any]:
             "The resources dictionary must not "
             "contain the key 'memory' or 'object_store_memory'"
         )
+    elif ray_constants.PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME in resources:
+        raise ValueError(
+            "The resource should not include `bundle` which "
+            f"is reserved for Ray. resources: {resources}"
+        )
 
     num_cpus = options_dict.get("num_cpus")
     num_gpus = options_dict.get("num_gpus")
@@ -395,7 +395,7 @@ def resources_from_ray_options(options_dict: Dict[str, Any]) -> Dict[str, Any]:
     if num_gpus is not None:
         resources["GPU"] = num_gpus
     if memory is not None:
-        resources["memory"] = memory
+        resources["memory"] = int(memory)
     if object_store_memory is not None:
         resources["object_store_memory"] = object_store_memory
     if accelerator_type is not None:
@@ -602,7 +602,7 @@ def get_num_cpus(
             # TODO (Alex): We should probably add support for fractional cpus.
             if int(docker_count) != float(docker_count):
                 logger.warning(
-                    f"Ray currently does not support initializing Ray"
+                    f"Ray currently does not support initializing Ray "
                     f"with fractional cpus. Your num_cpus will be "
                     f"truncated from {docker_count} to "
                     f"{int(docker_count)}."
@@ -619,45 +619,38 @@ def get_num_cpus(
 
 
 # TODO(clarng): merge code with c++
-def get_cgroupv1_used_memory(filename):
-    with open(filename, "r") as f:
-        lines = f.readlines()
-        cache_bytes = -1
-        rss_bytes = -1
-        inactive_file_bytes = -1
-        working_set = -1
-        for line in lines:
-            if "total_rss " in line:
-                rss_bytes = int(line.split()[1])
-            elif "cache " in line:
-                cache_bytes = int(line.split()[1])
-            elif "inactive_file" in line:
-                inactive_file_bytes = int(line.split()[1])
-        if cache_bytes >= 0 and rss_bytes >= 0 and inactive_file_bytes >= 0:
-            working_set = rss_bytes + cache_bytes - inactive_file_bytes
-            assert working_set >= 0
-            return working_set
-        return None
-
-
-def get_cgroupv2_used_memory(stat_file, usage_file):
-    # Uses same calculation as libcontainer, that is:
-    # memory.current - memory.stat[inactive_file]
-    # Source: https://github.com/google/cadvisor/blob/24dd1de08a72cfee661f6178454db995900c0fee/container/libcontainer/handler.go#L836  # noqa: E501
+def get_cgroup_used_memory(
+    memory_stat_filename: str,
+    memory_usage_filename: str,
+    inactive_file_key: str,
+    active_file_key: str,
+):
+    """
+    The calculation logic is the same with `GetCGroupMemoryUsedBytes`
+    in `memory_monitor.cc` file.
+    """
     inactive_file_bytes = -1
-    current_usage = -1
-    with open(usage_file, "r") as f:
-        current_usage = int(f.read().strip())
-    with open(stat_file, "r") as f:
+    active_file_bytes = -1
+    with open(memory_stat_filename, "r") as f:
         lines = f.readlines()
         for line in lines:
-            if "inactive_file" in line:
+            if f"{inactive_file_key} " in line:
                 inactive_file_bytes = int(line.split()[1])
-        if current_usage >= 0 and inactive_file_bytes >= 0:
-            working_set = current_usage - inactive_file_bytes
-            assert working_set >= 0
-            return working_set
+            elif f"{active_file_key} " in line:
+                active_file_bytes = int(line.split()[1])
+
+    with open(memory_usage_filename, "r") as f:
+        lines = f.readlines()
+        cgroup_usage_in_bytes = int(lines[0].strip())
+
+    if (
+        inactive_file_bytes == -1
+        or cgroup_usage_in_bytes == -1
+        or active_file_bytes == -1
+    ):
         return None
+
+    return cgroup_usage_in_bytes - inactive_file_bytes - active_file_bytes
 
 
 def get_used_memory():
@@ -670,17 +663,28 @@ def get_used_memory():
     # container.
     docker_usage = None
     # For cgroups v1:
-    memory_usage_filename = "/sys/fs/cgroup/memory/memory.stat"
+    memory_usage_filename_v1 = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+    memory_stat_filename_v1 = "/sys/fs/cgroup/memory/memory.stat"
     # For cgroups v2:
     memory_usage_filename_v2 = "/sys/fs/cgroup/memory.current"
     memory_stat_filename_v2 = "/sys/fs/cgroup/memory.stat"
-    if os.path.exists(memory_usage_filename):
-        docker_usage = get_cgroupv1_used_memory(memory_usage_filename)
+    if os.path.exists(memory_usage_filename_v1) and os.path.exists(
+        memory_stat_filename_v1
+    ):
+        docker_usage = get_cgroup_used_memory(
+            memory_stat_filename_v1,
+            memory_usage_filename_v1,
+            "total_inactive_file",
+            "total_active_file",
+        )
     elif os.path.exists(memory_usage_filename_v2) and os.path.exists(
         memory_stat_filename_v2
     ):
-        docker_usage = get_cgroupv2_used_memory(
-            memory_stat_filename_v2, memory_usage_filename_v2
+        docker_usage = get_cgroup_used_memory(
+            memory_stat_filename_v2,
+            memory_usage_filename_v2,
+            "inactive_file",
+            "active_file",
         )
 
     if docker_usage is not None:
@@ -1168,40 +1172,11 @@ def deprecated(
     return deprecated_wrapper
 
 
-def import_attr(full_path: str):
-    """Given a full import path to a module attr, return the imported attr.
-
-    For example, the following are equivalent:
-        MyClass = import_attr("module.submodule:MyClass")
-        MyClass = import_attr("module.submodule.MyClass")
-        from module.submodule import MyClass
-
-    Returns:
-        Imported attr
-    """
-    if full_path is None:
-        raise TypeError("import path cannot be None")
-
-    if ":" in full_path:
-        if full_path.count(":") > 1:
-            raise ValueError(
-                f'Got invalid import path "{full_path}". An '
-                "import path may have at most one colon."
-            )
-        module_name, attr_name = full_path.split(":")
-    else:
-        last_period_idx = full_path.rfind(".")
-        module_name = full_path[:last_period_idx]
-        attr_name = full_path[last_period_idx + 1 :]
-
-    module = importlib.import_module(module_name)
-    return getattr(module, attr_name)
-
-
 def get_wheel_filename(
     sys_platform: str = sys.platform,
     ray_version: str = ray.__version__,
-    py_version: str = f"{sys.version_info.major}{sys.version_info.minor}",
+    py_version: Tuple[int, int] = (sys.version_info.major, sys.version_info.minor),
+    architecture: Optional[str] = None,
 ) -> str:
     """Returns the filename used for the nightly Ray wheel.
 
@@ -1210,28 +1185,42 @@ def get_wheel_filename(
             "darwin", "linux", "win32"
         ray_version: The Ray version as returned by ray.__version__ or
             `ray --version`.  Examples: "3.0.0.dev0"
-        py_version (str):
-            The major and minor Python versions concatenated.  Examples: "36",
-            "37", "38", "39"
+        py_version: The Python version as returned by sys.version_info. A
+            tuple of (major, minor). Examples: (3, 8)
+        architecture: Architecture, e.g. ``x86_64`` or ``aarch64``. If None, will
+            be determined by calling ``platform.processor()``.
+
     Returns:
         The wheel file name.  Examples:
             ray-3.0.0.dev0-cp38-cp38-manylinux2014_x86_64.whl
     """
-    assert py_version in ["36", "37", "38", "39"], py_version
+    assert py_version in ray_constants.RUNTIME_ENV_CONDA_PY_VERSIONS, py_version
+
+    py_version_str = "".join(map(str, py_version))
+
+    architecture = architecture or platform.processor()
+
+    if py_version_str in ["311", "310", "39", "38"] and architecture == "arm64":
+        darwin_os_string = "macosx_11_0_arm64"
+    else:
+        darwin_os_string = "macosx_10_15_x86_64"
+
+    if architecture == "aarch64":
+        linux_os_string = "manylinux2014_aarch64"
+    else:
+        linux_os_string = "manylinux2014_x86_64"
 
     os_strings = {
-        "darwin": "macosx_10_15_x86_64"
-        if py_version in ["38", "39"]
-        else "macosx_10_15_intel",
-        "linux": "manylinux2014_x86_64",
+        "darwin": darwin_os_string,
+        "linux": linux_os_string,
         "win32": "win_amd64",
     }
 
     assert sys_platform in os_strings, sys_platform
 
     wheel_filename = (
-        f"ray-{ray_version}-cp{py_version}-"
-        f"cp{py_version}{'m' if py_version in ['36', '37'] else ''}"
+        f"ray-{ray_version}-cp{py_version_str}-"
+        f"cp{py_version_str}{'m' if py_version_str in ['37'] else ''}"
         f"-{os_strings[sys_platform]}.whl"
     )
 
@@ -1242,7 +1231,7 @@ def get_master_wheel_url(
     ray_commit: str = ray.__commit__,
     sys_platform: str = sys.platform,
     ray_version: str = ray.__version__,
-    py_version: str = f"{sys.version_info.major}{sys.version_info.minor}",
+    py_version: Tuple[int, int] = sys.version_info[:2],
 ) -> str:
     """Return the URL for the wheel from a specific commit."""
     filename = get_wheel_filename(
@@ -1258,7 +1247,7 @@ def get_release_wheel_url(
     ray_commit: str = ray.__commit__,
     sys_platform: str = sys.platform,
     ray_version: str = ray.__version__,
-    py_version: str = f"{sys.version_info.major}{sys.version_info.minor}",
+    py_version: Tuple[int, int] = sys.version_info[:2],
 ) -> str:
     """Return the URL for the wheel for a specific release."""
     filename = get_wheel_filename(
@@ -1287,7 +1276,23 @@ def init_grpc_channel(
     options: Optional[Sequence[Tuple[str, Any]]] = None,
     asynchronous: bool = False,
 ):
+    import grpc
+    from grpc import aio as aiogrpc
+
+    from ray._private.tls_utils import load_certs_from_env
+
     grpc_module = aiogrpc if asynchronous else grpc
+
+    options = options or []
+    options_dict = dict(options)
+    options_dict["grpc.keepalive_time_ms"] = options_dict.get(
+        "grpc.keepalive_time_ms", ray._config.grpc_client_keepalive_time_ms()
+    )
+    options_dict["grpc.keepalive_timeout_ms"] = options_dict.get(
+        "grpc.keepalive_timeout_ms", ray._config.grpc_client_keepalive_timeout_ms()
+    )
+    options = options_dict.items()
+
     if os.environ.get("RAY_USE_TLS", "0").lower() in ("1", "true"):
         server_cert_chain, private_key, ca_cert = load_certs_from_env()
         credentials = grpc.ssl_channel_credentials(
@@ -1319,6 +1324,28 @@ def check_dashboard_dependencies_installed() -> bool:
         return False
 
 
+def check_ray_client_dependencies_installed() -> bool:
+    """Returns True if Ray Client dependencies are installed.
+
+    See documents for check_dashboard_dependencies_installed.
+    """
+    try:
+        import grpc  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+connect_error = (
+    "Unable to connect to GCS (ray head) at {}. "
+    "Check that (1) Ray with matching version started "
+    "successfully at the specified address, (2) this "
+    "node can reach the specified address, and (3) there is "
+    "no firewall setting preventing access."
+)
+
+
 def internal_kv_list_with_retry(gcs_client, prefix, namespace, num_retries=20):
     result = None
     if isinstance(prefix, str):
@@ -1329,16 +1356,11 @@ def internal_kv_list_with_retry(gcs_client, prefix, namespace, num_retries=20):
         try:
             result = gcs_client.internal_kv_keys(prefix, namespace)
         except Exception as e:
-            if isinstance(e, grpc.RpcError) and e.code() in (
-                grpc.StatusCode.UNAVAILABLE,
-                grpc.StatusCode.UNKNOWN,
+            if isinstance(e, ray.exceptions.RpcError) and e.rpc_code in (
+                ray._raylet.GRPC_STATUS_CODE_UNAVAILABLE,
+                ray._raylet.GRPC_STATUS_CODE_UNKNOWN,
             ):
-                logger.warning(
-                    f"Unable to connect to GCS at {gcs_client.address}. "
-                    "Check that (1) Ray GCS with matching version started "
-                    "successfully at the specified address, and (2) there is "
-                    "no firewall setting preventing access."
-                )
+                logger.warning(connect_error.format(gcs_client.address))
             else:
                 logger.exception("Internal KV List failed")
             result = None
@@ -1363,16 +1385,11 @@ def internal_kv_get_with_retry(gcs_client, key, namespace, num_retries=20):
         try:
             result = gcs_client.internal_kv_get(key, namespace)
         except Exception as e:
-            if isinstance(e, grpc.RpcError) and e.code() in (
-                grpc.StatusCode.UNAVAILABLE,
-                grpc.StatusCode.UNKNOWN,
+            if isinstance(e, ray.exceptions.RpcError) and e.rpc_code in (
+                ray._raylet.GRPC_STATUS_CODE_UNAVAILABLE,
+                ray._raylet.GRPC_STATUS_CODE_UNKNOWN,
             ):
-                logger.warning(
-                    f"Unable to connect to GCS at {gcs_client.address}. "
-                    "Check that (1) Ray GCS with matching version started "
-                    "successfully at the specified address, and (2) there is "
-                    "no firewall setting preventing access."
-                )
+                logger.warning(connect_error.format(gcs_client.address))
             else:
                 logger.exception("Internal KV Get failed")
             result = None
@@ -1389,6 +1406,48 @@ def internal_kv_get_with_retry(gcs_client, key, namespace, num_retries=20):
     return result
 
 
+def parse_resources_json(
+    resources: str, cli_logger, cf, command_arg="--resources"
+) -> Dict[str, float]:
+    try:
+        resources = json.loads(resources)
+        if not isinstance(resources, dict):
+            raise ValueError("The format after deserialization is not a dict")
+    except Exception as e:
+        cli_logger.error(
+            "`{}` is not a valid JSON string, detail error:{}",
+            cf.bold(f"{command_arg}={resources}"),
+            str(e),
+        )
+        cli_logger.abort(
+            "Valid values look like this: `{}`",
+            cf.bold(
+                f'{command_arg}=\'{{"CustomResource3": 1, "CustomResource2": 2}}\''
+            ),
+        )
+    return resources
+
+
+def parse_metadata_json(
+    metadata: str, cli_logger, cf, command_arg="--metadata-json"
+) -> Dict[str, str]:
+    try:
+        metadata = json.loads(metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("The format after deserialization is not a dict")
+    except Exception as e:
+        cli_logger.error(
+            "`{}` is not a valid JSON string, detail error:{}",
+            cf.bold(f"{command_arg}={metadata}"),
+            str(e),
+        )
+        cli_logger.abort(
+            "Valid values look like this: `{}`",
+            cf.bold(f'{command_arg}=\'{{"key1": "value1", "key2": "value2"}}\''),
+        )
+    return metadata
+
+
 def internal_kv_put_with_retry(gcs_client, key, value, namespace, num_retries=20):
     if isinstance(key, str):
         key = key.encode()
@@ -1402,22 +1461,17 @@ def internal_kv_put_with_retry(gcs_client, key, value, namespace, num_retries=20
             return gcs_client.internal_kv_put(
                 key, value, overwrite=True, namespace=namespace
             )
-        except grpc.RpcError as e:
-            if e.code() in (
-                grpc.StatusCode.UNAVAILABLE,
-                grpc.StatusCode.UNKNOWN,
+        except ray.exceptions.RpcError as e:
+            if e.rpc_code in (
+                ray._raylet.GRPC_STATUS_CODE_UNAVAILABLE,
+                ray._raylet.GRPC_STATUS_CODE_UNKNOWN,
             ):
-                logger.warning(
-                    f"Unable to connect to GCS at {gcs_client.address}. "
-                    "Check that (1) Ray GCS with matching version started "
-                    "successfully at the specified address, and (2) there is "
-                    "no firewall setting preventing access."
-                )
+                logger.warning(connect_error.format(gcs_client.address))
             else:
                 logger.exception("Internal KV Put failed")
             time.sleep(2)
             error = e
-    # Reraise the last grpc.RpcError.
+    # Reraise the last error.
     raise error
 
 
@@ -1445,11 +1499,34 @@ def get_directory_size_bytes(path: Union[str, Path] = ".") -> int:
     return total_size_bytes
 
 
-def check_version_info(cluster_metadata):
+def check_version_info(
+    cluster_metadata,
+    this_process_address,
+    raise_on_mismatch=True,
+    python_version_match_level="patch",
+):
     """Check if the Python and Ray versions stored in GCS matches this process.
     Args:
         cluster_metadata: Ray cluster metadata from GCS.
+        this_process_address: Informational only. The address of this process.
+            e.g. "node address:port" or "Ray Client".
+        raise_on_mismatch: Raise an exception on True, log a warning otherwise.
+        python_version_match_level: "minor" or "patch". To which python version level we
+            try to match. Note if "minor" and the patch is different, we will still log
+            a warning.
 
+    Behavior:
+        - We raise or log a warning, based on raise_on_mismatch, if:
+            - Ray versions do not match; OR
+            - Python (major, minor) versions do not match,
+                if python_version_match_level == 'minor'; OR
+            - Python (major, minor, patch) versions do not match,
+                if python_version_match_level == 'patch'.
+        - We also log a warning if:
+            - Python (major, minor) versions match, AND
+            - Python patch versions do not match, AND
+            - python_version_match_level == 'minor' AND
+            - raise_on_mismatch == False.
     Raises:
         Exception: An exception is raised if there is a version mismatch.
     """
@@ -1457,18 +1534,41 @@ def check_version_info(cluster_metadata):
         cluster_metadata["ray_version"],
         cluster_metadata["python_version"],
     )
-    version_info = compute_version_info()
-    if version_info != cluster_version_info:
-        node_ip_address = ray._private.services.get_node_ip_address()
-        error_message = (
-            "Version mismatch: The cluster was started with:\n"
-            "    Ray: " + cluster_version_info[0] + "\n"
-            "    Python: " + cluster_version_info[1] + "\n"
-            "This process on node " + node_ip_address + " was started with:" + "\n"
-            "    Ray: " + version_info[0] + "\n"
-            "    Python: " + version_info[1] + "\n"
+    my_version_info = compute_version_info()
+
+    # Calculate: ray_matches, python_matches, python_full_matches
+    ray_matches = cluster_version_info[0] == my_version_info[0]
+    python_full_matches = cluster_version_info[1] == my_version_info[1]
+    if python_version_match_level == "patch":
+        python_matches = cluster_version_info[1] == my_version_info[1]
+    elif python_version_match_level == "minor":
+        my_python_versions = my_version_info[1].split(".")
+        cluster_python_versions = cluster_version_info[1].split(".")
+        python_matches = my_python_versions[:2] == cluster_python_versions[:2]
+    else:
+        raise ValueError(
+            f"Invalid python_version_match_level: {python_version_match_level}, "
+            "want: 'minor' or 'patch'"
         )
-        raise RuntimeError(error_message)
+
+    mismatch_msg = (
+        "The cluster was started with:\n"
+        f"    Ray: {cluster_version_info[0]}\n"
+        f"    Python: {cluster_version_info[1]}\n"
+        f"This process on {this_process_address} was started with:\n"
+        f"    Ray: {my_version_info[0]}\n"
+        f"    Python: {my_version_info[1]}\n"
+    )
+
+    if ray_matches and python_matches:
+        if not python_full_matches:
+            logger.warning(f"Python patch version mismatch: {mismatch_msg}")
+    else:
+        error_message = f"Version mismatch: {mismatch_msg}"
+        if raise_on_mismatch:
+            raise RuntimeError(error_message)
+        else:
+            logger.warning(error_message)
 
 
 def get_runtime_env_info(
@@ -1482,7 +1582,8 @@ def get_runtime_env_info(
     In the user interface, the argument `runtime_env` contains some fields
     which not contained in `ProtoRuntimeEnv` but in `ProtoRuntimeEnvInfo`,
     such as `eager_install`. This function will extract those fields from
-    `RuntimeEnv` and create a new `ProtoRuntimeEnvInfo`, and serialize it.
+    `RuntimeEnv` and create a new `ProtoRuntimeEnvInfo`, and serialize it
+    into json format.
     """
     from ray.runtime_env import RuntimeEnvConfig
 
@@ -1533,15 +1634,20 @@ def get_runtime_env_info(
     return json_format.MessageToJson(proto_runtime_env_info)
 
 
-def parse_runtime_env(runtime_env: Optional[Union[Dict, "RuntimeEnv"]]):
+def parse_runtime_env_for_task_or_actor(
+    runtime_env: Optional[Union[Dict, "RuntimeEnv"]]
+):
     from ray.runtime_env import RuntimeEnv
+    from ray.runtime_env.runtime_env import _validate_no_local_paths
 
     # Parse local pip/conda config files here. If we instead did it in
     # .remote(), it would get run in the Ray Client server, which runs on
     # a remote node where the files aren't available.
     if runtime_env:
         if isinstance(runtime_env, dict):
-            return RuntimeEnv(**(runtime_env or {}))
+            runtime_env = RuntimeEnv(**(runtime_env or {}))
+            _validate_no_local_paths(runtime_env)
+            return runtime_env
         raise TypeError(
             "runtime_env must be dict or RuntimeEnv, ",
             f"but got: {type(runtime_env)}",
@@ -1571,10 +1677,249 @@ def split_address(address: str) -> Tuple[str, str]:
 
     Examples:
         >>> split_address("ray://my_cluster")
-        ("ray", "my_cluster")
+        ('ray', 'my_cluster')
     """
     if "://" not in address:
         raise ValueError("Address must contain '://'")
 
     module_string, inner_address = address.split("://", maxsplit=1)
     return (module_string, inner_address)
+
+
+def get_entrypoint_name():
+    """Get the entrypoint of the current script."""
+    prefix = ""
+    try:
+        curr = psutil.Process()
+        # Prepend `interactive_shell` for interactive shell scripts.
+        # https://stackoverflow.com/questions/2356399/tell-if-python-is-in-interactive-mode # noqa
+        if hasattr(sys, "ps1"):
+            prefix = "(interactive_shell) "
+
+        return prefix + list2cmdline(curr.cmdline())
+    except Exception:
+        return "unknown"
+
+
+class DeferSigint(contextlib.AbstractContextManager):
+    """Context manager that defers SIGINT signals until the context is left."""
+
+    # This is used by Ray's task cancellation to defer cancellation interrupts during
+    # problematic areas, e.g. task argument deserialization.
+    def __init__(self):
+        # Whether a SIGINT signal was received during the context.
+        self.signal_received = False
+        # The overridden SIGINT handler
+        self.overridden_sigint_handler = None
+        # The original signal method.
+        self.orig_signal = None
+
+    @classmethod
+    def create_if_main_thread(cls) -> contextlib.AbstractContextManager:
+        """Creates a DeferSigint context manager if running on the main thread,
+        returns a no-op context manager otherwise.
+        """
+        if threading.current_thread() == threading.main_thread():
+            return cls()
+        else:
+            return contextlib.nullcontext()
+
+    def _set_signal_received(self, signum, frame):
+        """SIGINT handler that defers the signal."""
+        self.signal_received = True
+
+    def _signal_monkey_patch(self, signum, handler):
+        """Monkey patch for signal.signal that defers the setting of new signal
+        handler after the DeferSigint context exits."""
+        # Only handle it in the main thread because if setting a handler in a non-main
+        # thread, signal.signal will raise an error because Python doesn't allow it.
+        if (
+            threading.current_thread() == threading.main_thread()
+            and signum == signal.SIGINT
+        ):
+            orig_sigint_handler = self.overridden_sigint_handler
+            self.overridden_sigint_handler = handler
+            return orig_sigint_handler
+        return self.orig_signal(signum, handler)
+
+    def __enter__(self):
+        # Save original SIGINT handler for later restoration.
+        self.overridden_sigint_handler = signal.getsignal(signal.SIGINT)
+        # Set SIGINT signal handler that defers the signal.
+        signal.signal(signal.SIGINT, self._set_signal_received)
+        # Monkey patch signal.signal to raise an error if a SIGINT handler is registered
+        # within the context.
+        self.orig_signal = signal.signal
+        signal.signal = self._signal_monkey_patch
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        assert self.overridden_sigint_handler is not None
+        assert self.orig_signal is not None
+        # Restore original signal.signal function.
+        signal.signal = self.orig_signal
+        # Restore overridden SIGINT handler.
+        signal.signal(signal.SIGINT, self.overridden_sigint_handler)
+        if exc_type is None and self.signal_received:
+            # No exception raised in context, call the original SIGINT handler.
+            # By default, this means raising KeyboardInterrupt.
+            self.overridden_sigint_handler(signal.SIGINT, None)
+        else:
+            # If exception was raised in context, returning False will cause it to be
+            # reraised.
+            return False
+
+
+def try_import_each_module(module_names_to_import: List[str]) -> None:
+    """
+    Make a best-effort attempt to import each named Python module.
+    This is used by the Python default_worker.py to preload modules.
+    """
+    for module_to_preload in module_names_to_import:
+        try:
+            importlib.import_module(module_to_preload)
+        except ImportError:
+            logger.exception(f'Failed to preload the module "{module_to_preload}"')
+
+
+def remove_ray_internal_flags_from_env(env: dict):
+    """
+    Remove Ray internal flags from `env`.
+    Defined in ray/common/ray_internal_flag_def.h
+    """
+    for flag in ray_constants.RAY_INTERNAL_FLAGS:
+        env.pop(flag, None)
+
+
+def update_envs(env_vars: Dict[str, str]):
+    """
+    When updating the environment variable, if there is ${X},
+    it will be replaced with the current environment variable.
+    """
+    if not env_vars:
+        return
+
+    for key, value in env_vars.items():
+        expanded = os.path.expandvars(value)
+        # Replace non-existant env vars with an empty string.
+        result = re.sub(r"\$\{[A-Z0-9_]+\}", "", expanded)
+        os.environ[key] = result
+
+
+def parse_pg_formatted_resources_to_original(
+    pg_formatted_resources: Dict[str, float]
+) -> Dict[str, float]:
+    original_resources = {}
+
+    for key, value in pg_formatted_resources.items():
+        result = PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN.match(key)
+        if result and len(result.groups()) == 3:
+            # Filter out resources that have bundle_group_[pg_id] since
+            # it is an implementation detail.
+            # This resource is automatically added to the resource
+            # request for all tasks that require placement groups.
+            if result.group(1) == ray_constants.PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME:
+                continue
+
+            original_resources[result.group(1)] = value
+            continue
+
+        result = PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN.match(key)
+        if result and len(result.groups()) == 2:
+            if result.group(1) == "bundle":
+                continue
+
+            original_resources[result.group(1)] = value
+            continue
+        original_resources[key] = value
+
+    return original_resources
+
+
+def load_class(path):
+    """Load a class at runtime given a full path.
+
+    Example of the path: mypkg.mysubpkg.myclass
+    """
+    class_data = path.split(".")
+    if len(class_data) < 2:
+        raise ValueError("You need to pass a valid path like mymodule.provider_class")
+    module_path = ".".join(class_data[:-1])
+    class_str = class_data[-1]
+    module = importlib.import_module(module_path)
+    return getattr(module, class_str)
+
+
+def validate_actor_state_name(actor_state_name):
+    if actor_state_name is None:
+        return
+    actor_state_names = [
+        "DEPENDENCIES_UNREADY",
+        "PENDING_CREATION",
+        "ALIVE",
+        "RESTARTING",
+        "DEAD",
+    ]
+    if actor_state_name not in actor_state_names:
+        raise ValueError(
+            f'"{actor_state_name}" is not a valid actor state name, '
+            'it must be one of the following: "DEPENDENCIES_UNREADY", '
+            '"PENDING_CREATION", "ALIVE", "RESTARTING", or "DEAD"'
+        )
+
+
+def get_current_node_cpu_model_name() -> Optional[str]:
+    if not sys.platform.startswith("linux"):
+        return None
+
+    try:
+        """
+        /proc/cpuinfo content example:
+
+        processor	: 0
+        vendor_id	: GenuineIntel
+        cpu family	: 6
+        model		: 85
+        model name	: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz
+        stepping	: 7
+        """
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":")[1].strip()
+        return None
+    except Exception:
+        logger.debug("Failed to get CPU model name", exc_info=True)
+        return None
+
+
+def validate_socket_filepath(filepath: str):
+    """
+    Validate the provided filename is a valid Unix socket filename.
+    """
+    # Don't check for Windows as it doesn't support Unix sockets.
+    if sys.platform == "win32":
+        return
+    is_mac = sys.platform.startswith("darwin")
+    maxlen = (104 if is_mac else 108) - 1
+    if len(filepath.encode("utf-8")) > maxlen:
+        raise OSError(
+            f"validate_socket_filename failed: AF_UNIX path length cannot exceed {maxlen} bytes: {filepath}"
+        )
+
+
+# Whether we're currently running in a test, either local or CI.
+in_test = None
+
+
+def is_in_test():
+    global in_test
+
+    if in_test is None:
+        in_test = any(
+            env_var in os.environ
+            # These environment variables are always set by pytest and Buildkite,
+            # respectively.
+            for env_var in ("PYTEST_CURRENT_TEST", "BUILDKITE")
+        )
+    return in_test

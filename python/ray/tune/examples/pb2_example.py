@@ -3,30 +3,19 @@
 import argparse
 
 import ray
-from ray import air, tune
-from ray.tune.schedulers.pb2 import PB2
+from ray import tune
 from ray.tune.examples.pbt_function import pbt_function
+from ray.tune.schedulers.pb2 import PB2
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--smoke-test", action="store_true", help="Finish quickly for testing"
     )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
     args, _ = parser.parse_known_args()
+
     if args.smoke_test:
         ray.init(num_cpus=2)  # force pausing to happen for test
-    else:
-        if args.server_address:
-            ray.init(f"ray://{args.server_address}")
-        else:
-            ray.init()
 
     perturbation_interval = 5
     pbt = PB2(
@@ -40,13 +29,13 @@ if __name__ == "__main__":
 
     tuner = tune.Tuner(
         pbt_function,
-        run_config=air.RunConfig(
+        run_config=tune.RunConfig(
             name="pbt_test",
             verbose=False,
             stop={
                 "training_iteration": 30,
             },
-            failure_config=air.FailureConfig(
+            failure_config=tune.FailureConfig(
                 fail_fast=True,
             ),
         ),
@@ -55,6 +44,7 @@ if __name__ == "__main__":
             metric="mean_accuracy",
             mode="max",
             num_samples=8,
+            reuse_actors=True,
         ),
         param_space={
             "lr": 0.0001,

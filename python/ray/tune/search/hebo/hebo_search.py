@@ -6,6 +6,12 @@ import numpy as np
 import pandas as pd
 
 from ray.tune.result import DEFAULT_METRIC
+from ray.tune.search import (
+    UNDEFINED_METRIC_MODE,
+    UNDEFINED_SEARCH_SPACE,
+    UNRESOLVED_SEARCH_SPACE,
+    Searcher,
+)
 from ray.tune.search.sample import (
     Categorical,
     Domain,
@@ -14,12 +20,6 @@ from ray.tune.search.sample import (
     LogUniform,
     Quantized,
     Uniform,
-)
-from ray.tune.search import (
-    UNRESOLVED_SEARCH_SPACE,
-    UNDEFINED_METRIC_MODE,
-    UNDEFINED_SEARCH_SPACE,
-    Searcher,
 )
 from ray.tune.search.variant_generator import parse_spec_vars
 from ray.tune.utils.util import is_nan_or_inf, unflatten_dict, validate_warmstart
@@ -77,7 +77,7 @@ class HEBOSearch(Searcher):
             re-running those trials by passing in the reward attributes
             as a list so the optimiser can be told the results without
             needing to re-compute the trial. Must be the same length as
-            points_to_evaluate. (See tune/examples/hebo_example.py)
+            points_to_evaluate.
         random_state_seed: Seed for reproducible
             results. Defaults to None. Please note that setting this to a value
             will change global random states for `numpy` and `torch`
@@ -355,26 +355,23 @@ class HEBOSearch(Searcher):
         else:
             numpy_random_state = None
             torch_random_state = None
+        save_object = self.__dict__.copy()
+        save_object["__numpy_random_state"] = numpy_random_state
+        save_object["__torch_random_state"] = torch_random_state
         with open(checkpoint_path, "wb") as f:
-            pickle.dump(
-                (
-                    self._opt,
-                    self._initial_points,
-                    numpy_random_state,
-                    torch_random_state,
-                    self._live_trial_mapping,
-                    self._max_concurrent,
-                    self._suggestions_cache,
-                    self._space,
-                    self._hebo_config,
-                    self._batch_filled,
-                ),
-                f,
-            )
+            pickle.dump(save_object, f)
 
     def restore(self, checkpoint_path: str):
         """Restoring current optimizer state."""
         with open(checkpoint_path, "rb") as f:
+            save_object = pickle.load(f)
+
+        if isinstance(save_object, dict):
+            numpy_random_state = save_object.pop("__numpy_random_state", None)
+            torch_random_state = save_object.pop("__torch_random_state", None)
+            self.__dict__.update(save_object)
+        else:
+            # Backwards compatibility
             (
                 self._opt,
                 self._initial_points,
@@ -386,7 +383,7 @@ class HEBOSearch(Searcher):
                 self._space,
                 self._hebo_config,
                 self._batch_filled,
-            ) = pickle.load(f)
+            ) = save_object
         if numpy_random_state is not None:
             np.random.set_state(numpy_random_state)
         if torch_random_state is not None:
@@ -423,7 +420,6 @@ class HEBOSearch(Searcher):
                         "type": "pow",
                         "lb": domain.lower,
                         "ub": domain.upper,
-                        "base": sampler.base,
                     }
                 elif isinstance(sampler, Uniform):
                     return {
@@ -440,7 +436,6 @@ class HEBOSearch(Searcher):
                         "type": "pow_int",
                         "lb": domain.lower,
                         "ub": domain.upper - 1,  # Upper bound exclusive
-                        "base": sampler.base,
                     }
                 elif isinstance(sampler, Uniform):
                     return {

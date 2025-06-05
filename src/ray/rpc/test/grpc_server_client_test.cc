@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <chrono>
+#include <memory>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "ray/rpc/grpc_client.h"
@@ -84,9 +86,12 @@ class TestGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
-    RPC_SERVICE_HANDLER(TestService, Ping, /*max_active_rpcs=*/1);
-    RPC_SERVICE_HANDLER(TestService, PingTimeout, /*max_active_rpcs=*/1);
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
+    RPC_SERVICE_HANDLER_CUSTOM_AUTH(
+        TestService, Ping, /*max_active_rpcs=*/1, AuthType::NO_AUTH);
+    RPC_SERVICE_HANDLER_CUSTOM_AUTH(
+        TestService, PingTimeout, /*max_active_rpcs=*/1, AuthType::NO_AUTH);
   }
 
  private:
@@ -102,12 +107,14 @@ class TestGrpcServerClientFixture : public ::testing::Test {
     // Prepare and start test server.
     handler_thread_ = std::make_unique<std::thread>([this]() {
       /// The asio work to keep handler_io_service_ alive.
-      boost::asio::io_service::work handler_io_service_work_(handler_io_service_);
+      boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
+          handler_io_service_work_(handler_io_service_.get_executor());
       handler_io_service_.run();
     });
-    test_service_.reset(new TestGrpcService(handler_io_service_, test_service_handler_));
     grpc_server_.reset(new GrpcServer("test", 0, true));
-    grpc_server_->RegisterService(*test_service_);
+    grpc_server_->RegisterService(
+        std::make_unique<TestGrpcService>(handler_io_service_, test_service_handler_),
+        false);
     grpc_server_->Run();
 
     // Wait until server starts listening.
@@ -118,10 +125,11 @@ class TestGrpcServerClientFixture : public ::testing::Test {
     // Prepare a client
     client_thread_ = std::make_unique<std::thread>([this]() {
       /// The asio work to keep client_io_service_ alive.
-      boost::asio::io_service::work client_io_service_work_(client_io_service_);
+      boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
+          client_io_service_work_(client_io_service_.get_executor());
       client_io_service_.run();
     });
-    client_call_manager_.reset(new ClientCallManager(client_io_service_));
+    client_call_manager_.reset(new ClientCallManager(client_io_service_, false));
     grpc_client_.reset(new GrpcClient<TestService>(
         "127.0.0.1", grpc_server_->GetPort(), *client_call_manager_));
   }
@@ -159,7 +167,6 @@ class TestGrpcServerClientFixture : public ::testing::Test {
   TestServiceHandler test_service_handler_;
   instrumented_io_context handler_io_service_;
   std::unique_ptr<std::thread> handler_thread_;
-  std::unique_ptr<TestGrpcService> test_service_;
   std::unique_ptr<GrpcServer> grpc_server_;
   grpc::CompletionQueue cq_;
   std::shared_ptr<grpc::Channel> channel_;
@@ -210,6 +217,8 @@ TEST_F(TestGrpcServerClientFixture, TestClientCallManagerTimeout) {
   grpc_client_.reset();
   client_call_manager_.reset();
   client_call_manager_.reset(new ClientCallManager(client_io_service_,
+                                                   false,
+                                                   ClusterID::Nil(),
                                                    /*num_thread=*/1,
                                                    /*call_timeout_ms=*/100));
   grpc_client_.reset(new GrpcClient<TestService>(
@@ -243,6 +252,8 @@ TEST_F(TestGrpcServerClientFixture, TestClientDiedBeforeReply) {
   grpc_client_.reset();
   client_call_manager_.reset();
   client_call_manager_.reset(new ClientCallManager(client_io_service_,
+                                                   false,
+                                                   ClusterID::Nil(),
                                                    /*num_thread=*/1,
                                                    /*call_timeout_ms=*/100));
   grpc_client_.reset(new GrpcClient<TestService>(
@@ -272,7 +283,8 @@ TEST_F(TestGrpcServerClientFixture, TestClientDiedBeforeReply) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   }
   // Reinit client with infinite timeout.
-  client_call_manager_.reset(new ClientCallManager(client_io_service_));
+  client_call_manager_.reset(
+      new ClientCallManager(client_io_service_, false, ClusterID::FromRandom()));
   grpc_client_.reset(new GrpcClient<TestService>(
       "127.0.0.1", grpc_server_->GetPort(), *client_call_manager_));
   // Send again, this request should be replied. If any leaking happened, this call won't

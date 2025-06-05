@@ -63,7 +63,7 @@ def _test_component_failed(cluster, component_type):
         time.sleep(1)
         process.kill()
         process.wait()
-        assert not process.poll() is None
+        assert process.poll() is not None
 
         # Make sure that we can still get the objects after the
         # executing tasks died.
@@ -95,7 +95,7 @@ def check_components_alive(cluster, component_type, check_component_alive):
                 + str(process.pid)
                 + "to terminate"
             )
-            assert not process.poll() is None
+            assert process.poll() is not None
 
 
 @pytest.mark.parametrize(
@@ -104,7 +104,10 @@ def check_components_alive(cluster, component_type, check_component_alive):
         {
             "num_cpus": 8,
             "num_nodes": 4,
-            "_system_config": {"num_heartbeats_timeout": 10},
+            "_system_config": {
+                "health_check_initial_delay_ms": 0,
+                "health_check_failure_threshold": 10,
+            },
         }
     ],
     indirect=True,
@@ -124,7 +127,7 @@ def test_get_node_info_after_raylet_died(ray_start_cluster_head):
             cluster.head_node.node_ip_address,
         )
 
-    assert get_node_info().raylet_socket_name == cluster.head_node.raylet_socket_name
+    assert get_node_info()["raylet_socket_name"] == cluster.head_node.raylet_socket_name
 
     cluster.head_node.kill_raylet()
     wait_for_condition(
@@ -134,14 +137,8 @@ def test_get_node_info_after_raylet_died(ray_start_cluster_head):
         get_node_info()
 
     node2 = cluster.add_node()
-    assert get_node_info().raylet_socket_name == node2.raylet_socket_name
+    assert get_node_info()["raylet_socket_name"] == node2.raylet_socket_name
 
 
 if __name__ == "__main__":
-    import os
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -1,11 +1,11 @@
-from collections import defaultdict
+import copy
+import multiprocessing
 import sys
-import os
+from collections import defaultdict
 
 import pytest
 
 import ray
-
 from ray._private.metrics_agent import RAY_WORKER_TIMEOUT_S
 from ray._private.test_utils import (
     raw_metrics,
@@ -34,6 +34,12 @@ def tasks_by_state(info) -> dict:
 
 def tasks_by_name_and_state(info) -> dict:
     return tasks_breakdown(info, lambda s: (s.labels["Name"], s.labels["State"]))
+
+
+def tasks_by_all(info) -> dict:
+    return tasks_breakdown(
+        info, lambda s: (s.labels["Name"], s.labels["State"], s.labels["IsRetry"])
+    )
 
 
 def tasks_breakdown(info, key_fn) -> dict:
@@ -195,6 +201,53 @@ ray.get(w)
     proc.kill()
 
 
+def driver_for_test_task_fetch_args(head_info):
+    ray.init("auto")
+
+    @ray.remote(resources={"worker": 1})
+    def task1():
+        return [1] * 1024 * 1024
+
+    @ray.remote(resources={"head": 1})
+    def task2(obj):
+        pass
+
+    o1 = task1.remote()
+    o2 = task2.remote(o1)
+
+    wait_for_condition(
+        lambda: tasks_by_state(head_info).get("PENDING_ARGS_FETCH", 0.0) == 1.0
+    )
+
+    ray.cancel(o2)
+
+    wait_for_condition(
+        lambda: tasks_by_state(head_info).get("PENDING_ARGS_FETCH", 0.0) == 0.0
+    )
+
+
+def test_task_fetch_args(ray_start_cluster):
+    cluster = ray_start_cluster
+    cluster.add_node(
+        resources={"head": 1},
+        _system_config={
+            "metrics_report_interval_ms": 100,
+            "testing_asio_delay_us": "ObjectManagerService.grpc_server.Pull=5000000000:5000000000",  # noqa: E501
+        },
+    )
+    head_info = ray.init(address=cluster.address)
+    cluster.add_node(resources={"worker": 1})
+    cluster.wait_for_nodes()
+
+    multiprocessing.set_start_method("spawn")
+    p = multiprocessing.Process(
+        target=driver_for_test_task_fetch_args, args=(head_info,)
+    )
+    p.start()
+    p.join()
+    assert p.exitcode == 0
+
+
 def test_task_wait_on_deps(shutdown_only):
     info = ray.init(num_cpus=2, **METRIC_CONFIG)
 
@@ -318,9 +371,26 @@ import time
 
 ray.init("auto")
 
-@ray.remote(retry_exceptions=True)
+@ray.remote
+def sleep():
+    time.sleep(999)
+
+@ray.remote
+class Phaser:
+    def __init__(self):
+        self.i = 0
+
+    def inc(self):
+        self.i += 1
+        if self.i < 3:
+            raise ValueError("First two tries will fail")
+
+phaser = Phaser.remote()
+
+@ray.remote(retry_exceptions=True, max_retries=3)
 def f():
-    assert False
+    ray.get(phaser.inc.remote())
+    ray.get(sleep.remote())
 
 f.remote()
 time.sleep(999)
@@ -328,10 +398,72 @@ time.sleep(999)
 
     proc = run_string_as_driver_nonblocking(driver)
     expected = {
-        "FAILED": 1.0,  # Only recorded as finished once.
+        ("sleep", "RUNNING", "0"): 1.0,
+        ("f", "FAILED", "0"): 1.0,
+        ("f", "FAILED", "1"): 1.0,
+        ("f", "RUNNING_IN_RAY_GET", "1"): 1.0,
+        ("Phaser.__init__", "FINISHED", "0"): 1.0,
+        ("Phaser.inc", "FINISHED", "0"): 1.0,
+        ("Phaser.inc", "FAILED", "0"): 2.0,
     }
     wait_for_condition(
-        lambda: tasks_by_state(info) == expected, timeout=20, retry_interval_ms=500
+        lambda: tasks_by_all(info) == expected,
+        timeout=20,
+        retry_interval_ms=500,
+    )
+    proc.kill()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Flaky on Windows. Timing out.")
+def test_actor_task_retry(shutdown_only):
+    info = ray.init(num_cpus=2, **METRIC_CONFIG)
+
+    driver = """
+import ray
+import os
+import time
+
+ray.init("auto")
+
+@ray.remote
+class Phaser:
+    def __init__(self):
+        self.i = 0
+
+    def inc(self):
+        self.i += 1
+        if self.i < 3:
+            raise ValueError("First two tries will fail")
+
+phaser = Phaser.remote()
+
+@ray.remote(max_restarts=10, max_task_retries=10)
+class F:
+    def f(self):
+        try:
+            ray.get(phaser.inc.remote())
+        except Exception:
+            print("RESTART")
+            os._exit(1)
+
+f = F.remote()
+ray.get(f.f.remote())
+time.sleep(999)
+"""
+
+    proc = run_string_as_driver_nonblocking(driver)
+    expected = {
+        ("F.__init__", "FINISHED", "0"): 1.0,
+        ("F.f", "FAILED", "0"): 1.0,
+        ("F.f", "FAILED", "1"): 1.0,
+        ("F.f", "FINISHED", "1"): 1.0,
+        ("Phaser.__init__", "FINISHED", "0"): 1.0,
+        ("Phaser.inc", "FINISHED", "0"): 1.0,
+    }
+    wait_for_condition(
+        lambda: tasks_by_all(info) == expected,
+        timeout=20,
+        retry_interval_ms=500,
     )
     proc.kill()
 
@@ -347,7 +479,7 @@ import os
 
 ray.init("auto")
 
-@ray.remote
+@ray.remote(max_retries=0)
 def f():
     print("RUNNING FAILING TASK")
     os._exit(1)
@@ -513,10 +645,62 @@ ray.get(g.remote())
         )
 
 
-if __name__ == "__main__":
-    import sys
+@pytest.mark.skipif(sys.platform == "win32", reason="Flaky on Windows. Timing out.")
+def test_metrics_batch(shutdown_only):
+    """Verify metrics_report_batch_size works correctly without data loss."""
+    config_copy = copy.deepcopy(METRIC_CONFIG)
+    config_copy["_system_config"].update({"metrics_report_batch_size": 1})
+    info = ray.init(num_cpus=2, **config_copy)
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    driver = """
+import ray
+import os
+import time
+
+ray.init("auto")
+
+@ray.remote
+class Phaser:
+    def __init__(self):
+        self.i = 0
+
+    def inc(self):
+        self.i += 1
+        if self.i < 3:
+            raise ValueError("First two tries will fail")
+
+phaser = Phaser.remote()
+
+@ray.remote(max_restarts=10, max_task_retries=10)
+class F:
+    def f(self):
+        try:
+            ray.get(phaser.inc.remote())
+        except Exception:
+            print("RESTART")
+            os._exit(1)
+
+f = F.remote()
+ray.get(f.f.remote())
+time.sleep(999)
+"""
+
+    proc = run_string_as_driver_nonblocking(driver)
+    expected = {
+        ("F.__init__", "FINISHED", "0"): 1.0,
+        ("F.f", "FAILED", "0"): 1.0,
+        ("F.f", "FAILED", "1"): 1.0,
+        ("F.f", "FINISHED", "1"): 1.0,
+        ("Phaser.__init__", "FINISHED", "0"): 1.0,
+        ("Phaser.inc", "FINISHED", "0"): 1.0,
+    }
+    wait_for_condition(
+        lambda: tasks_by_all(info) == expected,
+        timeout=20,
+        retry_interval_ms=500,
+    )
+    proc.kill()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

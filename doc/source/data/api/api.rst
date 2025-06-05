@@ -1,6 +1,6 @@
 .. _data-api:
 
-Ray Datasets API
+Ray Data API
 ================
 
 .. toctree::
@@ -8,10 +8,11 @@ Ray Datasets API
 
     input_output.rst
     dataset.rst
-    dataset_pipeline.rst
-    grouped_dataset.rst
-    dataset_context.rst
-    data_representations.rst
-    random_access_dataset.rst
-    utility.rst
+    data_iterator.rst
+    execution_options.rst
+    aggregate.rst
+    grouped_data.rst
+    data_context.rst
+    preprocessor.rst
+    llm.rst
     from_other_data_libs.rst

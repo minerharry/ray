@@ -24,6 +24,57 @@ function loadVisibleTermynals() {
     });
 }
 
+// Store the state of the page in the browser's local storage.
+// For now this includes just the sidebar scroll position.
+document.addEventListener("DOMContentLoaded", () => {
+  const sidebar = document.getElementById("main-sidebar")
+
+  window.addEventListener("beforeunload", () => {
+    if (sidebar) {
+      localStorage.setItem("scroll", sidebar.scrollTop)
+    }
+  })
+
+  const storedScrollPosition = localStorage.getItem("scroll")
+  if (storedScrollPosition) {
+    if (sidebar) {
+      sidebar.scrollTop = storedScrollPosition;
+    }
+    localStorage.removeItem("scroll");
+  }
+
+})
+
+// Send GA events any time a code block is copied
+document.addEventListener("DOMContentLoaded", function() {
+    let codeButtons = document.querySelectorAll(".copybtn");
+        for (let i = 0; i < codeButtons.length; i++) {
+            const button = codeButtons[i];
+            button.addEventListener("click", function() {
+                gtag("event", "code_copy_click", {
+                     "send_to": "UA-110413294-1",
+                     "event_category": "ray_docs_copy_code",
+                     "event_label": "URL: " + document.URL
+                         + " Button: " + button.getAttribute("data-clipboard-target"),
+                     "value": 1,
+                });
+            });
+        }
+});
+
+document.addEventListener("DOMContentLoaded", function() {
+  let anyscaleButton = document.getElementById("try-anyscale")
+  anyscaleButton.onclick = () => {
+    gtag("event", "try_anyscale", {
+        "send_to": "UA-110413294-1",
+        "event_category": "TryAnyscale",
+        "event_label": "TryAnyscale",
+        "value": 1,
+    });
+    window.open('https://www.anyscale.com', '_blank');
+  }
+});
+
 window.addEventListener("scroll", loadVisibleTermynals);
 createTermynals();
 loadVisibleTermynals();

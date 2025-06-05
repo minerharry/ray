@@ -2,20 +2,21 @@
 import logging
 import os
 import pickle
+import random
+import re
 import sys
 import time
 
-import numpy as np
 import pytest
 
 import ray
 import ray.cluster_utils
+from ray._common.test_utils import SignalActor
 from ray._private.test_utils import (
-    SignalActor,
     client_test_enabled,
-    get_error_message,
     run_string_as_driver,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -46,17 +47,54 @@ assert ray.get(f.remote()) == 1
     run_string_as_driver(script, dict(os.environ, **env))
 
 
+def test_release_cpu_resources(shutdown_only):
+    ray.init(num_cpus=1)
+
+    @ray.remote(num_cpus=1)
+    def child():
+        return 3
+
+    @ray.remote(num_cpus=1)
+    def parent():
+        # Parent should release the CPU resource
+        # to run child.
+        return ray.get(child.remote())
+
+    assert ray.get(parent.remote()) == 3
+
+    # Make sure CPU resource inside PG can also be released properly.
+    pg = ray.util.placement_group(bundles=[{"CPU": 1}])
+    assert (
+        ray.get(
+            parent.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg, placement_group_capture_child_tasks=True
+                )
+            ).remote()
+        )
+        == 3
+    )
+    assert (
+        ray.get(
+            parent.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=0,
+                    placement_group_capture_child_tasks=True,
+                )
+            ).remote()
+        )
+        == 3
+    )
+
+
 # https://github.com/ray-project/ray/issues/16025
 def test_release_resources_race(shutdown_only):
-    # This test fails with the flag set to false.
-    ray.init(
-        num_cpus=2,
-        object_store_memory=700e6,
-        _system_config={"inline_object_status_in_refs": True},
-    )
+    ray.init(num_cpus=2)
+
     refs = []
     for _ in range(10):
-        refs.append(ray.put(np.zeros(20 * 1024 * 1024, dtype=np.uint8)))
+        refs.append(ray.put(bytearray(1024 * 1024)))
 
     @ray.remote
     def consume(refs):
@@ -64,9 +102,38 @@ def test_release_resources_race(shutdown_only):
         ray.get(refs)
         return os.getpid()
 
-    pids = set(ray.get([consume.remote(refs) for _ in range(1000)]))
+    pids = set(ray.get([consume.remote(refs) for _ in range(10)]))
     # Should not have started multiple workers.
     assert len(pids) <= 2, pids
+
+
+def test_not_release_resource(shutdown_only):
+    # Test to make sure we don't release CPU
+    # resource if the object is already fetched.
+    ray.init(num_cpus=1)
+
+    @ray.remote
+    def task1():
+        return [1] * (1024 * 1024)
+
+    o1 = task1.remote()
+
+    @ray.remote
+    def task2(*args, **kwargs):
+        # ray.get here should not release
+        # CPU resource since the object is already
+        # available in args[0]
+        assert args[0] == ray.get(kwargs["o"][0])
+        return os.getpid()
+
+    @ray.remote
+    def task3(*args):
+        return os.getpid()
+
+    o2 = task2.remote(o1, o=[o1])
+    # This should run after task2 finishes
+    o3 = task3.remote(o1)
+    assert len(set(ray.get([o2, o3]))) == 1
 
 
 # https://github.com/ray-project/ray/issues/22504
@@ -113,17 +180,137 @@ def test_grpc_message_size(shutdown_only):
 
     # 50KiB, not enough to spill to plasma, but will be inlined.
     def f():
-        return np.zeros(50000, dtype=np.uint8)
+        return bytearray(50000)
 
     # Executes a 10MiB task spec
     ray.get(bar.remote(*[f() for _ in range(200)]))
 
 
+def test_default_worker_import_dependency(shutdown_only):
+    """
+    Test ray's python worker import doesn't import the not-allowed dependencies.
+    """
+    # We don't allow numpy to be imported in the worker script to avoid slow
+    # worker startup time, as well as interfering with OMP_NUM_THREADS which
+    # is used by numpy when imported.
+    # See https://github.com/ray-project/ray/issues/33891
+    blocked_deps = ["numpy"]
+
+    # Ray should not be importing pydantic (used in serialization) eagerly.
+    # This introduces regression in worker start up time.
+    # https://github.com/ray-project/ray/issues/41338
+    blocked_deps += ["pydantic"]
+
+    # Remove the ray module and the blocked deps from sys.modules.
+    sys.modules.pop("ray", None)
+    assert "ray" not in sys.modules
+    for dep in blocked_deps:
+        sys.modules.pop(dep, None)
+        assert dep not in sys.modules
+
+    # This imports the python worker.
+    import ray._private.workers.default_worker  # noqa: F401
+
+    # Check that the ray module is imported.
+    assert "ray" in sys.modules
+
+    # Check that the blocked deps are not imported.
+    for dep in blocked_deps:
+        assert dep not in sys.modules
+
+    # Test starting a ray workers should not see unwanted deps loaded eagerly.
+    ray.init()
+
+    @ray.remote
+    def f():
+        import ray  # noqa: F401
+
+        assert "ray" in sys.modules
+        for x in blocked_deps:
+            assert x not in sys.modules
+
+    ray.get(f.remote())
+
+
 # https://github.com/ray-project/ray/issues/7287
-def test_omp_threads_set(shutdown_only):
-    ray.init(num_cpus=1)
-    # Should have been auto set by ray init.
-    assert os.environ["OMP_NUM_THREADS"] == "1"
+def test_omp_threads_set(ray_start_cluster, monkeypatch):
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=2)
+    ray.init(address=cluster.address)
+
+    @ray.remote
+    def f():
+        return os.environ.get("OMP_NUM_THREADS")
+
+    @ray.remote
+    class Actor:
+        def f(self):
+            return os.environ.get("OMP_NUM_THREADS")
+
+    ###########################
+    # Test basic tasks
+    ###########################
+    # Test override to num_cpus if OMP_NUM_THREADS not set
+    assert ray.get(f.options(num_cpus=2).remote()) == "2"
+
+    # Test override to default cpu number if OMP_NUM_THREADS not set
+    assert ray.get(f.remote()) == "1"
+
+    # Test set to 1 for fractional CPU
+    assert ray.get(f.options(num_cpus=0.25).remote()) == "1"
+
+    ###########################
+    # Test not overriding env_variables
+    ###########################
+    from ray.runtime_env import RuntimeEnv
+
+    assert (
+        ray.get(
+            f.options(
+                runtime_env=RuntimeEnv(env_vars={"OMP_NUM_THREADS": "2"})
+            ).remote()
+        )
+        == "2"
+    )
+    assert (
+        ray.get(
+            f.options(
+                num_cpus=1, runtime_env=RuntimeEnv(env_vars={"OMP_NUM_THREADS": "2"})
+            ).remote()
+        )
+        == "2"
+    )
+
+    ###########################
+    # Test actor tasks
+    ###########################
+    # Test actor tasks set OMP_NUM_THREADS correctly in a similar way.
+    assert ray.get(Actor.remote().f.remote()) == "1"
+    assert ray.get(Actor.options(num_cpus=2).remote().f.remote()) == "2"
+    assert ray.get(Actor.options(num_cpus=0.25).remote().f.remote()) == "1"
+
+    ###########################
+    # Test setting and restoring of the environ after tasks run
+    ###########################
+    @ray.remote
+    def g():
+        return os.getpid(), os.environ.get("OMP_NUM_THREADS")
+
+    # Set to 1
+    pid1, omp_num_threads = ray.get(g.remote())
+    assert omp_num_threads == "1"
+    # Set to 2
+    pid2, omp_num_threads = ray.get(g.options(num_cpus=2).remote())
+    assert pid1 == pid2
+    assert omp_num_threads == "2"
+
+    ###########################
+    # Test not setting the value with environ already set to 1 in env
+    ###########################
+    with monkeypatch.context() as m:
+        m.setenv("OMP_NUM_THREADS", "1")
+        cluster.add_node(num_cpus=4)
+    assert ray.get(f.options(num_cpus=4).remote()) == "1"
 
 
 def test_submit_api(shutdown_only):
@@ -189,8 +376,6 @@ def test_submit_api(shutdown_only):
 
 
 def test_invalid_arguments():
-    import re
-
     def f():
         return 1
 
@@ -205,20 +390,20 @@ def test_invalid_arguments():
     # Type check
     for keyword in ("max_retries", "max_calls"):
         with pytest.raises(TypeError, match=re.escape(template1.format(keyword))):
-            ray.remote(**{keyword: np.random.uniform(0, 1)})(f)
+            ray.remote(**{keyword: random.random()})(f)
     num_returns_template = (
         "The type of keyword 'num_returns' "
         + f"must be {(int, str, type(None))}, but received type {float}"
     )
     with pytest.raises(TypeError, match=re.escape(num_returns_template)):
-        ray.remote(**{"num_returns": np.random.uniform(0, 1)})(f)
+        ray.remote(**{"num_returns": random.random()})(f)
 
     for keyword in ("max_restarts", "max_task_retries"):
         with pytest.raises(TypeError, match=re.escape(template1.format(keyword))):
-            ray.remote(**{keyword: np.random.uniform(0, 1)})(A)
+            ray.remote(**{keyword: random.random()})(A)
 
     # Value check for non-negative finite values
-    for v in (np.random.randint(-100, -2), -1):
+    for v in (random.randint(-100, -2), -1):
         keyword = "max_calls"
         with pytest.raises(
             ValueError,
@@ -231,7 +416,8 @@ def test_invalid_arguments():
         with pytest.raises(
             ValueError,
             match=f"The keyword '{keyword}' only accepts None, "
-            'a non-negative integer, or "dynamic"',
+            "a non-negative integer, "
+            r"'streaming' \(for generators\), or 'dynamic'",
         ):
             ray.remote(**{keyword: v})(f)
 
@@ -242,11 +428,11 @@ def test_invalid_arguments():
     )
 
     with pytest.raises(ValueError, match=template2.format("max_retries")):
-        ray.remote(max_retries=np.random.randint(-100, -2))(f)
+        ray.remote(max_retries=random.randint(-100, -2))(f)
 
     for keyword in ("max_restarts", "max_task_retries"):
         with pytest.raises(ValueError, match=template2.format(keyword)):
-            ray.remote(**{keyword: np.random.randint(-100, -2)})(A)
+            ray.remote(**{keyword: random.randint(-100, -2)})(A)
 
     metadata_type_err = (
         "The type of keyword '_metadata' "
@@ -258,11 +444,28 @@ def test_invalid_arguments():
     ray.remote(_metadata={"data": 1})(f)
     ray.remote(_metadata={"data": 1})(A)
 
+    # Check invalid resource quantity
+    with pytest.raises(
+        ValueError,
+        match=(
+            "The precision of the fractional quantity of resource num_gpus"
+            " cannot go beyond 0.0001"
+        ),
+    ):
+        ray.remote(num_gpus=0.0000001)(f)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "The precision of the fractional quantity of resource custom_resource"
+            " cannot go beyond 0.0001"
+        ),
+    ):
+        ray.remote(resources={"custom_resource": 0.0000001})(f)
+
 
 def test_options():
     """General test of option keywords in Ray."""
-    import re
-
     from ray._private import ray_option_utils
 
     def f():
@@ -360,6 +563,7 @@ def test_options():
 
     assert foo._default_options == {
         "_metadata": {"namespace": {"a": 1, "b": 2}},
+        "max_calls": 1,
         "num_gpus": 2,
     }
 
@@ -368,7 +572,7 @@ def test_options():
     # TODO(suquark): The current implementation of `.options()` is so bad that we
     # cannot even access its options from outside. Here we hack the closures to
     # achieve our goal. Need futher efforts to clean up the tech debt.
-    assert f2.remote.__closure__[1].cell_contents == {
+    assert f2.remote.__closure__[2].cell_contents == {
         "_metadata": {"namespace": {"a": 11, "b": 2, "c": 3}},
         "num_cpus": 1,
         "num_gpus": 1,
@@ -380,7 +584,7 @@ def test_options():
 
     f3 = foo.options(num_cpus=1, num_gpus=1, **mock_options2(a=11, c=3))
 
-    assert f3.remote.__closure__[1].cell_contents == {
+    assert f3.remote.__closure__[2].cell_contents == {
         "_metadata": {"namespace": {"a": 1, "b": 2}, "namespace2": {"a": 11, "c": 3}},
         "num_cpus": 1,
         "num_gpus": 1,
@@ -442,22 +646,6 @@ def test_put_get(shutdown_only):
         object_ref = ray.put(value_before)
         value_after = ray.get(object_ref)
         assert value_before == value_after
-
-
-def test_wait_timing(shutdown_only):
-    ray.init(num_cpus=2)
-
-    @ray.remote
-    def f():
-        time.sleep(1)
-
-    future = f.remote()
-
-    start = time.time()
-    ready, not_ready = ray.wait([future], timeout=0.2)
-    assert 0.2 < time.time() - start < 0.3
-    assert len(ready) == 0
-    assert len(not_ready) == 1
 
 
 @pytest.mark.skipif(client_test_enabled(), reason="internal _raylet")
@@ -538,9 +726,9 @@ def test_fetch_local(ray_start_cluster_head):
     @ray.remote
     def put():
         ray.wait([signal_actor.wait.remote()])
-        return np.random.rand(5 * 1024 * 1024)  # 40 MB data
+        return bytearray(40 * 1024 * 1024)  # 40 MB data
 
-    local_ref = ray.put(np.random.rand(5 * 1024 * 1024))
+    local_ref = ray.put(bytearray(40 * 1024 * 1024))
     remote_ref = put.remote()
     # Data is not ready in any node
     (ready_ref, remaining_ref) = ray.wait([remote_ref], timeout=2, fetch_local=False)
@@ -573,8 +761,9 @@ def test_nested_functions(ray_start_shared_local_modes):
 
     assert ray.get(f.remote()) == (1, 2)
 
-    # Test a remote function that recursively calls itself.
 
+def test_recursive_remote_call(ray_start_shared_local_modes):
+    # Test a remote function that recursively calls itself.
     @ray.remote
     def factorial(n):
         if n == 0:
@@ -652,9 +841,9 @@ def test_passing_arguments_by_value_out_of_the_box(ray_start_shared_local_modes)
     assert ray.get(f.remote(s)) == s
 
     # Test types.
-    assert ray.get(f.remote(int)) == int
-    assert ray.get(f.remote(float)) == float
-    assert ray.get(f.remote(str)) == str
+    assert ray.get(f.remote(int)) is int
+    assert ray.get(f.remote(float)) is float
+    assert ray.get(f.remote(str)) is str
 
     class Foo:
         def __init__(self):
@@ -674,7 +863,7 @@ def test_putting_object_that_closes_over_object_ref(ray_start_shared_local_modes
             self.val = ray.put(0)
 
         def method(self):
-            f
+            _ = f
 
     f = Foo()
     ray.put(f)
@@ -832,7 +1021,7 @@ def test_args_named_and_star(ray_start_shared_local_modes):
 
 
 def test_oversized_function(ray_start_shared_local_modes):
-    bar = np.zeros(100 * 1024 * 125)
+    bar = bytearray(800 * 1024 * 125)
 
     @ray.remote
     class Actor:
@@ -917,16 +1106,8 @@ def test_failed_task(ray_start_shared_local_modes, error_pubsub):
     def throw_exception_fct3(x):
         raise Exception("Test function 3 intentionally failed.")
 
-    p = error_pubsub
-
     throw_exception_fct1.remote()
     throw_exception_fct1.remote()
-
-    if ray._private.worker.global_worker.mode != ray._private.worker.LOCAL_MODE:
-        msgs = get_error_message(p, 2, ray._private.ray_constants.TASK_PUSH_ERROR)
-        assert len(msgs) == 2
-        for msg in msgs:
-            assert "Test function 1 intentionally failed." in msg.error_message
 
     x = throw_exception_fct2.remote()
     try:
@@ -974,8 +1155,26 @@ def test_failed_task(ray_start_shared_local_modes, error_pubsub):
         assert False
 
 
+def test_import_ray_does_not_import_grpc():
+    # First unload grpc and ray
+    if "grpc" in sys.modules:
+        del sys.modules["grpc"]
+    if "ray" in sys.modules:
+        del sys.modules["ray"]
+
+    # Then import ray from scratch
+    import ray  # noqa: F401
+
+    # Make sure grpc did not get imported by "import ray"
+    assert "grpc" not in sys.modules
+
+    # Load grpc back so other tests will not be affected
+    try:
+        import grpc  # noqa: F401
+    except ImportError:
+        # It's ok if we don't have grpc installed.
+        pass
+
+
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

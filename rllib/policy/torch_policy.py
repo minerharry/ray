@@ -6,7 +6,6 @@ import os
 import threading
 import time
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -18,7 +17,7 @@ from typing import (
     Union,
 )
 
-import gym
+import gymnasium as gym
 import numpy as np
 import tree  # pip install dm_tree
 
@@ -31,10 +30,14 @@ from ray.rllib.policy.policy import Policy, PolicyState
 from ray.rllib.policy.rnn_sequencing import pad_batch_to_sequences_of_same_size
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils import NullContextManager, force_list
-from ray.rllib.utils.annotations import DeveloperAPI, override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.error import ERR_MSG_TORCH_POLICY_CANNOT_SAVE_MODEL
 from ray.rllib.utils.framework import try_import_torch
-from ray.rllib.utils.metrics import NUM_AGENT_STEPS_TRAINED
+from ray.rllib.utils.metrics import (
+    DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY,
+    NUM_AGENT_STEPS_TRAINED,
+    NUM_GRAD_UPDATES_LIFETIME,
+)
 from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
 from ray.rllib.utils.numpy import convert_to_numpy
 from ray.rllib.utils.spaces.space_utils import normalize_action
@@ -49,19 +52,15 @@ from ray.rllib.utils.typing import (
     TensorType,
 )
 
-if TYPE_CHECKING:
-    from ray.rllib.evaluation import Episode  # noqa
-
 torch, nn = try_import_torch()
 
 logger = logging.getLogger(__name__)
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchPolicy(Policy):
     """PyTorch specific Policy class to use with RLlib."""
 
-    @DeveloperAPI
     def __init__(
         self,
         observation_space: gym.spaces.Space,
@@ -298,7 +297,6 @@ class TorchPolicy(Policy):
         timestep: Optional[int] = None,
         **kwargs,
     ) -> Tuple[TensorType, List[TensorType], Dict[str, TensorType]]:
-
         with torch.no_grad():
             # Pass lazy (torch) tensor dict to Model as `input_dict`.
             input_dict = self._lazy_tensor_dict(input_dict)
@@ -323,7 +321,6 @@ class TorchPolicy(Policy):
             )
 
     @override(Policy)
-    @DeveloperAPI
     def compute_actions(
         self,
         obs_batch: Union[List[TensorStructType], TensorStructType],
@@ -331,12 +328,11 @@ class TorchPolicy(Policy):
         prev_action_batch: Union[List[TensorStructType], TensorStructType] = None,
         prev_reward_batch: Union[List[TensorStructType], TensorStructType] = None,
         info_batch: Optional[Dict[str, list]] = None,
-        episodes: Optional[List["Episode"]] = None,
+        episodes=None,
         explore: Optional[bool] = None,
         timestep: Optional[int] = None,
         **kwargs,
     ) -> Tuple[TensorStructType, List[TensorType], Dict[str, TensorType]]:
-
         with torch.no_grad():
             seq_lens = torch.ones(len(obs_batch), dtype=torch.int32)
             input_dict = self._lazy_tensor_dict(
@@ -358,7 +354,6 @@ class TorchPolicy(Policy):
 
     @with_lock
     @override(Policy)
-    @DeveloperAPI
     def compute_log_likelihoods(
         self,
         actions: Union[List[TensorStructType], TensorStructType],
@@ -371,8 +366,8 @@ class TorchPolicy(Policy):
             Union[List[TensorStructType], TensorStructType]
         ] = None,
         actions_normalized: bool = True,
+        **kwargs,
     ) -> TensorType:
-
         if self.action_sampler_fn and self.action_distribution_fn is None:
             raise ValueError(
                 "Cannot compute log-prob/likelihood w/o an "
@@ -398,7 +393,6 @@ class TorchPolicy(Policy):
 
             # Action dist class and inputs are generated via custom function.
             if self.action_distribution_fn:
-
                 # Try new action_distribution_fn signature, supporting
                 # state_batches and seq_lens.
                 try:
@@ -446,9 +440,7 @@ class TorchPolicy(Policy):
 
     @with_lock
     @override(Policy)
-    @DeveloperAPI
     def learn_on_batch(self, postprocessed_batch: SampleBatch) -> Dict[str, TensorType]:
-
         # Set Model to train mode.
         if self.model:
             self.model.train()
@@ -465,19 +457,28 @@ class TorchPolicy(Policy):
         # Step the optimizers.
         self.apply_gradients(_directStepOptimizerSingleton)
 
+        self.num_grad_updates += 1
+
         if self.model:
             fetches["model"] = self.model.metrics()
+
         fetches.update(
             {
                 "custom_metrics": learn_stats,
                 NUM_AGENT_STEPS_TRAINED: postprocessed_batch.count,
+                NUM_GRAD_UPDATES_LIFETIME: self.num_grad_updates,
+                # -1, b/c we have to measure this diff before we do the update above.
+                DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY: (
+                    self.num_grad_updates
+                    - 1
+                    - (postprocessed_batch.num_grad_updates or 0)
+                ),
             }
         )
 
         return fetches
 
     @override(Policy)
-    @DeveloperAPI
     def load_batch_into_buffer(
         self,
         batch: SampleBatch,
@@ -528,14 +529,12 @@ class TorchPolicy(Policy):
         return len(slices[0])
 
     @override(Policy)
-    @DeveloperAPI
     def get_num_samples_loaded_into_buffer(self, buffer_index: int = 0) -> int:
         if len(self.devices) == 1 and self.devices[0] == "/cpu:0":
             assert buffer_index == 0
         return sum(len(b) for b in self._loaded_batches[buffer_index])
 
     @override(Policy)
-    @DeveloperAPI
     def learn_on_loaded_batch(self, offset: int = 0, buffer_index: int = 0):
         if not self._loaded_batches[buffer_index]:
             raise ValueError(
@@ -545,9 +544,13 @@ class TorchPolicy(Policy):
 
         # Get the correct slice of the already loaded batch to use,
         # based on offset and batch size.
-        device_batch_size = self.config.get(
-            "sgd_minibatch_size", self.config["train_batch_size"]
-        ) // len(self.devices)
+        device_batch_size = self.config.get("minibatch_size")
+        if device_batch_size is None:
+            device_batch_size = self.config.get(
+                "sgd_minibatch_size",
+                self.config["train_batch_size"],
+            )
+        device_batch_size //= len(self.devices)
 
         # Set Model to train mode.
         if self.model_gpu_towers:
@@ -610,23 +613,28 @@ class TorchPolicy(Policy):
 
         self.apply_gradients(_directStepOptimizerSingleton)
 
+        self.num_grad_updates += 1
+
         for i, (model, batch) in enumerate(zip(self.model_gpu_towers, device_batches)):
             batch_fetches[f"tower_{i}"].update(
                 {
                     LEARNER_STATS_KEY: self.extra_grad_info(batch),
                     "model": model.metrics(),
+                    NUM_GRAD_UPDATES_LIFETIME: self.num_grad_updates,
+                    # -1, b/c we have to measure this diff before we do the update
+                    # above.
+                    DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY: (
+                        self.num_grad_updates - 1 - (batch.num_grad_updates or 0)
+                    ),
                 }
             )
-
         batch_fetches.update(self.extra_compute_grad_fetches())
 
         return batch_fetches
 
     @with_lock
     @override(Policy)
-    @DeveloperAPI
     def compute_gradients(self, postprocessed_batch: SampleBatch) -> ModelGradients:
-
         assert len(self.devices) == 1
 
         # If not done yet, see whether we have to zero-pad this batch.
@@ -655,7 +663,6 @@ class TorchPolicy(Policy):
         return all_grads, dict(fetches, **{LEARNER_STATS_KEY: grad_info})
 
     @override(Policy)
-    @DeveloperAPI
     def apply_gradients(self, gradients: ModelGradients) -> None:
         if gradients == _directStepOptimizerSingleton:
             for i, opt in enumerate(self._optimizers):
@@ -672,7 +679,6 @@ class TorchPolicy(Policy):
 
             self._optimizers[0].step()
 
-    @DeveloperAPI
     def get_tower_stats(self, stats_name: str) -> List[TensorStructType]:
         """Returns list of per-tower stats, copied to this Policy's device.
 
@@ -704,33 +710,27 @@ class TorchPolicy(Policy):
         return data
 
     @override(Policy)
-    @DeveloperAPI
     def get_weights(self) -> ModelWeights:
         return {k: v.cpu().detach().numpy() for k, v in self.model.state_dict().items()}
 
     @override(Policy)
-    @DeveloperAPI
     def set_weights(self, weights: ModelWeights) -> None:
         weights = convert_to_torch_tensor(weights, device=self.device)
         self.model.load_state_dict(weights)
 
     @override(Policy)
-    @DeveloperAPI
     def is_recurrent(self) -> bool:
         return self._is_recurrent
 
     @override(Policy)
-    @DeveloperAPI
     def num_state_tensors(self) -> int:
         return len(self.model.get_initial_state())
 
     @override(Policy)
-    @DeveloperAPI
     def get_initial_state(self) -> List[TensorType]:
         return [s.detach().cpu().numpy() for s in self.model.get_initial_state()]
 
     @override(Policy)
-    @DeveloperAPI
     def get_state(self) -> PolicyState:
         state = super().get_state()
 
@@ -739,18 +739,26 @@ class TorchPolicy(Policy):
             optim_state_dict = convert_to_numpy(o.state_dict())
             state["_optimizer_variables"].append(optim_state_dict)
         # Add exploration state.
-        state["_exploration_state"] = self.exploration.get_state()
+        if self.exploration:
+            # This is not compatible with RLModules, which have a method
+            # `forward_exploration` to specify custom exploration behavior.
+            state["_exploration_state"] = self.exploration.get_state()
         return state
 
     @override(Policy)
-    @DeveloperAPI
     def set_state(self, state: PolicyState) -> None:
         # Set optimizer vars first.
         optimizer_vars = state.get("_optimizer_variables", None)
         if optimizer_vars:
             assert len(optimizer_vars) == len(self._optimizers)
             for o, s in zip(self._optimizers, optimizer_vars):
-                optim_state_dict = convert_to_torch_tensor(s, device=self.device)
+                # Torch optimizer param_groups include things like beta, etc. These
+                # parameters should be left as scalar and not converted to tensors.
+                # otherwise, torch.optim.step() will start to complain.
+                optim_state_dict = {"param_groups": s["param_groups"]}
+                optim_state_dict["state"] = convert_to_torch_tensor(
+                    s["state"], device=self.device
+                )
                 o.load_state_dict(optim_state_dict)
         # Set exploration's state.
         if hasattr(self, "exploration") and "_exploration_state" in state:
@@ -762,7 +770,6 @@ class TorchPolicy(Policy):
         # Then the Policy's (NN) weights and connectors.
         super().set_state(state)
 
-    @DeveloperAPI
     def extra_grad_process(
         self, optimizer: "torch.optim.Optimizer", loss: TensorType
     ) -> Dict[str, TensorType]:
@@ -781,7 +788,6 @@ class TorchPolicy(Policy):
         """
         return {}
 
-    @DeveloperAPI
     def extra_compute_grad_fetches(self) -> Dict[str, Any]:
         """Extra values to fetch and return from compute_gradients().
 
@@ -791,7 +797,6 @@ class TorchPolicy(Policy):
         """
         return {LEARNER_STATS_KEY: {}}  # e.g, stats, td error, etc.
 
-    @DeveloperAPI
     def extra_action_out(
         self,
         input_dict: Dict[str, TensorType],
@@ -814,7 +819,6 @@ class TorchPolicy(Policy):
         """
         return {}
 
-    @DeveloperAPI
     def extra_grad_info(self, train_batch: SampleBatch) -> Dict[str, TensorType]:
         """Return dict of extra grad info.
 
@@ -827,7 +831,6 @@ class TorchPolicy(Policy):
         """
         return {}
 
-    @DeveloperAPI
     def optimizer(
         self,
     ) -> Union[List["torch.optim.Optimizer"], "torch.optim.Optimizer"]:
@@ -842,12 +845,11 @@ class TorchPolicy(Policy):
             ]
         else:
             optimizers = [torch.optim.Adam(self.model.parameters())]
-        if getattr(self, "exploration", None):
+        if self.exploration:
             optimizers = self.exploration.get_exploration_optimizer(optimizers)
         return optimizers
 
     @override(Policy)
-    @DeveloperAPI
     def export_model(self, export_dir: str, onnx: Optional[int] = None) -> None:
         """Exports the Policy's Model to local directory for serving.
 
@@ -910,7 +912,6 @@ class TorchPolicy(Policy):
                 logger.warning(ERR_MSG_TORCH_POLICY_CANNOT_SAVE_MODEL)
 
     @override(Policy)
-    @DeveloperAPI
     def import_model_from_h5(self, import_file: str) -> None:
         """Imports weights into torch model."""
         return self.model.import_from_h5(import_file)
@@ -1130,11 +1131,12 @@ class TorchPolicy(Policy):
                 with lock:
                     results[shard_idx] = (
                         ValueError(
-                            e.args[0]
-                            + "\n traceback"
-                            + traceback.format_exc()
-                            + "\n"
-                            + "In tower {} on device {}".format(shard_idx, device)
+                            f"Error In tower {shard_idx} on device "
+                            f"{device} during multi GPU parallel gradient "
+                            f"calculation:"
+                            f": {e}\n"
+                            f"Traceback: \n"
+                            f"{traceback.format_exc()}\n"
                         ),
                         e,
                     )
@@ -1176,7 +1178,7 @@ class TorchPolicy(Policy):
         return outputs
 
 
-@DeveloperAPI
+@OldAPIStack
 class DirectStepOptimizer:
     """Typesafe method for indicating `apply_gradients` can directly step the
     optimizers with in-place gradients.
@@ -1190,7 +1192,7 @@ class DirectStepOptimizer:
         return DirectStepOptimizer._instance
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return type(self) is type(other)
 
     def __repr__(self):
         return "DirectStepOptimizer"

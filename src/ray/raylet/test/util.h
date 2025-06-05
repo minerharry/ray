@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "ray/raylet/worker.h"
 
 namespace ray {
@@ -24,7 +30,8 @@ class MockWorker : public WorkerInterface {
       : worker_id_(worker_id),
         port_(port),
         is_detached_actor_(false),
-        runtime_env_hash_(runtime_env_hash) {}
+        runtime_env_hash_(runtime_env_hash),
+        job_id_(JobID::FromInt(859)) {}
 
   WorkerID WorkerId() const override { return worker_id_; }
 
@@ -34,16 +41,19 @@ class MockWorker : public WorkerInterface {
 
   void SetOwnerAddress(const rpc::Address &address) override { address_ = address; }
 
-  void AssignTaskId(const TaskID &task_id) override {}
+  void AssignTaskId(const TaskID &task_id) override { task_id_ = task_id; }
 
   void SetAssignedTask(const RayTask &assigned_task) override {
     task_ = assigned_task;
-    task_assign_time_ = std::chrono::steady_clock::now();
+    task_assign_time_ = absl::Now();
+    root_detached_actor_id_ = assigned_task.GetTaskSpecification().RootDetachedActorId();
   };
 
-  const std::chrono::steady_clock::time_point GetAssignedTaskTime() const override {
-    return task_assign_time_;
-  };
+  absl::Time GetAssignedTaskTime() const override { return task_assign_time_; };
+
+  std::optional<bool> GetIsGpu() const override { return is_gpu_; }
+
+  std::optional<bool> GetIsActorWorker() const override { return is_actor_worker_; }
 
   const std::string IpAddress() const override { return address_.ip_address(); }
 
@@ -95,27 +105,8 @@ class MockWorker : public WorkerInterface {
     return -1;
   }
   void SetAssignedPort(int port) override { RAY_CHECK(false) << "Method unused"; }
-  const TaskID &GetAssignedTaskId() const override {
-    RAY_CHECK(false) << "Method unused";
-    return TaskID::Nil();
-  }
-  bool AddBlockedTaskId(const TaskID &task_id) override {
-    RAY_CHECK(false) << "Method unused";
-    return false;
-  }
-  bool RemoveBlockedTaskId(const TaskID &task_id) override {
-    RAY_CHECK(false) << "Method unused";
-    return false;
-  }
-  const std::unordered_set<TaskID> &GetBlockedTaskIds() const override {
-    RAY_CHECK(false) << "Method unused";
-    auto *t = new std::unordered_set<TaskID>();
-    return *t;
-  }
-  const JobID &GetAssignedJobId() const override {
-    RAY_CHECK(false) << "Method unused";
-    return JobID::Nil();
-  }
+  const TaskID &GetAssignedTaskId() const override { return task_id_; }
+  const JobID &GetAssignedJobId() const override { return job_id_; }
   int GetRuntimeEnvHash() const override { return runtime_env_hash_; }
   void AssignActorId(const ActorID &actor_id) override {
     RAY_CHECK(false) << "Method unused";
@@ -139,7 +130,7 @@ class MockWorker : public WorkerInterface {
     return address_;
   }
 
-  void DirectActorCallArgWaitComplete(int64_t tag) override {
+  void ActorCallArgWaitComplete(int64_t tag) override {
     RAY_CHECK(false) << "Method unused";
   }
 
@@ -173,6 +164,12 @@ class MockWorker : public WorkerInterface {
     return true;
   }
 
+  void SetJobId(const JobID &job_id) override { job_id_ = job_id; }
+
+  const ActorID &GetRootDetachedActorId() const override {
+    return root_detached_actor_id_;
+  }
+
  protected:
   void SetStartupToken(StartupToken startup_token) override {
     RAY_CHECK(false) << "Method unused";
@@ -185,12 +182,17 @@ class MockWorker : public WorkerInterface {
   std::shared_ptr<TaskResourceInstances> allocated_instances_;
   std::shared_ptr<TaskResourceInstances> lifetime_allocated_instances_;
   std::vector<double> borrowed_cpu_instances_;
+  std::optional<bool> is_gpu_;
+  std::optional<bool> is_actor_worker_;
   bool is_detached_actor_;
   BundleID bundle_id_;
   bool blocked_ = false;
   RayTask task_;
-  std::chrono::steady_clock::time_point task_assign_time_;
+  absl::Time task_assign_time_;
   int runtime_env_hash_;
+  TaskID task_id_;
+  JobID job_id_;
+  ActorID root_detached_actor_id_;
 };
 
 }  // namespace raylet

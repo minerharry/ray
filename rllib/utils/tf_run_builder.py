@@ -3,12 +3,14 @@ import os
 import time
 
 from ray.util.debug import log_once
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import try_import_tf
 
 tf1, tf, tfv = try_import_tf()
 logger = logging.getLogger(__name__)
 
 
+@OldAPIStack
 class _TFRunBuilder:
     """Used to incrementally build up a TensorFlow run.
 
@@ -73,7 +75,17 @@ def _run_timeline(sess, ops, debug_name, feed_dict=None, timeline_dir=None):
     if timeline_dir:
         from tensorflow.python.client import timeline
 
-        run_options = tf1.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        try:
+            run_options = tf1.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        except AttributeError:
+            run_options = None
+            # In local mode, tf1.RunOptions is not available, see #26511
+            if log_once("tf1.RunOptions_not_available"):
+                logger.exception(
+                    "Can not access tf.RunOptions.FULL_TRACE. This may be because "
+                    "you have used `ray.init(local_mode=True)`. RLlib will use "
+                    "timeline without `options=tf.RunOptions.FULL_TRACE`."
+                )
         run_metadata = tf1.RunMetadata()
         start = time.time()
         fetches = sess.run(

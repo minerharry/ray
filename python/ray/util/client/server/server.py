@@ -22,7 +22,7 @@ import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
 from ray import cloudpickle
 from ray._private import ray_constants
 from ray._private.client_mode_hook import disable_client_hook
-from ray._private.gcs_utils import GcsClient
+from ray._raylet import GcsClient
 from ray._private.ray_constants import env_integer
 from ray._private.ray_logging import setup_logger
 from ray._private.services import canonicalize_bootstrap_address_or_die
@@ -55,7 +55,7 @@ def _use_response_cache(func):
 
     @functools.wraps(func)
     def wrapper(self, request, context):
-        metadata = {k: v for k, v in context.invocation_metadata()}
+        metadata = dict(context.invocation_metadata())
         expected_ids = ("client_id", "thread_id", "req_id")
         if any(i not in metadata for i in expected_ids):
             # Missing IDs, skip caching and call underlying stub directly
@@ -118,7 +118,7 @@ class RayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
     ) -> ray_client_pb2.InitResponse:
         if request.job_config:
             job_config = pickle.loads(request.job_config)
-            job_config.client_job = True
+            job_config._client_job = True
         else:
             job_config = None
         current_job_config = None
@@ -144,7 +144,7 @@ class RayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
         # that tests the behavior of multiple clients with the same job config
         # connecting to one server (test_client_init.py::test_num_clients),
         # so I'm leaving it here for now.
-        job_config = job_config.get_proto_job_config()
+        job_config = job_config._get_proto_job_config()
         # If the server has been initialized, we need to compare whether the
         # runtime env is compatible.
         if current_job_config:
@@ -262,12 +262,13 @@ class RayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
             ctx = ray_client_pb2.ClusterInfoResponse.RuntimeContext()
             with disable_client_hook():
                 rtc = ray.get_runtime_context()
-                ctx.job_id = rtc.job_id.binary()
-                ctx.node_id = rtc.node_id.binary()
+                ctx.job_id = ray._private.utils.hex_to_binary(rtc.get_job_id())
+                ctx.node_id = ray._private.utils.hex_to_binary(rtc.get_node_id())
                 ctx.namespace = rtc.namespace
                 ctx.capture_client_tasks = (
                     rtc.should_capture_child_tasks_in_placement_group
                 )
+                ctx.gcs_address = rtc.gcs_address
                 ctx.runtime_env = rtc.get_runtime_env_string()
             resp.runtime_context.CopyFrom(ctx)
         else:
@@ -286,6 +287,8 @@ class RayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
             data = ray.timeline()
         elif request.type == ray_client_pb2.ClusterInfoType.PING:
             data = {}
+        elif request.type == ray_client_pb2.ClusterInfoType.DASHBOARD_URL:
+            data = {"dashboard_url": ray._private.worker.get_dashboard_url()}
         else:
             raise TypeError("Unsupported cluster info type")
         return json.dumps(data)
@@ -452,7 +455,7 @@ class RayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
             return ray_client_pb2.GetResponse(valid=False, error=cloudpickle.dumps(e))
 
     def GetObject(self, request: ray_client_pb2.GetRequest, context):
-        metadata = {k: v for k, v in context.invocation_metadata()}
+        metadata = dict(context.invocation_metadata())
         client_id = metadata.get("client_id")
         if client_id is None:
             yield ray_client_pb2.GetResponse(
@@ -684,7 +687,8 @@ class RayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
         # Convert empty string back to None.
         actor = ray.get_actor(task.name, task.namespace or None)
         bin_actor_id = actor._actor_id.binary()
-        self.actor_refs[bin_actor_id] = actor
+        if bin_actor_id not in self.actor_refs:
+            self.actor_refs[bin_actor_id] = actor
         self.actor_owners[task.client_id].add(bin_actor_id)
         self.named_actors.add(bin_actor_id)
         return ray_client_pb2.ClientTaskTicket(return_ids=[actor._actor_id.binary()])
@@ -816,12 +820,13 @@ def shutdown_with_server(server, _exiting_interpreter=False):
         ray.shutdown(_exiting_interpreter)
 
 
-def create_ray_handler(address, redis_password):
+def create_ray_handler(address, redis_password, redis_username=None):
     def ray_connect_handler(job_config: JobConfig = None, **ray_init_kwargs):
         if address:
             if redis_password:
                 ray.init(
                     address=address,
+                    _redis_username=redis_username,
                     _redis_password=redis_password,
                     job_config=job_config,
                     **ray_init_kwargs,
@@ -836,7 +841,7 @@ def create_ray_handler(address, redis_password):
 
 def try_create_gcs_client(address: Optional[str]) -> Optional[GcsClient]:
     """
-    Try to create a gcs client based on the the command line args or by
+    Try to create a gcs client based on the command line args or by
     autodetecting a running Ray cluster.
     """
     address = canonicalize_bootstrap_address_or_die(address)
@@ -861,31 +866,43 @@ def main():
         "--address", required=False, type=str, help="Address to use to connect to Ray"
     )
     parser.add_argument(
+        "--redis-username",
+        required=False,
+        type=str,
+        help="username for connecting to Redis",
+    )
+    parser.add_argument(
         "--redis-password",
         required=False,
         type=str,
         help="Password for connecting to Redis",
     )
     parser.add_argument(
-        "--metrics-agent-port",
+        "--runtime-env-agent-address",
         required=False,
-        type=int,
-        default=0,
-        help="The port to use for connecting to the runtime_env agent.",
+        type=str,
+        default=None,
+        help="The port to use for connecting to the runtime_env_agent.",
     )
     args, _ = parser.parse_known_args()
     setup_logger(ray_constants.LOGGER_LEVEL, ray_constants.LOGGER_FORMAT)
 
-    ray_connect_handler = create_ray_handler(args.address, args.redis_password)
+    ray_connect_handler = create_ray_handler(
+        args.address, args.redis_password, args.redis_username
+    )
 
     hostport = "%s:%d" % (args.host, args.port)
-    logger.info(f"Starting Ray Client server on {hostport}")
+    args_str = str(args)
+    if args.redis_password:
+        args_str = args_str.replace(args.redis_password, "****")
+    logger.info(f"Starting Ray Client server on {hostport}, args {args_str}")
     if args.mode == "proxy":
         server = serve_proxier(
             hostport,
             args.address,
+            redis_username=args.redis_username,
             redis_password=args.redis_password,
-            runtime_env_agent_port=args.metrics_agent_port,
+            runtime_env_agent_address=args.runtime_env_agent_address,
         )
     else:
         server = serve(hostport, ray_connect_handler)

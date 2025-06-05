@@ -2,6 +2,8 @@
 This script is used to clean up state after running test scripts, including
 on external services. For instance, this script can be used to remove the runs
 from WandB that have been saved during unit testing or when running examples.
+
+TODO: can we remove this file?
 """
 import sys
 
@@ -10,11 +12,16 @@ def clear_wandb_project():
     import wandb
 
     # This is hardcoded in the `ray/air/examples/upload_to_wandb.py` example
-    wandb_project = "ray_air_example"
+    wandb_projects = [
+        "ray_air_example",
+        "ray_air_example_xgboost",
+        "ray_air_example_torch",
+    ]
 
-    api = wandb.Api()
-    for run in api.runs(wandb_project):
-        run.delete()
+    for wandb_project in wandb_projects:
+        api = wandb.Api()
+        for run in api.runs(wandb_project):
+            run.delete()
 
 
 def clear_comet_ml_project():

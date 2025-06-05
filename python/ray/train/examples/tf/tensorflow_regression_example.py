@@ -1,44 +1,25 @@
 import argparse
-
-import numpy as np
-import pandas as pd
-import tensorflow as tf
+import sys
 
 import ray
-from ray.air import session
-from ray.air.callbacks.keras import Callback as TrainCheckpointReportCallback
-from ray.air.result import Result
-from ray.data import Dataset
-from ray.train.batch_predictor import BatchPredictor
-from ray.train.tensorflow import (
-    TensorflowPredictor,
-    TensorflowTrainer,
-    prepare_dataset_shard,
-)
-from ray.air.config import ScalingConfig
+from ray import train
+from ray.data.preprocessors import Concatenator
+from ray.train import Result, ScalingConfig
 
+if sys.version_info >= (3, 12):
+    # Skip this test in Python 3.12+ because TensorFlow is not supported.
+    sys.exit(0)
+else:
+    import tensorflow as tf
 
-def get_dataset(a=5, b=10, size=1000) -> Dataset:
-    dataset = ray.data.read_csv("s3://anonymous@air-example-data/regression.csv")
-
-    def combine_x(batch):
-        return pd.DataFrame(
-            {
-                "x": batch[[f"x{i:03d}" for i in range(100)]].values.tolist(),
-                "y": batch["y"],
-            }
-        )
-
-    dataset = dataset.map_batches(combine_x)
-    return dataset
+    from ray.air.integrations.keras import ReportCheckpointCallback
+    from ray.train.tensorflow import TensorflowTrainer
 
 
 def build_model() -> tf.keras.Model:
     model = tf.keras.Sequential(
         [
             tf.keras.layers.InputLayer(input_shape=(100,)),
-            # Add feature dimension, expanding (batch_size,) to (batch_size, 1).
-            tf.keras.layers.Flatten(),
             tf.keras.layers.Dense(10),
             tf.keras.layers.Dense(1),
         ]
@@ -60,65 +41,37 @@ def train_func(config: dict):
             metrics=[tf.keras.metrics.mean_squared_error],
         )
 
-    dataset = session.get_dataset_shard("train")
-
-    def to_tf_dataset(dataset, batch_size):
-        def to_tensor_iterator():
-            for batch in dataset.iter_tf_batches(
-                batch_size=batch_size, dtypes=tf.float32
-            ):
-                yield batch["x"], batch["y"]
-
-        output_signature = (
-            tf.TensorSpec(shape=(None, 100), dtype=tf.float32),
-            tf.TensorSpec(shape=(None), dtype=tf.float32),
-        )
-        tf_dataset = tf.data.Dataset.from_generator(
-            to_tensor_iterator, output_signature=output_signature
-        )
-        return prepare_dataset_shard(tf_dataset)
+    dataset = train.get_dataset_shard("train")
 
     results = []
     for _ in range(epochs):
-        tf_dataset = to_tf_dataset(dataset=dataset, batch_size=batch_size)
+        tf_dataset = dataset.to_tf(
+            feature_columns="x", label_columns="y", batch_size=batch_size
+        )
         history = multi_worker_model.fit(
-            tf_dataset, callbacks=[TrainCheckpointReportCallback()]
+            tf_dataset, callbacks=[ReportCheckpointCallback()]
         )
         results.append(history.history)
     return results
 
 
 def train_tensorflow_regression(num_workers: int = 2, use_gpu: bool = False) -> Result:
-    dataset_pipeline = get_dataset()
+    dataset = ray.data.read_csv("s3://anonymous@air-example-data/regression.csv")
+    columns_to_concatenate = [f"x{i:03}" for i in range(100)]
+    preprocessor = Concatenator(columns=columns_to_concatenate, output_column_name="x")
+    dataset = preprocessor.fit_transform(dataset)
+
     config = {"lr": 1e-3, "batch_size": 32, "epochs": 4}
     scaling_config = ScalingConfig(num_workers=num_workers, use_gpu=use_gpu)
     trainer = TensorflowTrainer(
         train_loop_per_worker=train_func,
         train_loop_config=config,
         scaling_config=scaling_config,
-        datasets={"train": dataset_pipeline},
+        datasets={"train": dataset},
     )
     results = trainer.fit()
     print(results.metrics)
     return results
-
-
-def predict_regression(result: Result) -> Dataset:
-    batch_predictor = BatchPredictor.from_checkpoint(
-        result.checkpoint, TensorflowPredictor, model_definition=build_model
-    )
-
-    df = pd.DataFrame(
-        [[np.random.uniform(0, 1, size=100)] for i in range(100)], columns=["x"]
-    )
-    prediction_dataset = ray.data.from_pandas(df)
-
-    predictions = batch_predictor.predict(prediction_dataset, dtype=tf.float32)
-
-    print("PREDICTIONS")
-    predictions.show()
-
-    return predictions
 
 
 if __name__ == "__main__":
@@ -155,4 +108,4 @@ if __name__ == "__main__":
         result = train_tensorflow_regression(
             num_workers=args.num_workers, use_gpu=args.use_gpu
         )
-    predict_regression(result)
+    print(result)

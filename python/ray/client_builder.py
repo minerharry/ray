@@ -14,12 +14,11 @@ from ray._private.ray_constants import (
     RAY_NAMESPACE_ENVIRONMENT_VARIABLE,
     RAY_RUNTIME_ENV_ENVIRONMENT_VARIABLE,
 )
-from ray._private.utils import split_address
+from ray._private.utils import check_ray_client_dependencies_installed, split_address
 from ray._private.worker import BaseContext
 from ray._private.worker import init as ray_driver_init
 from ray.job_config import JobConfig
 from ray.util.annotations import Deprecated, PublicAPI
-from ray.widgets import Template
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +33,13 @@ CLIENT_DOCS_URL = (
 class ClientContext(BaseContext):
     """
     Basic context manager for a ClientBuilder connection.
+
     """
 
     dashboard_url: Optional[str]
     python_version: str
     ray_version: str
     ray_commit: str
-    protocol_version: Optional[str]
     _num_clients: int
     _context_to_restore: Optional[ray.util.client.RayAPIStub]
 
@@ -86,20 +85,6 @@ class ClientContext(BaseContext):
             # This is only a driver connected to an existing cluster.
             ray.shutdown()
 
-    def _repr_html_(self):
-        if self.dashboard_url:
-            dashboard_row = Template("context_dashrow.html.j2").render(
-                dashboard_url="http://" + self.dashboard_url
-            )
-        else:
-            dashboard_row = None
-
-        return Template("context.html.j2").render(
-            python_version=self.python_version,
-            ray_version=self.ray_version,
-            dashboard_row=dashboard_row,
-        )
-
 
 @Deprecated
 class ClientBuilder:
@@ -110,6 +95,12 @@ class ClientBuilder:
     """
 
     def __init__(self, address: Optional[str]) -> None:
+        if not check_ray_client_dependencies_installed():
+            raise ValueError(
+                "Ray Client requires pip package `ray[client]`. "
+                "If you installed the minimal Ray (e.g. `pip install ray`), "
+                "please reinstall by executing `pip install ray[client]`."
+            )
         self.address = address
         self._job_config = JobConfig()
         self._remote_init_kwargs = {}
@@ -127,8 +118,8 @@ class ClientBuilder:
         Set an environment for the session.
         Args:
             env (Dict[st, Any]): A runtime environment to use for this
-            connection. See :ref:`runtime-environments` for what values are
-            accepted in this dict.
+                connection. See :ref:`runtime-environments` for what values are
+                accepted in this dict.
         """
         self._job_config.set_runtime_env(env)
         return self
@@ -186,14 +177,14 @@ class ClientBuilder:
             ray_init_kwargs=self._remote_init_kwargs,
             metadata=self._metadata,
         )
-        get_dashboard_url = ray.remote(ray._private.worker.get_dashboard_url)
-        dashboard_url = ray.get(get_dashboard_url.options(num_cpus=0).remote())
+
+        dashboard_url = ray.util.client.ray._get_dashboard_url()
+
         cxt = ClientContext(
             dashboard_url=dashboard_url,
             python_version=client_info_dict["python_version"],
             ray_version=client_info_dict["ray_version"],
             ray_commit=client_info_dict["ray_commit"],
-            protocol_version=client_info_dict["protocol_version"],
             _num_clients=client_info_dict["num_clients"],
             _context_to_restore=ray.util.client.ray.get_context(),
         )
@@ -316,7 +307,6 @@ class _LocalClientBuilder(ClientBuilder):
             ),
             ray_version=ray.__version__,
             ray_commit=ray.__commit__,
-            protocol_version=None,
             _num_clients=1,
             _context_to_restore=None,
         )

@@ -1,38 +1,29 @@
-from typing import Any
+import collections
+from typing import Any, Mapping, Optional
 
-import numpy as np
-
-from ray.data.block import Block, DataBatch, T, BlockAccessor
+from ray.data._internal.arrow_block import ArrowBlockBuilder
 from ray.data._internal.block_builder import BlockBuilder
-from ray.data._internal.simple_block import SimpleBlockBuilder
-from ray.data._internal.arrow_block import ArrowRow, ArrowBlockBuilder
-from ray.data._internal.pandas_block import PandasRow, PandasBlockBuilder
+from ray.data.block import Block, BlockAccessor, BlockType, DataBatch
 
 
-class DelegatingBlockBuilder(BlockBuilder[T]):
+class DelegatingBlockBuilder(BlockBuilder):
     def __init__(self):
         self._builder = None
         self._empty_block = None
 
-    def add(self, item: Any) -> None:
-        if self._builder is None:
-            # TODO (kfstorm): Maybe we can use Pandas block format for dict.
-            if isinstance(item, dict) or isinstance(item, ArrowRow):
-                import pyarrow
+    @property
+    def _inferred_block_type(self) -> Optional[BlockType]:
+        """The block type inferred from the first item added to the builder."""
+        if self._builder is not None:
+            return self._builder.block_type()
+        return None
 
-                try:
-                    check = ArrowBlockBuilder()
-                    check.add(item)
-                    check.build()
-                    self._builder = ArrowBlockBuilder()
-                except (TypeError, pyarrow.lib.ArrowInvalid):
-                    self._builder = SimpleBlockBuilder()
-            elif isinstance(item, np.ndarray):
-                self._builder = ArrowBlockBuilder()
-            elif isinstance(item, PandasRow):
-                self._builder = PandasBlockBuilder()
-            else:
-                self._builder = SimpleBlockBuilder()
+    def add(self, item: Mapping[str, Any]) -> None:
+        assert isinstance(item, collections.abc.Mapping), item
+
+        if self._builder is None:
+            self._builder = ArrowBlockBuilder()
+
         self._builder.add(item)
 
     def add_batch(self, batch: DataBatch):
@@ -41,7 +32,7 @@ class DelegatingBlockBuilder(BlockBuilder[T]):
         This data batch will be converted to an internal block and then added to the
         underlying builder.
         """
-        block = BlockAccessor.batch_to_block(batch)
+        block = BlockAccessor.batch_to_block(batch, self._inferred_block_type)
         return self.add_block(block)
 
     def add_block(self, block: Block):
@@ -53,12 +44,25 @@ class DelegatingBlockBuilder(BlockBuilder[T]):
             return
         if self._builder is None:
             self._builder = accessor.builder()
-        self._builder.add_block(block)
+        else:
+            block_type = accessor.block_type()
+            assert block_type == self._inferred_block_type, (
+                block_type,
+                self._inferred_block_type,
+            )
+
+        self._builder.add_block(accessor.to_block())
+
+    def will_build_yield_copy(self) -> bool:
+        if self._builder is None:
+            return True
+        return self._builder.will_build_yield_copy()
 
     def build(self) -> Block:
         if self._builder is None:
             if self._empty_block is not None:
                 self._builder = BlockAccessor.for_block(self._empty_block).builder()
+                self._builder.add_block(self._empty_block)
             else:
                 self._builder = ArrowBlockBuilder()
         return self._builder.build()

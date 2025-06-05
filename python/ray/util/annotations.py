@@ -1,4 +1,16 @@
+from enum import Enum
 from typing import Optional
+import inspect
+import sys
+import warnings
+from functools import wraps
+
+
+class AnnotationType(Enum):
+    PUBLIC_API = "PublicAPI"
+    DEVELOPER_API = "DeveloperAPI"
+    DEPRECATED = "Deprecated"
+    UNKNOWN = "Unknown"
 
 
 def PublicAPI(*args, **kwargs):
@@ -20,6 +32,8 @@ def PublicAPI(*args, **kwargs):
 
     Args:
         stability: One of {"stable", "beta", "alpha"}.
+        api_group: Optional. Used only for doc rendering purpose. APIs in the same group
+                   will be grouped together in the API doc pages.
 
     Examples:
         >>> from ray.util.annotations import PublicAPI
@@ -32,27 +46,24 @@ def PublicAPI(*args, **kwargs):
         ...     return y
     """
     if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
-        return PublicAPI(stability="stable")(args[0])
+        return PublicAPI(stability="stable", api_group="Others")(args[0])
 
     if "stability" in kwargs:
         stability = kwargs["stability"]
         assert stability in ["stable", "beta", "alpha"], stability
-    elif kwargs:
-        raise ValueError("Unknown kwargs: {}".format(kwargs.keys()))
     else:
         stability = "stable"
+    api_group = kwargs.get("api_group", "Others")
 
     def wrap(obj):
         if stability in ["alpha", "beta"]:
             message = (
-                f"PublicAPI ({stability}): This API is in {stability} "
+                f"**PublicAPI ({stability}):** This API is in {stability} "
                 "and may change before becoming stable."
             )
-        else:
-            message = "PublicAPI: This API is stable across Ray releases."
+            _append_doc(obj, message=message)
 
-        _append_doc(obj, message=message)
-        _mark_annotated(obj)
+        _mark_annotated(obj, type=AnnotationType.PUBLIC_API, api_group=api_group)
         return obj
 
     return wrap
@@ -76,12 +87,25 @@ def DeveloperAPI(*args, **kwargs):
 
     def wrap(obj):
         _append_doc(
-            obj, message="DeveloperAPI: This API may change across minor Ray releases."
+            obj,
+            message="**DeveloperAPI:** This API may change across minor Ray releases.",
         )
-        _mark_annotated(obj)
+        _mark_annotated(obj, type=AnnotationType.DEVELOPER_API)
         return obj
 
     return wrap
+
+
+class RayDeprecationWarning(DeprecationWarning):
+    """Specialized Deprecation Warning for fine grained filtering control"""
+
+    pass
+
+
+# By default, print the first occurrence of matching warnings for
+# each module where the warning is issued (regardless of line number)
+if not sys.warnoptions:
+    warnings.filterwarnings("module", category=RayDeprecationWarning)
 
 
 def Deprecated(*args, **kwargs):
@@ -107,22 +131,50 @@ def Deprecated(*args, **kwargs):
     if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
         return Deprecated()(args[0])
 
-    message = (
-        "**DEPRECATED:** This API is deprecated and may be removed in a future "
-        "Ray release."
+    doc_message = (
+        "**DEPRECATED**: This API is deprecated and may be removed "
+        "in future Ray releases."
+    )
+    warning_message = (
+        "This API is deprecated and may be removed in future Ray releases. "
+        "You could suppress this warning by setting env variable "
+        'PYTHONWARNINGS="ignore::DeprecationWarning"'
     )
 
+    warning = kwargs.pop("warning", False)
+
     if "message" in kwargs:
-        message += " " + kwargs["message"]
+        doc_message = doc_message + "\n" + kwargs["message"]
+        warning_message = warning_message + "\n" + kwargs["message"]
         del kwargs["message"]
 
     if kwargs:
         raise ValueError("Unknown kwargs: {}".format(kwargs.keys()))
 
     def inner(obj):
-        _append_doc(obj, message=message, directive="warning")
-        _mark_annotated(obj)
-        return obj
+        _append_doc(obj, message=doc_message, directive="warning")
+        _mark_annotated(obj, type=AnnotationType.DEPRECATED)
+
+        if not warning:
+            return obj
+
+        if inspect.isclass(obj):
+            obj_init = obj.__init__
+
+            def patched_init(*args, **kwargs):
+                warnings.warn(warning_message, RayDeprecationWarning, stacklevel=2)
+                return obj_init(*args, **kwargs)
+
+            obj.__init__ = patched_init
+            return obj
+        else:
+            # class method or function.
+            @wraps(obj)
+            def wrapper(*args, **kwargs):
+                warnings.warn(warning_message, RayDeprecationWarning, stacklevel=2)
+                return obj(*args, **kwargs)
+
+            return wrapper
 
     return inner
 
@@ -135,10 +187,14 @@ def _append_doc(obj, *, message: str, directive: Optional[str] = None) -> str:
 
     indent = _get_indent(obj.__doc__)
     obj.__doc__ += "\n\n"
+
     if directive is not None:
-        obj.__doc__ += f"{' ' * indent}.. {directive}::\n"
+        obj.__doc__ += f"{' ' * indent}.. {directive}::\n\n"
+
+        message = message.replace("\n", "\n" + " " * (indent + 4))
         obj.__doc__ += f"{' ' * (indent + 4)}{message}"
     else:
+        message = message.replace("\n", "\n" + " " * (indent + 4))
         obj.__doc__ += f"{' ' * indent}{message}"
     obj.__doc__ += f"\n{' ' * indent}"
 
@@ -190,12 +246,23 @@ def _get_indent(docstring: str) -> int:
     return len(non_empty_lines[1]) - len(non_empty_lines[1].lstrip())
 
 
-def _mark_annotated(obj) -> None:
+def _mark_annotated(
+    obj, type: AnnotationType = AnnotationType.UNKNOWN, api_group="Others"
+) -> None:
     # Set magic token for check_api_annotations linter.
     if hasattr(obj, "__name__"):
         obj._annotated = obj.__name__
+        obj._annotated_type = type
+        obj._annotated_api_group = api_group
 
 
 def _is_annotated(obj) -> bool:
     # Check the magic token exists and applies to this class (not a subclass).
     return hasattr(obj, "_annotated") and obj._annotated == obj.__name__
+
+
+def _get_annotation_type(obj) -> Optional[str]:
+    if not _is_annotated(obj):
+        return None
+
+    return obj._annotated_type.value

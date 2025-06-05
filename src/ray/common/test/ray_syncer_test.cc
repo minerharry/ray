@@ -11,24 +11,27 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include "mock/ray/common/ray_syncer/ray_syncer.h"
 
-// clang-format off
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
-#include <chrono>
-#include <sstream>
+#include <gmock/gmock.h>
+#include <google/protobuf/util/json_util.h>
+#include <google/protobuf/util/message_differencer.h>
 #include <grpc/grpc.h>
 #include <grpcpp/create_channel.h>
-#include <google/protobuf/util/message_differencer.h>
-#include <google/protobuf/util/json_util.h>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
+#include <gtest/gtest.h>
 
+#include <chrono>
+#include <sstream>
+
+#include "ray/common/ray_syncer/node_state.h"
 #include "ray/common/ray_syncer/ray_syncer.h"
-#include "mock/ray/common/ray_syncer/ray_syncer.h"
-// clang-format on
+#include "ray/common/ray_syncer/ray_syncer_client.h"
+#include "ray/common/ray_syncer/ray_syncer_server.h"
+#include "ray/rpc/grpc_server.h"
 
 using namespace std::chrono;
 using namespace ray::syncer;
@@ -44,6 +47,9 @@ namespace syncer {
 
 constexpr size_t kTestComponents = 1;
 
+using work_guard_type =
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
+
 RaySyncMessage MakeMessage(MessageType cid, int64_t version, const NodeID &id) {
   auto msg = RaySyncMessage();
   msg.set_version(version);
@@ -55,6 +61,7 @@ RaySyncMessage MakeMessage(MessageType cid, int64_t version, const NodeID &id) {
 class RaySyncerTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    work_guard_ = std::make_unique<work_guard_type>(io_context_.get_executor());
     local_versions_.fill(0);
     for (size_t cid = 0; cid < reporters_.size(); ++cid) {
       receivers_[cid] = std::make_unique<MockReceiverInterface>();
@@ -74,10 +81,7 @@ class RaySyncerTest : public ::testing::Test {
       ON_CALL(*reporter, CreateSyncMessage(_, _))
           .WillByDefault(WithArg<0>(Invoke(take_snapshot)));
     }
-    thread_ = std::make_unique<std::thread>([this]() {
-      boost::asio::io_context::work work(io_context_);
-      io_context_.run();
-    });
+    thread_ = std::make_unique<std::thread>([this]() { io_context_.run(); });
     local_id_ = NodeID::FromRandom();
     syncer_ = std::make_unique<RaySyncer>(io_context_, local_id_.Binary());
   }
@@ -95,6 +99,7 @@ class RaySyncerTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    work_guard_->reset();
     io_context_.stop();
     thread_->join();
   }
@@ -106,6 +111,7 @@ class RaySyncerTest : public ::testing::Test {
       nullptr};
 
   instrumented_io_context io_context_;
+  std::unique_ptr<work_guard_type> work_guard_;
   std::unique_ptr<std::thread> thread_;
 
   std::unique_ptr<RaySyncer> syncer_;
@@ -145,48 +151,75 @@ TEST_F(RaySyncerTest, NodeStateConsume) {
   ASSERT_FALSE(node_status->ConsumeSyncMessage(std::make_shared<RaySyncMessage>(msg)));
 }
 
-TEST_F(RaySyncerTest, NodeSyncConnection) {
+struct MockReactor {
+  void StartRead(RaySyncMessage *) { ++read_cnt; }
+
+  void StartWrite(const RaySyncMessage *,
+                  grpc::WriteOptions opts = grpc::WriteOptions()) {
+    ++write_cnt;
+  }
+
+  virtual void OnWriteDone(bool ok) {}
+  virtual void OnReadDone(bool ok) {}
+
+  size_t read_cnt = 0;
+  size_t write_cnt = 0;
+};
+
+TEST_F(RaySyncerTest, RaySyncerBidiReactorBase) {
   auto node_id = NodeID::FromRandom();
 
-  MockNodeSyncConnection sync_connection(
+  MockRaySyncerBidiReactorBase<MockReactor> sync_reactor(
       io_context_,
       node_id.Binary(),
-      [](std::shared_ptr<ray::rpc::syncer::RaySyncMessage>) {});
+      [](std::shared_ptr<const ray::rpc::syncer::RaySyncMessage>) {});
   auto from_node_id = NodeID::FromRandom();
   auto msg = MakeMessage(MessageType::RESOURCE_VIEW, 0, from_node_id);
+  auto msg_ptr1 = std::make_shared<RaySyncMessage>(msg);
+  msg.set_version(2);
+  auto msg_ptr2 = std::make_shared<RaySyncMessage>(msg);
+  msg.set_version(3);
+  auto msg_ptr3 = std::make_shared<RaySyncMessage>(msg);
 
   // First push will succeed and the second one will be deduplicated.
-  ASSERT_TRUE(sync_connection.PushToSendingQueue(std::make_shared<RaySyncMessage>(msg)));
-  ASSERT_FALSE(sync_connection.PushToSendingQueue(std::make_shared<RaySyncMessage>(msg)));
-  ASSERT_EQ(1, sync_connection.sending_buffer_.size());
-  ASSERT_EQ(0, sync_connection.sending_buffer_.begin()->second->version());
-  ASSERT_EQ(1, sync_connection.node_versions_.size());
-  ASSERT_EQ(
-      0,
-      sync_connection.node_versions_[from_node_id.Binary()][MessageType::RESOURCE_VIEW]);
+  ASSERT_TRUE(sync_reactor.PushToSendingQueue(msg_ptr1));
+  ASSERT_FALSE(sync_reactor.PushToSendingQueue(msg_ptr1));
+  ASSERT_EQ(0, sync_reactor.sending_buffer_.size());
 
-  msg.set_version(2);
-  ASSERT_TRUE(sync_connection.PushToSendingQueue(std::make_shared<RaySyncMessage>(msg)));
-  ASSERT_FALSE(sync_connection.PushToSendingQueue(std::make_shared<RaySyncMessage>(msg)));
-  // The previous message is deleted.
-  ASSERT_EQ(1, sync_connection.sending_buffer_.size());
-  ASSERT_EQ(1, sync_connection.node_versions_.size());
-  ASSERT_EQ(2, sync_connection.sending_buffer_.begin()->second->version());
+  ASSERT_TRUE(sync_reactor.PushToSendingQueue(msg_ptr2));
+  ASSERT_EQ(1, sync_reactor.sending_buffer_.size());
+  ASSERT_EQ(1, sync_reactor.node_versions_.size());
+  ASSERT_EQ(2, sync_reactor.sending_buffer_.begin()->second->version());
   ASSERT_EQ(
-      2,
-      sync_connection.node_versions_[from_node_id.Binary()][MessageType::RESOURCE_VIEW]);
+      2, sync_reactor.node_versions_[from_node_id.Binary()][MessageType::RESOURCE_VIEW]);
+
+  ASSERT_TRUE(sync_reactor.PushToSendingQueue(msg_ptr3));
+  ASSERT_EQ(1, sync_reactor.sending_buffer_.size());
+  ASSERT_EQ(1, sync_reactor.node_versions_.size());
+  ASSERT_EQ(3, sync_reactor.sending_buffer_.begin()->second->version());
+  ASSERT_EQ(
+      3, sync_reactor.node_versions_[from_node_id.Binary()][MessageType::RESOURCE_VIEW]);
 }
 
 struct SyncerServerTest {
-  SyncerServerTest(std::string port) {
+  SyncerServerTest(std::string port)
+      : SyncerServerTest(
+            std::move(port), /*node_id=*/NodeID::FromRandom(), /*ray_sync_observer=*/{}) {
+  }
+
+  SyncerServerTest(std::string port,
+                   NodeID node_id,
+                   RpcCompletionCallback ray_sync_observer)
+      : work_guard(io_context.get_executor()) {
     this->server_port = port;
     // Setup io context
-    auto node_id = NodeID::FromRandom();
     for (auto &v : local_versions) {
       v = 0;
     }
     // Setup syncer and grpc server
-    syncer = std::make_unique<RaySyncer>(io_context, node_id.Binary());
+    syncer = std::make_unique<RaySyncer>(
+        io_context, node_id.Binary(), std::move(ray_sync_observer));
+    thread = std::make_unique<std::thread>([this] { io_context.run(); });
 
     auto server_address = std::string("0.0.0.0:") + port;
     grpc::ServerBuilder builder;
@@ -196,7 +229,10 @@ struct SyncerServerTest {
     server = builder.BuildAndStart();
 
     for (size_t cid = 0; cid < reporters.size(); ++cid) {
-      auto snapshot_received = [this](std::shared_ptr<const RaySyncMessage> message) {
+      auto snapshot_received = [this,
+                                node_id](std::shared_ptr<const RaySyncMessage> message) {
+        RAY_LOG(DEBUG) << "Message received: from "
+                       << NodeID::FromBinary(message->node_id()) << " to " << node_id;
         auto iter = received_versions.find(message->node_id());
         if (iter == received_versions.end()) {
           for (auto &v : received_versions[message->node_id()]) {
@@ -208,6 +244,9 @@ struct SyncerServerTest {
         received_versions[message->node_id()][message->message_type()] =
             message->version();
         message_consumed[message->node_id()]++;
+        RAY_LOG(DEBUG) << "Message consumed from "
+                       << NodeID::FromBinary(message->node_id())
+                       << ", local_id=" << node_id;
       };
       receivers[cid] = std::make_unique<MockReceiverInterface>();
       EXPECT_CALL(*receivers[cid], ConsumeSyncMessage(_))
@@ -232,10 +271,6 @@ struct SyncerServerTest {
       syncer->Register(
           static_cast<MessageType>(cid), reporter.get(), receivers[cid].get());
     }
-    thread = std::make_unique<std::thread>([this] {
-      boost::asio::io_context::work work(io_context);
-      io_context.run();
-    });
   }
 
   void WaitSendingFlush() {
@@ -244,13 +279,22 @@ struct SyncerServerTest {
       auto f = p.get_future();
       io_context.post(
           [&p, this]() mutable {
-            for (const auto &[node_id, conn] : syncer->sync_connections_) {
-              if (!conn->sending_buffer_.empty()) {
+            for (const auto &[node_id, conn] : syncer->sync_reactors_) {
+              auto ptr = dynamic_cast<RayServerBidiReactor *>(conn);
+              size_t remainings = 0;
+              if (ptr == nullptr) {
+                remainings =
+                    dynamic_cast<RayClientBidiReactor *>(conn)->sending_buffer_.size();
+              } else {
+                remainings = ptr->sending_buffer_.size();
+              }
+
+              if (remainings != 0) {
                 p.set_value(false);
                 RAY_LOG(INFO) << NodeID::FromBinary(syncer->GetLocalNodeID()) << ": "
                               << "Waiting for message on " << NodeID::FromBinary(node_id)
                               << " to be sent."
-                              << " Remainings " << conn->sending_buffer_.size();
+                              << " Remainings " << remainings;
                 return;
               }
             }
@@ -281,11 +325,19 @@ struct SyncerServerTest {
     return false;
   }
 
-  ~SyncerServerTest() {
-    service.reset();
-    server.reset();
+  void Stop() {
+    for (auto node_id : syncer->GetAllConnectedNodeIDs()) {
+      syncer->Disconnect(node_id);
+    }
+
+    server->Shutdown();
+
     io_context.stop();
     thread->join();
+
+    server.reset();
+    service.reset();
+
     syncer.reset();
   }
 
@@ -314,7 +366,9 @@ struct SyncerServerTest {
   std::unique_ptr<RaySyncer> syncer;
   std::unique_ptr<grpc::Server> server;
   std::unique_ptr<std::thread> thread;
+
   instrumented_io_context io_context;
+  work_guard_type work_guard;
   std::string server_port;
   std::array<std::atomic<int64_t>, kTestComponents> local_versions;
   std::array<std::unique_ptr<MockReporterInterface>, kTestComponents> reporters = {
@@ -367,38 +421,81 @@ using TClusterView = absl::flat_hash_map<
     std::string,
     std::array<std::shared_ptr<const RaySyncMessage>, kComponentArraySize>>;
 
-TEST(SyncerTest, Test1To1) {
-  auto s1 = SyncerServerTest("19990");
+class SyncerTest : public ::testing::Test {
+ public:
+  SyncerServerTest &MakeServer(std::string port) {
+    servers.emplace_back(std::make_unique<SyncerServerTest>(port));
+    return *servers.back();
+  }
 
-  auto s2 = SyncerServerTest("19991");
+  SyncerServerTest &MakeServer(std::string port,
+                               NodeID node_id,
+                               RpcCompletionCallback on_rpc_completion) {
+    servers.emplace_back(std::make_unique<SyncerServerTest>(
+        port, std::move(node_id), std::move(on_rpc_completion)));
+    return *servers.back();
+  }
+
+ protected:
+  void TearDown() override {
+    // Drain all grpc requests.
+    for (auto &s : servers) {
+      s->Stop();
+    }
+
+    std::this_thread::sleep_for(1s);
+  }
+  std::vector<std::unique_ptr<SyncerServerTest>> servers;
+};
+
+TEST_F(SyncerTest, Test1To1) {
+  // Generate node ids for checking.
+  NodeID node_id1 = NodeID::FromRandom();
+  NodeID node_id2 = NodeID::FromRandom();
+
+  // Used to check the number of messages consumed for two servers.
+  int s1_observer_cb_call_cnt = 0;
+  int s2_observer_cb_call_cnt = 0;
+
+  // Register observer callback for syncers.
+  auto syncer_observer_cb = [&](const NodeID &node_id) {
+    if (node_id == node_id1) {
+      ++s1_observer_cb_call_cnt;
+    } else if (node_id == node_id2) {
+      ++s2_observer_cb_call_cnt;
+    }
+  };
+
+  auto &s1 = MakeServer("19990", node_id1, syncer_observer_cb);
+  auto &s2 = MakeServer("19991", node_id2, syncer_observer_cb);
 
   // Make sure the setup is correct
   ASSERT_NE(nullptr, s1.receivers[MessageType::RESOURCE_VIEW]);
   ASSERT_NE(nullptr, s2.receivers[MessageType::RESOURCE_VIEW]);
   ASSERT_NE(nullptr, s1.reporters[MessageType::RESOURCE_VIEW]);
   ASSERT_NE(nullptr, s2.reporters[MessageType::RESOURCE_VIEW]);
+  RAY_LOG(DEBUG) << "s1: " << NodeID::FromBinary(s1.syncer->GetLocalNodeID());
+  RAY_LOG(DEBUG) << "s2: " << NodeID::FromBinary(s2.syncer->GetLocalNodeID());
 
   auto channel_to_s2 = MakeChannel("19991");
 
-  s1.syncer->Connect(channel_to_s2);
+  s1.syncer->Connect(s2.syncer->GetLocalNodeID(), channel_to_s2);
 
   // Make sure s2 adds s1
   ASSERT_TRUE(s2.WaitUntil(
-      [&s2]() {
-        return s2.syncer->sync_connections_.size() == 1 && s2.snapshot_taken == 1;
-      },
+      [&s2]() { return s2.syncer->sync_reactors_.size() == 1 && s2.snapshot_taken == 1; },
       5));
 
   // Make sure s1 adds s2
   ASSERT_TRUE(s1.WaitUntil(
-      [&s1]() {
-        return s1.syncer->sync_connections_.size() == 1 && s1.snapshot_taken == 1;
-      },
+      [&s1]() { return s1.syncer->sync_reactors_.size() == 1 && s1.snapshot_taken == 1; },
       5));
 
   // s1 will only send 1 message to s2 because it only has one reporter
   ASSERT_TRUE(s2.WaitUntil(
       [&s2, node_id = s1.syncer->GetLocalNodeID()]() {
+        RAY_LOG(DEBUG) << NodeID::FromBinary(node_id) << " - "
+                       << s2.GetNumConsumedMessages(node_id);
         return s2.GetNumConsumedMessages(node_id) == 1;
       },
       5));
@@ -406,6 +503,9 @@ TEST(SyncerTest, Test1To1) {
   // s2 will send 2 messages to s1 because it has two reporters.
   ASSERT_TRUE(s1.WaitUntil(
       [&s1, node_id = s2.syncer->GetLocalNodeID()]() {
+        RAY_LOG(DEBUG) << "Num of messages from " << NodeID::FromBinary(node_id) << " to "
+                       << NodeID::FromBinary(s1.syncer->GetLocalNodeID()) << " is "
+                       << s1.GetNumConsumedMessages(node_id);
         return s1.GetNumConsumedMessages(node_id) == 1;
       },
       5));
@@ -436,17 +536,13 @@ TEST(SyncerTest, Test1To1) {
   std::mt19937 gen(rd());
   std::uniform_int_distribution<> rand_sleep(0, 10000);
   std::uniform_int_distribution<> choose_component(0, kTestComponents - 1);
-  size_t s1_updated = 0;
-  size_t s2_updated = 0;
 
   auto start = steady_clock::now();
   for (int i = 0; i < 10000; ++i) {
     if (choose_component(gen) == 0) {
       s1.local_versions[0]++;
-      ++s1_updated;
     } else {
       s2.local_versions[choose_component(gen)]++;
-      ++s2_updated;
     }
     if (rand_sleep(gen) < 5) {
       std::this_thread::sleep_for(1s);
@@ -473,74 +569,65 @@ TEST(SyncerTest, Test1To1) {
   ASSERT_LE(s1.GetNumConsumedMessages(s2.syncer->GetLocalNodeID()), max_sends * 2 + 3);
   // s1 has one reporter + 1 for the one send before the measure
   ASSERT_LE(s2.GetNumConsumedMessages(s1.syncer->GetLocalNodeID()), max_sends + 3);
+
+  // Make sure registered callbacks have been called.
+  ASSERT_GT(s1_observer_cb_call_cnt, 0);
+  ASSERT_GT(s2_observer_cb_call_cnt, 0);
 }
 
-TEST(SyncerTest, Reconnect) {
+TEST_F(SyncerTest, Reconnect) {
   // This test is to check reconnect works.
-  // Firstly
-  //    s1 -> s3
-  // Then,
-  //    s2 -> s3
-  // And we need to ensure s3 is connecting to s2
+  auto &s1 = MakeServer("19990");
+  auto &s2 = MakeServer("19991");
 
-  auto s1 = SyncerServerTest("19990");
-  auto s2 = SyncerServerTest("19991");
-  auto s3 = SyncerServerTest("19992");
-
-  s1.syncer->Connect(MakeChannel("19992"));
+  s1.syncer->Connect(s2.syncer->GetLocalNodeID(), MakeChannel("19991"));
 
   // Make sure the setup is correct
   ASSERT_TRUE(s1.WaitUntil(
-      [&s1]() {
-        return s1.syncer->sync_connections_.size() == 1 && s1.snapshot_taken == 1;
-      },
+      [&s1]() { return s1.syncer->sync_reactors_.size() == 1 && s1.snapshot_taken == 1; },
+      5));
+  ASSERT_TRUE(s2.WaitUntil(
+      [&s2]() { return s2.syncer->sync_reactors_.size() == 1 && s2.snapshot_taken == 1; },
       5));
 
+  s1.syncer->Disconnect(s2.syncer->GetLocalNodeID());
+  s1.syncer->Connect(s2.syncer->GetLocalNodeID(), MakeChannel("19991"));
   ASSERT_TRUE(s1.WaitUntil(
-      [&s3]() {
-        return s3.syncer->sync_connections_.size() == 1 && s3.snapshot_taken == 1;
-      },
+      [&s1]() { return s1.syncer->sync_reactors_.size() == 1 && s1.snapshot_taken == 1; },
       5));
-  s2.syncer->Connect(MakeChannel("19992"));
 
-  ASSERT_TRUE(s1.WaitUntil(
-      [&s2]() {
-        return s2.syncer->sync_connections_.size() == 1 && s2.snapshot_taken == 1;
+  s1.local_versions[0] = 1;
+  ASSERT_TRUE(s2.WaitUntil(
+      [&s2, node_id = s1.syncer->GetLocalNodeID()]() {
+        return s2.received_versions[node_id][0] == 1;
       },
       5));
 }
 
-TEST(SyncerTest, Broadcast) {
+TEST_F(SyncerTest, Broadcast) {
   // This test covers the broadcast feature of ray syncer.
-  auto s1 = SyncerServerTest("19990");
-  auto s2 = SyncerServerTest("19991");
-  auto s3 = SyncerServerTest("19992");
+  auto &s1 = MakeServer("19990");
+  auto &s2 = MakeServer("19991");
+  auto &s3 = MakeServer("19992");
   // We need to make sure s1 is sending data to s3 for s2
-  s1.syncer->Connect(MakeChannel("19991"));
-  s1.syncer->Connect(MakeChannel("19992"));
+  s1.syncer->Connect(s2.syncer->GetLocalNodeID(), MakeChannel("19991"));
+  s1.syncer->Connect(s3.syncer->GetLocalNodeID(), MakeChannel("19992"));
 
   // Make sure the setup is correct
   ASSERT_TRUE(s1.WaitUntil(
-      [&s1]() {
-        return s1.syncer->sync_connections_.size() == 2 && s1.snapshot_taken == 1;
-      },
+      [&s1]() { return s1.syncer->sync_reactors_.size() == 2 && s1.snapshot_taken == 1; },
       5));
 
   ASSERT_TRUE(s1.WaitUntil(
-      [&s2]() {
-        return s2.syncer->sync_connections_.size() == 1 && s2.snapshot_taken == 1;
-      },
+      [&s2]() { return s2.syncer->sync_reactors_.size() == 1 && s2.snapshot_taken == 1; },
       5));
 
   ASSERT_TRUE(s1.WaitUntil(
-      [&s3]() {
-        return s3.syncer->sync_connections_.size() == 1 && s3.snapshot_taken == 1;
-      },
+      [&s3]() { return s3.syncer->sync_reactors_.size() == 1 && s3.snapshot_taken == 1; },
       5));
 
   // Change the resource in s2 and make sure s1 && s3 are correct
   s2.local_versions[0] = 1;
-
   ASSERT_TRUE(s1.WaitUntil(
       [&s1, node_id = s2.syncer->GetLocalNodeID()]() mutable {
         return s1.received_versions[node_id][0] == 1;
@@ -552,9 +639,30 @@ TEST(SyncerTest, Broadcast) {
         return s3.received_versions[node_id][0] == 1;
       },
       5));
+  ASSERT_EQ(
+      0,
+      s1.syncer->GetSyncMessage(s1.syncer->GetLocalNodeID(), MessageType::RESOURCE_VIEW)
+          ->version());
+  ASSERT_EQ(nullptr,
+            s1.syncer->GetSyncMessage(NodeID::FromRandom().Binary(),
+                                      MessageType::RESOURCE_VIEW));
+  s1.syncer->Disconnect(s3.syncer->GetLocalNodeID());
+  RAY_LOG(INFO) << "s1.id=" << NodeID::FromBinary(s1.syncer->GetLocalNodeID());
+  RAY_LOG(INFO) << "s3.id=" << NodeID::FromBinary(s3.syncer->GetLocalNodeID());
+
+  EXPECT_TRUE(s3.WaitUntil(
+      [&s3, node_id = s1.syncer->GetLocalNodeID()]() mutable {
+        return s3.syncer->node_state_->GetClusterView().count(node_id) == 0;
+      },
+      5));
+  EXPECT_TRUE(s1.WaitUntil(
+      [&s1, node_id = s3.syncer->GetLocalNodeID()]() mutable {
+        return s1.syncer->node_state_->GetClusterView().count(node_id) == 0;
+      },
+      5));
 }
 
-bool CompareViews(const std::vector<std::unique_ptr<SyncerServerTest>> &servers,
+bool CompareViews(const std::vector<SyncerServerTest *> &servers,
                   const std::vector<TClusterView> &views,
                   const std::vector<std::set<size_t>> &g) {
   // Check broadcasting is working
@@ -577,12 +685,12 @@ bool CompareViews(const std::vector<std::unique_ptr<SyncerServerTest>> &servers,
       if (!google::protobuf::util::MessageDifferencer::Equals(*v[0], *vv[0])) {
         RAY_LOG(ERROR) << i << ": FAIL RESOURCE: " << v[0] << ", " << vv[0];
         std::string dbg_message;
-        google::protobuf::util::MessageToJsonString(*v[0], &dbg_message);
+        RAY_CHECK(google::protobuf::util::MessageToJsonString(*v[0], &dbg_message).ok());
         RAY_LOG(ERROR) << "server[0] >> "
                        << NodeID::FromBinary(servers[0]->syncer->GetLocalNodeID()) << ": "
                        << dbg_message << " - " << NodeID::FromBinary(v[0]->node_id());
         dbg_message.clear();
-        google::protobuf::util::MessageToJsonString(*vv[0], &dbg_message);
+        RAY_CHECK(google::protobuf::util::MessageToJsonString(*vv[0], &dbg_message).ok());
         RAY_LOG(ERROR) << "server[i] << "
                        << NodeID::FromBinary(servers[i]->syncer->GetLocalNodeID()) << ": "
                        << dbg_message << " - " << NodeID::FromBinary(vv[0]->node_id());
@@ -595,7 +703,7 @@ bool CompareViews(const std::vector<std::unique_ptr<SyncerServerTest>> &servers,
 }
 
 bool TestCorrectness(std::function<TClusterView(RaySyncer &syncer)> get_cluster_view,
-                     std::vector<std::unique_ptr<SyncerServerTest>> &servers,
+                     std::vector<SyncerServerTest *> &servers,
                      const std::vector<std::set<size_t>> &g) {
   auto check = [&servers, get_cluster_view, &g]() {
     std::vector<TClusterView> views;
@@ -656,15 +764,16 @@ bool TestCorrectness(std::function<TClusterView(RaySyncer &syncer)> get_cluster_
   return check();
 }
 
-TEST(SyncerTest, Test1ToN) {
+TEST_F(SyncerTest, Test1ToN) {
   size_t base_port = 18990;
-  std::vector<std::unique_ptr<SyncerServerTest>> servers;
+  std::vector<SyncerServerTest *> servers;
   for (int i = 0; i < 20; ++i) {
-    servers.push_back(std::make_unique<SyncerServerTest>(std::to_string(i + base_port)));
+    servers.push_back(&MakeServer(std::to_string(i + base_port)));
   }
   std::vector<std::set<size_t>> g(servers.size());
   for (size_t i = 1; i < servers.size(); ++i) {
-    servers[0]->syncer->Connect(MakeChannel(servers[i]->server_port));
+    servers[0]->syncer->Connect(servers[i]->syncer->GetLocalNodeID(),
+                                MakeChannel(servers[i]->server_port));
     g[0].insert(i);
   }
 
@@ -680,11 +789,11 @@ TEST(SyncerTest, Test1ToN) {
   ASSERT_TRUE(TestCorrectness(get_cluster_view, servers, g));
 }
 
-TEST(SyncerTest, TestMToN) {
+TEST_F(SyncerTest, TestMToN) {
   size_t base_port = 18990;
-  std::vector<std::unique_ptr<SyncerServerTest>> servers;
+  std::vector<SyncerServerTest *> servers;
   for (int i = 0; i < 20; ++i) {
-    servers.push_back(std::make_unique<SyncerServerTest>(std::to_string(i + base_port)));
+    servers.push_back(&MakeServer(std::to_string(i + base_port)));
   }
   std::vector<std::set<size_t>> g(servers.size());
   // Try to construct a tree based structure
@@ -693,7 +802,8 @@ TEST(SyncerTest, TestMToN) {
   while (i < servers.size()) {
     // try to connect to 2 servers per node.
     for (int k = 0; k < 2 && i < servers.size(); ++k, ++i) {
-      servers[curr]->syncer->Connect(MakeChannel(servers[i]->server_port));
+      servers[curr]->syncer->Connect(servers[i]->syncer->GetLocalNodeID(),
+                                     MakeChannel(servers[i]->server_port));
       g[curr].insert(i);
     }
     ++curr;
@@ -710,5 +820,175 @@ TEST(SyncerTest, TestMToN) {
   ASSERT_TRUE(TestCorrectness(get_cluster_view, servers, g));
 }
 
+struct MockRaySyncerService : public ray::rpc::syncer::RaySyncer::CallbackService {
+  MockRaySyncerService(
+      instrumented_io_context &_io_context,
+      std::function<void(std::shared_ptr<const RaySyncMessage>)> _message_processor,
+      std::function<void(RaySyncerBidiReactor *reactor, bool)> _cleanup_cb)
+      : message_processor(_message_processor),
+        cleanup_cb(_cleanup_cb),
+        node_id(NodeID::FromRandom()),
+        io_context(_io_context) {}
+  grpc::ServerBidiReactor<RaySyncMessage, RaySyncMessage> *StartSync(
+      grpc::CallbackServerContext *context) override {
+    reactor = new RayServerBidiReactor(
+        context, io_context, node_id.Binary(), message_processor, cleanup_cb);
+    return reactor;
+  }
+
+  std::function<void(std::shared_ptr<const RaySyncMessage>)> message_processor;
+  std::function<void(RaySyncerBidiReactor *reactor, bool)> cleanup_cb;
+  NodeID node_id;
+  instrumented_io_context &io_context;
+  RayServerBidiReactor *reactor = nullptr;
+};
+
+class SyncerReactorTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    rpc_service_ = std::make_unique<MockRaySyncerService>(
+        io_context_,
+        [this](auto msg) { server_received_message.set_value(msg); },
+        [this](RaySyncerBidiReactor *reactor, bool restart) {
+          server_cleanup.set_value(std::make_pair(reactor->GetRemoteNodeID(), restart));
+        });
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort("0.0.0.0:18990", grpc::InsecureServerCredentials());
+    builder.RegisterService(rpc_service_.get());
+    server = builder.BuildAndStart();
+
+    client_node_id = NodeID::FromRandom();
+    cli_channel = MakeChannel("18990");
+    auto cli_stub = ray::rpc::syncer::RaySyncer::NewStub(cli_channel);
+
+    // `cli_reactor` will be deleted by `RayClientBidiReactor::OnDone`, so we need to use
+    // `release()` to release ownership.
+    cli_reactor =
+        std::make_unique<RayClientBidiReactor>(
+            rpc_service_->node_id.Binary(),
+            client_node_id.Binary(),
+            io_context_,
+            [this](auto msg) { client_received_message.set_value(msg); },
+            [this](RaySyncerBidiReactor *reactor, bool r) {
+              client_cleanup.set_value(std::make_pair(reactor->GetRemoteNodeID(), r));
+            },
+            std::move(cli_stub))
+            .release();
+    cli_reactor->StartCall();
+
+    work_guard_ = std::make_unique<work_guard_type>(io_context_.get_executor());
+    thread_ = std::make_unique<std::thread>([this]() { io_context_.run(); });
+
+    auto start = steady_clock::now();
+    while (duration_cast<seconds>(steady_clock::now() - start).count() <= 5) {
+      RAY_LOG(INFO) << "Waiting: "
+                    << duration_cast<seconds>(steady_clock::now() - start).count();
+      if (rpc_service_->reactor != nullptr) {
+        break;
+      };
+      std::this_thread::sleep_for(1s);
+    }
+  }
+
+  void TearDown() override {
+    io_context_.stop();
+    thread_->join();
+  }
+
+  std::pair<RayServerBidiReactor *, RayClientBidiReactor *> GetReactors() {
+    return std::make_pair(rpc_service_->reactor, cli_reactor);
+  }
+
+  std::pair<std::string, std::string> GetNodeID() {
+    return std::make_pair(rpc_service_->node_id.Binary(), client_node_id.Binary());
+  }
+
+  void ResetPromise() {
+    server_received_message = std::promise<std::shared_ptr<const RaySyncMessage>>();
+    client_received_message = std::promise<std::shared_ptr<const RaySyncMessage>>();
+    server_cleanup = std::promise<std::pair<std::string, bool>>();
+    client_cleanup = std::promise<std::pair<std::string, bool>>();
+  }
+
+  instrumented_io_context io_context_;
+  std::unique_ptr<work_guard_type> work_guard_;
+  std::unique_ptr<std::thread> thread_;
+  std::unique_ptr<MockRaySyncerService> rpc_service_;
+  std::unique_ptr<grpc::Server> server;
+  std::promise<std::shared_ptr<const RaySyncMessage>> server_received_message;
+  std::promise<std::shared_ptr<const RaySyncMessage>> client_received_message;
+  std::promise<std::pair<std::string, bool>> server_cleanup;
+  std::promise<std::pair<std::string, bool>> client_cleanup;
+
+  grpc::ClientContext cli_context;
+  RayClientBidiReactor *cli_reactor;
+  std::shared_ptr<grpc::Channel> cli_channel;
+  NodeID client_node_id;
+};
+
+TEST_F(SyncerReactorTest, TestReactor) {
+  auto [s, c] = GetReactors();
+  auto [node_s, node_c] = GetNodeID();
+  ASSERT_TRUE(s != nullptr);
+  ASSERT_TRUE(c != nullptr);
+
+  auto msg_s = std::make_shared<RaySyncMessage>();
+  msg_s->set_version(1);
+  msg_s->set_node_id(node_s);
+
+  s->PushToSendingQueue(msg_s);
+
+  auto msg_c = std::make_shared<RaySyncMessage>();
+  msg_c->set_version(2);
+  msg_c->set_node_id(node_c);
+
+  c->PushToSendingQueue(msg_c);
+  // Make sure sending is working
+  auto server_received = server_received_message.get_future().get();
+  auto client_received = client_received_message.get_future().get();
+  ResetPromise();
+  ASSERT_EQ(server_received->version(), 2);
+  ASSERT_EQ(server_received->node_id(), node_c);
+  ASSERT_EQ(client_received->version(), 1);
+  ASSERT_EQ(client_received->node_id(), node_s);
+
+  s->Disconnect();
+  auto c_cleanup = client_cleanup.get_future().get();
+  ASSERT_EQ(node_s, c_cleanup.first);
+  ASSERT_EQ(false, c_cleanup.second);
+}
+
+TEST_F(SyncerReactorTest, TestReactorFailure) {
+  auto [s, c] = GetReactors();
+  auto [node_s, node_c] = GetNodeID();
+  ASSERT_TRUE(s != nullptr);
+  ASSERT_TRUE(c != nullptr);
+  *s->disconnected_ = true;
+  s->Finish(grpc::Status::CANCELLED);
+  auto c_cleanup = client_cleanup.get_future().get();
+  ASSERT_EQ(node_s, c_cleanup.first);
+  ASSERT_EQ(true, c_cleanup.second);
+}
+
 }  // namespace syncer
 }  // namespace ray
+
+int main(int argc, char **argv) {
+  InitShutdownRAII ray_log_shutdown_raii(
+      ray::RayLog::StartRayLog,
+      ray::RayLog::ShutDownRayLog,
+      argv[0],
+      ray::RayLogLevel::INFO,
+      ray::RayLog::GetLogFilepathFromDirectory(/*log_dir=*/"", /*app_name=*/argv[0]),
+      ray::RayLog::GetErrLogFilepathFromDirectory(/*log_dir=*/"", /*app_name=*/argv[0]),
+      ray::RayLog::GetRayLogRotationMaxBytesOrDefault(),
+      ray::RayLog::GetRayLogRotationBackupCountOrDefault());
+  ray::RayLog::InstallFailureSignalHandler(argv[0]);
+  ray::RayLog::InstallTerminateHandler();
+
+  ::testing::InitGoogleTest(&argc, argv);
+  auto ret = RUN_ALL_TESTS();
+  // Sleep for gRPC to gracefully shutdown.
+  std::this_thread::sleep_for(2s);
+  return ret;
+}

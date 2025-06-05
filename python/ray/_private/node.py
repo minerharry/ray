@@ -15,27 +15,30 @@ import threading
 import time
 import traceback
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import IO, AnyStr, Dict, Optional, Tuple
 
 from filelock import FileLock
 
 import ray
 import ray._private.ray_constants as ray_constants
 import ray._private.services
-import ray._private.utils
 from ray._private import storage
-from ray._private.gcs_utils import GcsClient
+from ray._private.resource_isolation_config import ResourceIsolationConfig
 from ray._private.resource_spec import ResourceSpec
-from ray._private.utils import open_log, try_to_create_directory, try_to_symlink
+from ray._private.services import get_address, serialize_config
+from ray._private.utils import (
+    is_in_test,
+    open_log,
+    try_to_create_directory,
+    try_to_symlink,
+    validate_socket_filepath,
+)
+from ray._raylet import GcsClient, get_session_key_from_storage
 
 # Logger for this module. It should be configured at the entry point
 # into the program using Ray. Ray configures it by default automatically
 # using logging.basicConfig in its entry/init points.
 logger = logging.getLogger(__name__)
-
-SESSION_LATEST = "session_latest"
-NUM_PORT_RETRIES = 40
-NUM_REDIS_GET_RETRIES = 20
 
 
 class Node:
@@ -57,6 +60,8 @@ class Node:
         shutdown_at_exit: bool = True,
         spawn_reaper: bool = True,
         connect_only: bool = False,
+        default_worker: bool = False,
+        ray_init_cluster: bool = False,
     ):
         """Start a node.
 
@@ -71,6 +76,8 @@ class Node:
                 other spawned processes if this process dies unexpectedly.
             connect_only: If true, connect to the node without starting
                 new processes.
+            default_worker: Whether it's running from a ray worker or not
+            ray_init_cluster: Whether it's a cluster created by ray.init()
         """
         if shutdown_at_exit:
             if connect_only:
@@ -78,13 +85,20 @@ class Node:
                     "'shutdown_at_exit' and 'connect_only' cannot both be true."
                 )
             self._register_shutdown_hooks()
-
+        self._default_worker = default_worker
         self.head = head
         self.kernel_fate_share = bool(
             spawn_reaper and ray._private.utils.detect_fate_sharing_support()
         )
+        self.resource_isolation_config: ResourceIsolationConfig = (
+            ray_params.resource_isolation_config
+        )
         self.all_processes: dict = {}
         self.removal_lock = threading.Lock()
+
+        self.ray_init_cluster = ray_init_cluster
+        if ray_init_cluster:
+            assert head, "ray.init() created cluster only has the head node"
 
         # Set up external Redis when `RAY_REDIS_ADDRESS` is specified.
         redis_address_env = os.environ.get("RAY_REDIS_ADDRESS")
@@ -99,26 +113,6 @@ class Node:
             ray_params.external_addresses = external_redis
             ray_params.num_redis_shards = len(external_redis) - 1
 
-        # Try to get node IP address with the parameters.
-        if ray_params.node_ip_address:
-            node_ip_address = ray_params.node_ip_address
-        elif ray_params.redis_address:
-            node_ip_address = ray.util.get_node_ip_address(ray_params.redis_address)
-        else:
-            node_ip_address = ray.util.get_node_ip_address()
-        self._node_ip_address = node_ip_address
-
-        if ray_params.raylet_ip_address:
-            raylet_ip_address = ray_params.raylet_ip_address
-        else:
-            raylet_ip_address = node_ip_address
-
-        if raylet_ip_address != node_ip_address and (not connect_only or head):
-            raise ValueError(
-                "The raylet IP address should only be different than the node "
-                "IP address when connecting to an existing raylet; i.e., when "
-                "head=False and connect_only=True."
-            )
         if (
             ray_params._system_config
             and len(ray_params._system_config) > 0
@@ -128,18 +122,18 @@ class Node:
                 "System config parameters can only be set on the head node."
             )
 
-        self._raylet_ip_address = raylet_ip_address
-
         ray_params.update_if_absent(
             include_log_monitor=True,
             resources={},
-            temp_dir=ray._private.utils.get_ray_temp_dir(),
             worker_path=os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "workers/default_worker.py"
+                os.path.dirname(os.path.abspath(__file__)),
+                "workers",
+                "default_worker.py",
             ),
             setup_worker_path=os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                f"workers/{ray_constants.SETUP_WORKER_FILENAME}",
+                "workers",
+                ray_constants.SETUP_WORKER_FILENAME,
             ),
         )
 
@@ -171,42 +165,107 @@ class Node:
 
         if not self.head:
             self.validate_ip_port(self.address)
-            self.get_gcs_client()
+            self._init_gcs_client()
 
         # Register the temp dir.
-        if head:
-            # date including microsecond
-            date_str = datetime.datetime.today().strftime("%Y-%m-%d_%H-%M-%S_%f")
-            self._session_name = f"session_{date_str}_{os.getpid()}"
-        else:
-            session_name = ray._private.utils.internal_kv_get_with_retry(
-                self.get_gcs_client(),
-                "session_name",
-                ray_constants.KV_NAMESPACE_SESSION,
-                num_retries=NUM_REDIS_GET_RETRIES,
-            )
-            self._session_name = ray._private.utils.decode(session_name)
-            # setup gcs client
-            self.get_gcs_client()
+        self._session_name = ray_params.session_name
+        if self._session_name is None:
+            if head:
+                # We expect this the first time we initialize a cluster, but not during
+                # subsequent restarts of the head node.
+                maybe_key = self.check_persisted_session_name()
+                if maybe_key is None:
+                    # date including microsecond
+                    date_str = datetime.datetime.today().strftime(
+                        "%Y-%m-%d_%H-%M-%S_%f"
+                    )
+                    self._session_name = f"session_{date_str}_{os.getpid()}"
+                else:
+                    self._session_name = ray._private.utils.decode(maybe_key)
+            else:
+                assert not self._default_worker
+                session_name = ray._private.utils.internal_kv_get_with_retry(
+                    self.get_gcs_client(),
+                    "session_name",
+                    ray_constants.KV_NAMESPACE_SESSION,
+                    num_retries=ray_constants.NUM_REDIS_GET_RETRIES,
+                )
+                self._session_name = ray._private.utils.decode(session_name)
 
         # Initialize webui url
         if head:
             self._webui_url = None
         else:
-            self._webui_url = ray._private.services.get_webui_url_from_internal_kv()
+            if ray_params.webui is None:
+                assert not self._default_worker
+                self._webui_url = ray._private.services.get_webui_url_from_internal_kv()
+            else:
+                self._webui_url = (
+                    f"{ray_params.dashboard_host}:{ray_params.dashboard_port}"
+                )
 
+        # It creates a session_dir.
         self._init_temp()
+
+        node_ip_address = ray_params.node_ip_address
+        if node_ip_address is None:
+            if connect_only:
+                node_ip_address = self._wait_and_get_for_node_address()
+            else:
+                node_ip_address = ray.util.get_node_ip_address()
+
+        assert node_ip_address is not None
+        ray_params.update_if_absent(
+            node_ip_address=node_ip_address, raylet_ip_address=node_ip_address
+        )
+        self._node_ip_address = node_ip_address
+        if not connect_only:
+            ray._private.services.write_node_ip_address(
+                self.get_session_dir_path(), node_ip_address
+            )
+
+        if ray_params.raylet_ip_address:
+            raylet_ip_address = ray_params.raylet_ip_address
+        else:
+            raylet_ip_address = node_ip_address
+
+        if raylet_ip_address != node_ip_address and (not connect_only or head):
+            raise ValueError(
+                "The raylet IP address should only be different than the node "
+                "IP address when connecting to an existing raylet; i.e., when "
+                "head=False and connect_only=True."
+            )
+        self._raylet_ip_address = raylet_ip_address
 
         # Validate and initialize the persistent storage API.
         if head:
             storage._init_storage(ray_params.storage, is_head=True)
         else:
-            storage._init_storage(
-                ray._private.services.get_storage_uri_from_internal_kv(), is_head=False
-            )
+            if not self._default_worker:
+                storage_uri = ray._private.services.get_storage_uri_from_internal_kv()
+            else:
+                storage_uri = ray_params.storage
+            storage._init_storage(storage_uri, is_head=False)
 
-        # If it is a head node, try validating if
-        # external storage is configurable.
+        self._object_spilling_config = self._get_object_spilling_config()
+        logger.debug(
+            f"Starting node with object spilling config: {self._object_spilling_config}"
+        )
+
+        # Obtain the fallback directoy from the object spilling config
+        # Currently, we set the fallback directory to be the same as the object spilling
+        # path when the object spills to file system
+        self._fallback_directory = None
+        if self._object_spilling_config:
+            config = json.loads(self._object_spilling_config)
+            if config.get("type") == "filesystem":
+                directory_path = config.get("params", {}).get("directory_path")
+                if isinstance(directory_path, list):
+                    self._fallback_directory = directory_path[0]
+                elif isinstance(directory_path, str):
+                    self._fallback_directory = directory_path
+
+        # If it is a head node, try validating if external storage is configurable.
         if head:
             self.validate_external_storage()
 
@@ -214,12 +273,14 @@ class Node:
             # Get socket names from the configuration.
             self._plasma_store_socket_name = ray_params.plasma_store_socket_name
             self._raylet_socket_name = ray_params.raylet_socket_name
+            self._node_id = ray_params.node_id
 
             # If user does not provide the socket name, get it from Redis.
             if (
                 self._plasma_store_socket_name is None
                 or self._raylet_socket_name is None
                 or self._ray_params.node_manager_port is None
+                or self._node_id is None
             ):
                 # Get the address info of the processes to connect to
                 # from Redis or GCS.
@@ -227,9 +288,10 @@ class Node:
                     self.gcs_address,
                     self._raylet_ip_address,
                 )
-                self._plasma_store_socket_name = node_info.object_store_socket_name
-                self._raylet_socket_name = node_info.raylet_socket_name
-                self._ray_params.node_manager_port = node_info.node_manager_port
+                self._plasma_store_socket_name = node_info["object_store_socket_name"]
+                self._raylet_socket_name = node_info["raylet_socket_name"]
+                self._ray_params.node_manager_port = node_info["node_manager_port"]
+                self._node_id = node_info["node_id"]
         else:
             # If the user specified a socket name, use it.
             self._plasma_store_socket_name = self._prepare_socket_file(
@@ -238,6 +300,33 @@ class Node:
             self._raylet_socket_name = self._prepare_socket_file(
                 self._ray_params.raylet_socket_name, default_prefix="raylet"
             )
+            # Set node labels from RayParams or environment override variables.
+            self._node_labels = self._get_node_labels()
+            if (
+                self._ray_params.env_vars is not None
+                and "RAY_OVERRIDE_NODE_ID_FOR_TESTING" in self._ray_params.env_vars
+            ):
+                node_id = self._ray_params.env_vars["RAY_OVERRIDE_NODE_ID_FOR_TESTING"]
+                logger.debug(
+                    f"Setting node ID to {node_id} "
+                    "based on ray_params.env_vars override"
+                )
+                self._node_id = node_id
+            elif os.environ.get("RAY_OVERRIDE_NODE_ID_FOR_TESTING"):
+                node_id = os.environ["RAY_OVERRIDE_NODE_ID_FOR_TESTING"]
+                logger.debug(f"Setting node ID to {node_id} based on env override")
+                self._node_id = node_id
+            else:
+                node_id = ray.NodeID.from_random().hex()
+                logger.debug(f"Setting node ID to {node_id}")
+                self._node_id = node_id
+
+        # The dashboard agent port is assigned first to avoid
+        # other processes accidentally taking its default port
+        self._dashboard_agent_listen_port = self._get_cached_port(
+            "dashboard_agent_listen_port",
+            default_port=ray_params.dashboard_agent_listen_port,
+        )
 
         self.metrics_agent_port = self._get_cached_port(
             "metrics_agent_port", default_port=ray_params.metrics_agent_port
@@ -245,17 +334,23 @@ class Node:
         self._metrics_export_port = self._get_cached_port(
             "metrics_export_port", default_port=ray_params.metrics_export_port
         )
+        self._runtime_env_agent_port = self._get_cached_port(
+            "runtime_env_agent_port",
+            default_port=ray_params.runtime_env_agent_port,
+        )
 
         ray_params.update_if_absent(
             metrics_agent_port=self.metrics_agent_port,
             metrics_export_port=self._metrics_export_port,
+            dashboard_agent_listen_port=self._dashboard_agent_listen_port,
+            runtime_env_agent_port=self._runtime_env_agent_port,
         )
 
         # Pick a GCS server port.
         if head:
             gcs_server_port = os.getenv(ray_constants.GCS_PORT_ENVIRONMENT_VARIABLE)
             if gcs_server_port:
-                ray_params.update_if_absent(gcs_server_port=gcs_server_port)
+                ray_params.update_if_absent(gcs_server_port=int(gcs_server_port))
             if ray_params.gcs_server_port is None or ray_params.gcs_server_port == 0:
                 ray_params.gcs_server_port = self._get_cached_port("gcs_server_port")
 
@@ -267,41 +362,6 @@ class Node:
         # Start processes.
         if head:
             self.start_head_processes()
-            # Make sure GCS is up.
-            self.get_gcs_client().internal_kv_put(
-                b"session_name",
-                self._session_name.encode(),
-                True,
-                ray_constants.KV_NAMESPACE_SESSION,
-            )
-            self.get_gcs_client().internal_kv_put(
-                b"session_dir",
-                self._session_dir.encode(),
-                True,
-                ray_constants.KV_NAMESPACE_SESSION,
-            )
-            self.get_gcs_client().internal_kv_put(
-                b"temp_dir",
-                self._temp_dir.encode(),
-                True,
-                ray_constants.KV_NAMESPACE_SESSION,
-            )
-            if ray_params.storage is not None:
-                self.get_gcs_client().internal_kv_put(
-                    b"storage",
-                    ray_params.storage.encode(),
-                    True,
-                    ray_constants.KV_NAMESPACE_SESSION,
-                )
-            # Add tracing_startup_hook to redis / internal kv manually
-            # since internal kv is not yet initialized.
-            if ray_params.tracing_startup_hook:
-                self.get_gcs_client().internal_kv_put(
-                    b"tracing_startup_hook",
-                    ray_params.tracing_startup_hook.encode(),
-                    True,
-                    ray_constants.KV_NAMESPACE_TRACING,
-                )
 
         if not connect_only:
             self.start_ray_processes()
@@ -311,23 +371,54 @@ class Node:
                     self.gcs_address,
                     self._plasma_store_socket_name,
                 )
-            except TimeoutError:
+            except TimeoutError as te:
                 raise Exception(
-                    "The current node has not been updated within 30 "
-                    "seconds, this could happen because of some of "
-                    "the Ray processes failed to startup."
-                )
-            node_info = ray._private.services.get_node_to_connect_for_driver(
-                self.gcs_address,
-                self._raylet_ip_address,
-            )
-            if self._ray_params.node_manager_port == 0:
-                self._ray_params.node_manager_port = node_info.node_manager_port
+                    "The current node timed out during startup. This "
+                    "could happen because some of the Ray processes "
+                    "failed to startup."
+                ) from te
+
+        # Fetch node info to update port or get labels.
+        node_info = ray._private.services.get_node(
+            self.gcs_address,
+            self._node_id,
+        )
+        if not connect_only and self._ray_params.node_manager_port == 0:
+            self._ray_params.node_manager_port = node_info["node_manager_port"]
+        elif connect_only:
+            # Set node labels from GCS if provided at node init.
+            self._node_labels = node_info.get("labels", {})
 
         # Makes sure the Node object has valid addresses after setup.
         self.validate_ip_port(self.address)
         self.validate_ip_port(self.gcs_address)
-        self._record_stats()
+
+        if not connect_only:
+            self._record_stats()
+
+    def check_persisted_session_name(self):
+        if self._ray_params.external_addresses is None:
+            return None
+        self._redis_address = self._ray_params.external_addresses[0]
+        redis_ip_address, redis_port, enable_redis_ssl = get_address(
+            self._redis_address,
+        )
+        # Address is ip:port or redis://ip:port
+        if int(redis_port) < 0:
+            raise ValueError(
+                f"Invalid Redis port provided: {redis_port}."
+                "The port must be a non-negative integer."
+            )
+
+        return get_session_key_from_storage(
+            redis_ip_address,
+            int(redis_port),
+            self._ray_params.redis_username,
+            self._ray_params.redis_password,
+            enable_redis_ssl,
+            serialize_config(self._config),
+            b"session_name",
+        )
 
     @staticmethod
     def validate_ip_port(ip_port):
@@ -355,8 +446,14 @@ class Node:
 
         cluster_metadata = ray_usage_lib.get_cluster_metadata(self.get_gcs_client())
         if cluster_metadata is None:
+            cluster_metadata = ray_usage_lib.get_cluster_metadata(self.get_gcs_client())
+
+        if not cluster_metadata:
             return
-        ray._private.utils.check_version_info(cluster_metadata)
+        node_ip_address = ray._private.services.get_node_ip_address()
+        ray._private.utils.check_version_info(
+            cluster_metadata, f"node {node_ip_address}"
+        )
 
     def _register_shutdown_hooks(self):
         # Register the atexit handler. In this case, we shouldn't call sys.exit
@@ -380,29 +477,40 @@ class Node:
         self._incremental_dict = collections.defaultdict(lambda: 0)
 
         if self.head:
+            self._ray_params.update_if_absent(
+                temp_dir=ray._private.utils.get_ray_temp_dir()
+            )
             self._temp_dir = self._ray_params.temp_dir
         else:
-            temp_dir = ray._private.utils.internal_kv_get_with_retry(
-                self.get_gcs_client(),
-                "temp_dir",
-                ray_constants.KV_NAMESPACE_SESSION,
-                num_retries=NUM_REDIS_GET_RETRIES,
-            )
-            self._temp_dir = ray._private.utils.decode(temp_dir)
+            if self._ray_params.temp_dir is None:
+                assert not self._default_worker
+                temp_dir = ray._private.utils.internal_kv_get_with_retry(
+                    self.get_gcs_client(),
+                    "temp_dir",
+                    ray_constants.KV_NAMESPACE_SESSION,
+                    num_retries=ray_constants.NUM_REDIS_GET_RETRIES,
+                )
+                self._temp_dir = ray._private.utils.decode(temp_dir)
+            else:
+                self._temp_dir = self._ray_params.temp_dir
 
         try_to_create_directory(self._temp_dir)
 
         if self.head:
             self._session_dir = os.path.join(self._temp_dir, self._session_name)
         else:
-            session_dir = ray._private.utils.internal_kv_get_with_retry(
-                self.get_gcs_client(),
-                "session_dir",
-                ray_constants.KV_NAMESPACE_SESSION,
-                num_retries=NUM_REDIS_GET_RETRIES,
-            )
-            self._session_dir = ray._private.utils.decode(session_dir)
-        session_symlink = os.path.join(self._temp_dir, SESSION_LATEST)
+            if self._temp_dir is None or self._session_name is None:
+                assert not self._default_worker
+                session_dir = ray._private.utils.internal_kv_get_with_retry(
+                    self.get_gcs_client(),
+                    "session_dir",
+                    ray_constants.KV_NAMESPACE_SESSION,
+                    num_retries=ray_constants.NUM_REDIS_GET_RETRIES,
+                )
+                self._session_dir = ray._private.utils.decode(session_dir)
+            else:
+                self._session_dir = os.path.join(self._temp_dir, self._session_name)
+        session_symlink = os.path.join(self._temp_dir, ray_constants.SESSION_LATEST)
 
         # Send a warning message if the session exists.
         try_to_create_directory(self._session_dir)
@@ -420,6 +528,47 @@ class Node:
             self._session_dir, self._ray_params.runtime_env_dir_name
         )
         try_to_create_directory(self._runtime_env_dir)
+        # Create a symlink to the libtpu tpu_logs directory if it exists.
+        user_temp_dir = ray._private.utils.get_user_temp_dir()
+        tpu_log_dir = f"{user_temp_dir}/tpu_logs"
+        if os.path.isdir(tpu_log_dir):
+            tpu_logs_symlink = os.path.join(self._logs_dir, "tpu_logs")
+            try_to_symlink(tpu_logs_symlink, tpu_log_dir)
+
+    def _get_node_labels(self):
+        def merge_labels(env_override_labels, params_labels):
+            """Merges two dictionaries, picking from the
+            first in the event of a conflict. Also emit a warning on every
+            conflict.
+            """
+
+            result = params_labels.copy()
+            result.update(env_override_labels)
+
+            for key in set(env_override_labels.keys()).intersection(
+                set(params_labels.keys())
+            ):
+                if params_labels[key] != env_override_labels[key]:
+                    logger.warning(
+                        "Autoscaler is overriding your label:"
+                        f"{key}: {params_labels[key]} to "
+                        f"{key}: {env_override_labels[key]}."
+                    )
+            return result
+
+        env_override_labels = {}
+        env_override_labels_string = os.getenv(
+            ray_constants.LABELS_ENVIRONMENT_VARIABLE
+        )
+        if env_override_labels_string:
+            try:
+                env_override_labels = json.loads(env_override_labels_string)
+            except Exception:
+                logger.exception(f"Failed to load {env_override_labels_string}")
+                raise
+            logger.info(f"Autoscaler overriding labels: {env_override_labels}.")
+
+        return merge_labels(env_override_labels, self._ray_params.labels or {})
 
     def get_resource_spec(self):
         """Resolve and return the current resource spec for the node."""
@@ -466,13 +615,19 @@ class Node:
                 self._ray_params.num_cpus if num_cpus is None else num_cpus,
                 self._ray_params.num_gpus if num_gpus is None else num_gpus,
                 self._ray_params.memory if memory is None else memory,
-                self._ray_params.object_store_memory
-                if object_store_memory is None
-                else object_store_memory,
+                (
+                    self._ray_params.object_store_memory
+                    if object_store_memory is None
+                    else object_store_memory
+                ),
                 resources,
-                self._ray_params.redis_max_memory,
             ).resolve(is_head=self.head, node_ip_address=self.node_ip_address)
         return self._resource_spec
+
+    @property
+    def node_id(self):
+        """Get the node ID."""
+        return self._node_id
 
     @property
     def session_name(self):
@@ -492,7 +647,7 @@ class Node:
     @property
     def address(self):
         """Get the address for bootstrapping, e.g. the address to pass to
-        `ray start` or `ray.int()` to start worker nodes, that has been
+        `ray start` or `ray.init()` to start worker nodes, that has been
         converted to ip:port format.
         """
         return self._gcs_address
@@ -509,8 +664,13 @@ class Node:
         return self._redis_address
 
     @property
+    def redis_username(self):
+        """Get the cluster Redis username."""
+        return self._ray_params.redis_username
+
+    @property
     def redis_password(self):
-        """Get the cluster Redis password"""
+        """Get the cluster Redis password."""
         return self._ray_params.redis_password
 
     @property
@@ -549,6 +709,16 @@ class Node:
         return self._metrics_export_port
 
     @property
+    def runtime_env_agent_port(self):
+        """Get the port that exposes runtime env agent as http"""
+        return self._runtime_env_agent_port
+
+    @property
+    def runtime_env_agent_address(self):
+        """Get the address that exposes runtime env agent as http"""
+        return f"http://{self._raylet_ip_address}:{self._runtime_env_agent_port}"
+
+    @property
     def dashboard_agent_listen_port(self):
         """Get the dashboard agent's listen port"""
         return self._dashboard_agent_listen_port
@@ -578,28 +748,77 @@ class Node:
             "dashboard_agent_listen_port": self.dashboard_agent_listen_port,
         }
 
+    @property
+    def node_labels(self):
+        """Get the node labels."""
+        return self._node_labels
+
     def is_head(self):
         return self.head
 
     def get_gcs_client(self):
         if self._gcs_client is None:
-            for _ in range(NUM_REDIS_GET_RETRIES):
-                gcs_address = None
-                last_ex = None
-                try:
-                    gcs_address = self.gcs_address
-                    self._gcs_client = GcsClient(address=gcs_address)
-                    break
-                except Exception:
-                    last_ex = traceback.format_exc()
-                    logger.debug(f"Connecting to GCS: {last_ex}")
-                    time.sleep(1)
-            assert self._gcs_client is not None, (
-                f"Failed to connect to GCS at address={gcs_address}. "
-                f"Last exception: {last_ex}"
-            )
-            ray.experimental.internal_kv._initialize_internal_kv(self._gcs_client)
+            self._init_gcs_client()
         return self._gcs_client
+
+    def _init_gcs_client(self):
+        if self.head:
+            gcs_process = self.all_processes[ray_constants.PROCESS_TYPE_GCS_SERVER][
+                0
+            ].process
+        else:
+            gcs_process = None
+
+        # TODO(ryw) instead of create a new GcsClient, wrap the one from
+        # CoreWorkerProcess to save a grpc channel.
+        for _ in range(ray_constants.NUM_REDIS_GET_RETRIES):
+            gcs_address = None
+            last_ex = None
+            try:
+                gcs_address = self.gcs_address
+                client = GcsClient(
+                    address=gcs_address,
+                    cluster_id=self._ray_params.cluster_id,  # Hex string
+                )
+                self.cluster_id = client.cluster_id
+                if self.head:
+                    # Send a simple request to make sure GCS is alive
+                    # if it's a head node.
+                    client.internal_kv_get(b"dummy", None)
+                self._gcs_client = client
+                break
+            except Exception:
+                if gcs_process is not None and gcs_process.poll() is not None:
+                    # GCS has exited.
+                    break
+                last_ex = traceback.format_exc()
+                logger.debug(f"Connecting to GCS: {last_ex}")
+                time.sleep(1)
+
+        if self._gcs_client is None:
+            if hasattr(self, "_logs_dir"):
+                with open(os.path.join(self._logs_dir, "gcs_server.err")) as err:
+                    # Use " C " or " E " to exclude the stacktrace.
+                    # This should work for most cases, especitally
+                    # it's when GCS is starting. Only display last 10 lines of logs.
+                    errors = [e for e in err.readlines() if " C " in e or " E " in e][
+                        -10:
+                    ]
+                error_msg = "\n" + "".join(errors) + "\n"
+                raise RuntimeError(
+                    f"Failed to {'start' if self.head else 'connect to'} GCS. "
+                    f" Last {len(errors)} lines of error files:"
+                    f"{error_msg}."
+                    f"Please check {os.path.join(self._logs_dir, 'gcs_server.out')}"
+                    f" for details. Last connection error: {last_ex}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to {'start' if self.head else 'connect to'} GCS. Last "
+                    f"connection error: {last_ex}"
+                )
+
+        ray.experimental.internal_kv._initialize_internal_kv(self._gcs_client)
 
     def get_temp_dir_path(self):
         """Get the path of the temporary directory."""
@@ -669,7 +888,48 @@ class Node:
             )
         return redirect_output
 
-    def get_log_file_handles(self, name: str, unique: bool = False):
+    # TODO(hjiang): Re-implement the logic in C++, and expose via cython.
+    def get_log_file_names(
+        self,
+        name: str,
+        unique: bool = False,
+        create_out: bool = True,
+        create_err: bool = True,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Get filename to dump logs for stdout and stderr, with no files opened.
+        If output redirection has been disabled, no files will
+        be opened and `(None, None)` will be returned.
+
+        Args:
+            name: descriptive string for this log file.
+            unique: if true, a counter will be attached to `name` to
+                ensure the returned filename is not already used.
+            create_out: if True, create a .out file.
+            create_err: if True, create a .err file.
+
+        Returns:
+            A tuple of two file handles for redirecting optional (stdout, stderr),
+            or `(None, None)` if output redirection is disabled.
+        """
+        if not self.should_redirect_logs():
+            return None, None
+
+        log_stdout = None
+        log_stderr = None
+
+        if create_out:
+            log_stdout = self._get_log_file_name(name, "out", unique=unique)
+        if create_err:
+            log_stderr = self._get_log_file_name(name, "err", unique=unique)
+        return log_stdout, log_stderr
+
+    def get_log_file_handles(
+        self,
+        name: str,
+        unique: bool = False,
+        create_out: bool = True,
+        create_err: bool = True,
+    ) -> Tuple[Optional[IO[AnyStr]], Optional[IO[AnyStr]]]:
         """Open log files with partially randomized filenames, returning the
         file handles. If output redirection has been disabled, no files will
         be opened and `(None, None)` will be returned.
@@ -678,40 +938,47 @@ class Node:
             name: descriptive string for this log file.
             unique: if true, a counter will be attached to `name` to
                 ensure the returned filename is not already used.
+            create_out: if True, create a .out file.
+            create_err: if True, create a .err file.
 
         Returns:
-            A tuple of two file handles for redirecting (stdout, stderr), or
-            `(None, None)` if output redirection is disabled.
+            A tuple of two file handles for redirecting optional (stdout, stderr),
+            or `(None, None)` if output redirection is disabled.
         """
-        if not self.should_redirect_logs():
-            return None, None
+        log_stdout_fname, log_stderr_fname = self.get_log_file_names(
+            name, unique=unique, create_out=create_out, create_err=create_err
+        )
+        log_stdout = None if log_stdout_fname is None else open_log(log_stdout_fname)
+        log_stderr = None if log_stderr_fname is None else open_log(log_stderr_fname)
+        return log_stdout, log_stderr
 
-        log_stdout, log_stderr = self._get_log_file_names(name, unique=unique)
-        return open_log(log_stdout), open_log(log_stderr)
-
-    def _get_log_file_names(self, name: str, unique: bool = False):
+    def _get_log_file_name(
+        self,
+        name: str,
+        suffix: str,
+        unique: bool = False,
+    ) -> str:
         """Generate partially randomized filenames for log files.
 
         Args:
             name: descriptive string for this log file.
+            suffix: suffix of the file. Usually it is .out of .err.
             unique: if true, a counter will be attached to `name` to
                 ensure the returned filename is not already used.
 
         Returns:
             A tuple of two file names for redirecting (stdout, stderr).
         """
+        # strip if the suffix is something like .out.
+        suffix = suffix.strip(".")
 
         if unique:
-            log_stdout = self._make_inc_temp(
-                suffix=".out", prefix=name, directory_name=self._logs_dir
-            )
-            log_stderr = self._make_inc_temp(
-                suffix=".err", prefix=name, directory_name=self._logs_dir
+            filename = self._make_inc_temp(
+                suffix=f".{suffix}", prefix=name, directory_name=self._logs_dir
             )
         else:
-            log_stdout = os.path.join(self._logs_dir, f"{name}.out")
-            log_stderr = os.path.join(self._logs_dir, f"{name}.err")
-        return log_stdout, log_stderr
+            filename = os.path.join(self._logs_dir, f"{name}.{suffix}")
+        return filename
 
     def _get_unused_port(self, allocated_ports=None):
         if allocated_ports is None:
@@ -724,7 +991,7 @@ class Node:
         # Try to generate a port that is far above the 'next available' one.
         # This solves issue #8254 where GRPC fails because the port assigned
         # from this method has been used by a different process.
-        for _ in range(NUM_PORT_RETRIES):
+        for _ in range(ray_constants.NUM_PORT_RETRIES):
             new_port = random.randint(port, 65535)
             if new_port in allocated_ports:
                 # This port is allocated for other usage already,
@@ -755,10 +1022,9 @@ class Node:
             socket_path: the socket file to prepare.
         """
         result = socket_path
-        is_mac = sys.platform.startswith("darwin")
         if sys.platform == "win32":
             if socket_path is None:
-                result = f"tcp://{self._localhost}" f":{self._get_unused_port()}"
+                result = f"tcp://{self._localhost}:{self._get_unused_port()}"
         else:
             if socket_path is None:
                 result = self._make_inc_temp(
@@ -767,12 +1033,7 @@ class Node:
             else:
                 try_to_create_directory(os.path.dirname(socket_path))
 
-            # Check socket path length to make sure it's short enough
-            maxlen = (104 if is_mac else 108) - 1  # sockaddr_un->sun_path
-            if len(result.split("://", 1)[-1].encode("utf-8")) > maxlen:
-                raise OSError(
-                    f"AF_UNIX path length cannot exceed {maxlen} bytes: {result!r}"
-                )
+            validate_socket_filepath(result.split("://", 1)[-1])
         return result
 
     def _get_cached_port(
@@ -786,14 +1047,18 @@ class Node:
         port isn't already cached, an unused port is generated and cached.
 
         Args:
-            port_name: the name of the port, e.g. metrics_export_port
-            default_port (Optional[int]): The port to return and cache if no
-            port has already been cached for the given port_name.  If None, an
-            unused port is generated and cached.
+            port_name: The name of the port, e.g. metrics_export_port.
+            default_port: The port to return and cache if no port has already been
+                cached for the given port_name. If None, an unused port is generated
+                and cached.
+
         Returns:
-            port: the port number.
+            int: The port number.
         """
         file_path = os.path.join(self.get_session_dir_path(), "ports_by_node.json")
+
+        # Make sure only the ports in RAY_CACHED_PORTS are cached.
+        assert port_name in ray_constants.RAY_ALLOWED_CACHED_PORTS
 
         # Maps a Node.unique_id to a dict that maps port names to port numbers.
         ports_by_node: Dict[str, Dict[str, int]] = defaultdict(dict)
@@ -814,14 +1079,56 @@ class Node:
                 port = int(ports_by_node[self.unique_id][port_name])
             else:
                 # Pick a new port to use and cache it at this node.
-                port = default_port or self._get_unused_port(
-                    set(ports_by_node[self.unique_id].values())
-                )
+                allocated_ports = set(ports_by_node[self.unique_id].values())
+
+                if default_port is not None and default_port in allocated_ports:
+                    # The default port is already in use, so don't use it.
+                    default_port = None
+
+                port = default_port or self._get_unused_port(allocated_ports)
+
                 ports_by_node[self.unique_id][port_name] = port
                 with open(file_path, "w") as f:
                     json.dump(ports_by_node, f)
 
         return port
+
+    def _wait_and_get_for_node_address(self, timeout_s: int = 60) -> str:
+        """Wait until the RAY_NODE_IP_FILENAME file is avialable.
+
+        RAY_NODE_IP_FILENAME is created when a ray instance is started.
+
+        Args:
+            timeout_s: If the ip address is not found within this
+                timeout, it will raise ValueError.
+        Returns:
+            The node_ip_address of the current session if it finds it
+            within timeout_s.
+        """
+        for i in range(timeout_s):
+            node_ip_address = ray._private.services.get_cached_node_ip_address(
+                self.get_session_dir_path()
+            )
+
+            if node_ip_address is not None:
+                return node_ip_address
+
+            time.sleep(1)
+            if i % 10 == 0:
+                logger.info(
+                    f"Can't find a `{ray_constants.RAY_NODE_IP_FILENAME}` "
+                    f"file from {self.get_session_dir_path()}. "
+                    "Have you started Ray instance using "
+                    "`ray start` or `ray.init`?"
+                )
+
+        raise ValueError(
+            f"Can't find a `{ray_constants.RAY_NODE_IP_FILENAME}` "
+            f"file from {self.get_session_dir_path()}. "
+            f"for {timeout_s} seconds. "
+            "A ray instance hasn't started. "
+            "Did you do `ray start` or `ray.init` on this host?"
+        )
 
     def start_reaper_process(self):
         """
@@ -842,20 +1149,27 @@ class Node:
 
     def start_log_monitor(self):
         """Start the log monitor."""
+        stdout_log_fname, stderr_log_fname = self.get_log_file_names(
+            "log_monitor", unique=True, create_out=True, create_err=True
+        )
         process_info = ray._private.services.start_log_monitor(
+            self.get_session_dir_path(),
             self._logs_dir,
             self.gcs_address,
             fate_share=self.kernel_fate_share,
             max_bytes=self.max_bytes,
             backup_count=self.backup_count,
-            redirect_logging=self.should_redirect_logs(),
+            stdout_filepath=stdout_log_fname,
+            stderr_filepath=stderr_log_fname,
         )
         assert ray_constants.PROCESS_TYPE_LOG_MONITOR not in self.all_processes
         self.all_processes[ray_constants.PROCESS_TYPE_LOG_MONITOR] = [
             process_info,
         ]
 
-    def start_api_server(self, *, include_dashboard: bool, raise_on_failure: bool):
+    def start_api_server(
+        self, *, include_dashboard: Optional[bool], raise_on_failure: bool
+    ):
         """Start the dashboard.
 
         Args:
@@ -866,19 +1180,25 @@ class Node:
                 if we fail to start the API server. Otherwise it will print
                 a warning if we fail to start the API server.
         """
+        stdout_log_fname, stderr_log_fname = self.get_log_file_names(
+            "dashboard", unique=True, create_out=True, create_err=True
+        )
         self._webui_url, process_info = ray._private.services.start_api_server(
             include_dashboard,
             raise_on_failure,
             self._ray_params.dashboard_host,
             self.gcs_address,
+            self.cluster_id.hex(),
+            self._node_ip_address,
             self._temp_dir,
             self._logs_dir,
             self._session_dir,
+            port=self._ray_params.dashboard_port,
             fate_share=self.kernel_fate_share,
             max_bytes=self.max_bytes,
             backup_count=self.backup_count,
-            port=self._ray_params.dashboard_port,
-            redirect_logging=self.should_redirect_logs(),
+            stdout_filepath=stdout_log_fname,
+            stderr_filepath=stderr_log_fname,
         )
         assert ray_constants.PROCESS_TYPE_DASHBOARD not in self.all_processes
         if process_info is not None:
@@ -898,14 +1218,17 @@ class Node:
         assert gcs_server_port > 0
         assert self._gcs_address is None, "GCS server is already running."
         assert self._gcs_client is None, "GCS client is already connected."
-        # TODO(mwtian): append date time so restarted GCS uses different files.
-        stdout_file, stderr_file = self.get_log_file_handles("gcs_server", unique=True)
+
+        stdout_log_fname, stderr_log_fname = self.get_log_file_names(
+            "gcs_server", unique=True, create_out=True, create_err=True
+        )
         process_info = ray._private.services.start_gcs_server(
             self.redis_address,
-            self._logs_dir,
-            self.session_name,
-            stdout_file=stdout_file,
-            stderr_file=stderr_file,
+            log_dir=self._logs_dir,
+            stdout_filepath=stdout_log_fname,
+            stderr_filepath=stderr_log_fname,
+            session_name=self.session_name,
+            redis_username=self._ray_params.redis_username,
             redis_password=self._ray_params.redis_password,
             config=self._config,
             fate_share=self.kernel_fate_share,
@@ -922,12 +1245,11 @@ class Node:
         # TODO(mwtian): figure out a way to use 127.0.0.1 for local connection
         # when possible.
         self._gcs_address = f"{self._node_ip_address}:" f"{gcs_server_port}"
-        # Initialize gcs client, which also waits for GCS to start running.
-        self.get_gcs_client()
 
     def start_raylet(
         self,
         plasma_directory: str,
+        fallback_directory: str,
         object_store_memory: int,
         use_valgrind: bool = False,
         use_profiler: bool = False,
@@ -940,14 +1262,39 @@ class Node:
             use_profiler: True if we should start the process in the
                 valgrind profiler.
         """
-        stdout_file, stderr_file = self.get_log_file_handles("raylet", unique=True)
+        raylet_stdout_filepath, raylet_stderr_filepath = self.get_log_file_names(
+            ray_constants.PROCESS_TYPE_RAYLET,
+            unique=True,
+            create_out=True,
+            create_err=True,
+        )
+        (
+            dashboard_agent_stdout_filepath,
+            dashboard_agent_stderr_filepath,
+        ) = self.get_log_file_names(
+            ray_constants.PROCESS_TYPE_DASHBOARD_AGENT,
+            unique=True,
+            create_out=True,
+            create_err=True,
+        )
+        (
+            runtime_env_agent_stdout_filepath,
+            runtime_env_agent_stderr_filepath,
+        ) = self.get_log_file_names(
+            ray_constants.PROCESS_TYPE_RUNTIME_ENV_AGENT,
+            unique=True,
+            create_out=True,
+            create_err=True,
+        )
         process_info = ray._private.services.start_raylet(
             self.redis_address,
             self.gcs_address,
+            self._node_id,
             self._node_ip_address,
             self._ray_params.node_manager_port,
             self._raylet_socket_name,
             self._plasma_store_socket_name,
+            self.cluster_id.hex(),
             self._ray_params.worker_path,
             self._ray_params.setup_worker_path,
             self._ray_params.storage,
@@ -957,37 +1304,42 @@ class Node:
             self._logs_dir,
             self.get_resource_spec(),
             plasma_directory,
+            fallback_directory,
             object_store_memory,
             self.session_name,
+            is_head_node=self.is_head(),
             min_worker_port=self._ray_params.min_worker_port,
             max_worker_port=self._ray_params.max_worker_port,
             worker_port_list=self._ray_params.worker_port_list,
             object_manager_port=self._ray_params.object_manager_port,
+            redis_username=self._ray_params.redis_username,
             redis_password=self._ray_params.redis_password,
             metrics_agent_port=self._ray_params.metrics_agent_port,
+            runtime_env_agent_port=self._ray_params.runtime_env_agent_port,
             metrics_export_port=self._metrics_export_port,
             dashboard_agent_listen_port=self._ray_params.dashboard_agent_listen_port,
             use_valgrind=use_valgrind,
             use_profiler=use_profiler,
-            stdout_file=stdout_file,
-            stderr_file=stderr_file,
-            config=self._config,
+            raylet_stdout_filepath=raylet_stdout_filepath,
+            raylet_stderr_filepath=raylet_stderr_filepath,
+            dashboard_agent_stdout_filepath=dashboard_agent_stdout_filepath,
+            dashboard_agent_stderr_filepath=dashboard_agent_stderr_filepath,
+            runtime_env_agent_stdout_filepath=runtime_env_agent_stdout_filepath,
+            runtime_env_agent_stderr_filepath=runtime_env_agent_stderr_filepath,
             huge_pages=self._ray_params.huge_pages,
             fate_share=self.kernel_fate_share,
             socket_to_use=None,
             max_bytes=self.max_bytes,
             backup_count=self.backup_count,
-            start_initial_python_workers_for_first_job=self._ray_params.start_initial_python_workers_for_first_job,  # noqa: E501
             ray_debugger_external=self._ray_params.ray_debugger_external,
             env_updates=self._ray_params.env_vars,
             node_name=self._ray_params.node_name,
+            webui=self._webui_url,
+            labels=self.node_labels,
+            resource_isolation_config=self.resource_isolation_config,
         )
         assert ray_constants.PROCESS_TYPE_RAYLET not in self.all_processes
         self.all_processes[ray_constants.PROCESS_TYPE_RAYLET] = [process_info]
-
-    def start_worker(self):
-        """Start a worker process."""
-        raise NotImplementedError
 
     def start_monitor(self):
         """Start the monitor.
@@ -996,17 +1348,22 @@ class Node:
         any modification to these files may break existing
         cluster launching commands.
         """
-        stdout_file, stderr_file = self.get_log_file_handles("monitor", unique=True)
+        from ray.autoscaler.v2.utils import is_autoscaler_v2
+
+        stdout_log_fname, stderr_log_fname = self.get_log_file_names(
+            "monitor", unique=True, create_out=True, create_err=True
+        )
         process_info = ray._private.services.start_monitor(
             self.gcs_address,
             self._logs_dir,
-            stdout_file=stdout_file,
-            stderr_file=stderr_file,
+            stdout_filepath=stdout_log_fname,
+            stderr_filepath=stderr_log_fname,
             autoscaling_config=self._ray_params.autoscaling_config,
             fate_share=self.kernel_fate_share,
             max_bytes=self.max_bytes,
             backup_count=self.backup_count,
             monitor_ip=self._node_ip_address,
+            autoscaler_v2=is_autoscaler_v2(fetch_from_server=True),
         )
         assert ray_constants.PROCESS_TYPE_MONITOR not in self.all_processes
         self.all_processes[ray_constants.PROCESS_TYPE_MONITOR] = [process_info]
@@ -1022,9 +1379,10 @@ class Node:
             self._ray_params.ray_client_server_port,
             stdout_file=stdout_file,
             stderr_file=stderr_file,
+            redis_username=self._ray_params.redis_username,
             redis_password=self._ray_params.redis_password,
             fate_share=self.kernel_fate_share,
-            metrics_agent_port=self._ray_params.metrics_agent_port,
+            runtime_env_agent_address=self.runtime_env_agent_address,
         )
         assert ray_constants.PROCESS_TYPE_RAY_CLIENT_SERVER not in self.all_processes
         self.all_processes[ray_constants.PROCESS_TYPE_RAY_CLIENT_SERVER] = [
@@ -1040,22 +1398,65 @@ class Node:
         # Make sure the cluster metadata wasn't reported before.
         import ray._private.usage.usage_lib as ray_usage_lib
 
-        ray_usage_lib.put_cluster_metadata(self.get_gcs_client())
+        ray_usage_lib.put_cluster_metadata(
+            self.get_gcs_client(), ray_init_cluster=self.ray_init_cluster
+        )
+        # Make sure GCS is up.
+        added = self.get_gcs_client().internal_kv_put(
+            b"session_name",
+            self._session_name.encode(),
+            False,
+            ray_constants.KV_NAMESPACE_SESSION,
+        )
+        if not added:
+            curr_val = self.get_gcs_client().internal_kv_get(
+                b"session_name", ray_constants.KV_NAMESPACE_SESSION
+            )
+            assert curr_val == self._session_name.encode("utf-8"), (
+                f"Session name {self._session_name} does not match "
+                f"persisted value {curr_val}. Perhaps there was an "
+                f"error connecting to Redis."
+            )
+
+        self.get_gcs_client().internal_kv_put(
+            b"session_dir",
+            self._session_dir.encode(),
+            True,
+            ray_constants.KV_NAMESPACE_SESSION,
+        )
+        self.get_gcs_client().internal_kv_put(
+            b"temp_dir",
+            self._temp_dir.encode(),
+            True,
+            ray_constants.KV_NAMESPACE_SESSION,
+        )
+        if self._ray_params.storage is not None:
+            self.get_gcs_client().internal_kv_put(
+                b"storage",
+                self._ray_params.storage.encode(),
+                True,
+                ray_constants.KV_NAMESPACE_SESSION,
+            )
+        # Add tracing_startup_hook to redis / internal kv manually
+        # since internal kv is not yet initialized.
+        if self._ray_params.tracing_startup_hook:
+            self.get_gcs_client().internal_kv_put(
+                b"tracing_startup_hook",
+                self._ray_params.tracing_startup_hook.encode(),
+                True,
+                ray_constants.KV_NAMESPACE_TRACING,
+            )
 
     def start_head_processes(self):
         """Start head processes on the node."""
         logger.debug(
             f"Process STDOUT and STDERR is being " f"redirected to {self._logs_dir}."
         )
-        assert self._redis_address is None
         assert self._gcs_address is None
         assert self._gcs_client is None
 
-        if self._ray_params.external_addresses is not None:
-            self._redis_address = self._ray_params.external_addresses[0]
-
         self.start_gcs_server()
-        assert self._gcs_client is not None
+        assert self.get_gcs_client() is not None
         self._write_cluster_info_to_kv()
 
         if not self._ray_params.no_monitor:
@@ -1066,17 +1467,12 @@ class Node:
 
         if self._ray_params.include_dashboard is None:
             # Default
-            include_dashboard = True
-            raise_on_api_server_failure = False
-        elif self._ray_params.include_dashboard is False:
-            include_dashboard = False
             raise_on_api_server_failure = False
         else:
-            include_dashboard = True
-            raise_on_api_server_failure = True
+            raise_on_api_server_failure = self._ray_params.include_dashboard
 
         self.start_api_server(
-            include_dashboard=include_dashboard,
+            include_dashboard=self._ray_params.include_dashboard,
             raise_on_failure=raise_on_api_server_failure,
         )
 
@@ -1086,12 +1482,13 @@ class Node:
             f"Process STDOUT and STDERR is being " f"redirected to {self._logs_dir}."
         )
 
-        # Clean up external storage in case a previous Raylet instance crashed
-        # on this node and spilled objects remain on disk.
         if not self.head:
             # Get the system config from GCS first if this is a non-head node.
-            gcs_options = ray._raylet.GcsClientOptions.from_gcs_address(
-                self.gcs_address
+            gcs_options = ray._raylet.GcsClientOptions.create(
+                self.gcs_address,
+                self.cluster_id.hex(),
+                allow_cluster_id_nil=False,
+                fetch_cluster_id_if_nil=False,
             )
             global_state = ray._private.state.GlobalState()
             global_state._initialize_global_state(gcs_options)
@@ -1104,20 +1501,28 @@ class Node:
                 f" GCS system config: {new_config}"
             )
             self._config = new_config
-        self.destroy_external_storage()
 
         # Make sure we don't call `determine_plasma_store_config` multiple
         # times to avoid printing multiple warnings.
         resource_spec = self.get_resource_spec()
+
         (
             plasma_directory,
+            fallback_directory,
             object_store_memory,
         ) = ray._private.services.determine_plasma_store_config(
             resource_spec.object_store_memory,
+            self._temp_dir,
             plasma_directory=self._ray_params.plasma_directory,
+            fallback_directory=self._fallback_directory,
             huge_pages=self._ray_params.huge_pages,
         )
-        self.start_raylet(plasma_directory, object_store_memory)
+
+        # add plasma store memory to the total system reserved memory
+        if self.resource_isolation_config.is_enabled():
+            self.resource_isolation_config.add_object_store_memory(object_store_memory)
+
+        self.start_raylet(plasma_directory, fallback_directory, object_store_memory)
         if self._ray_params.include_log_monitor:
             self.start_log_monitor()
 
@@ -1258,17 +1663,6 @@ class Node:
             ray_constants.PROCESS_TYPE_LOG_MONITOR, check_alive=check_alive
         )
 
-    def kill_reporter(self, check_alive: bool = True):
-        """Kill the reporter.
-
-        Args:
-            check_alive: Raise an exception if the process was already
-                dead.
-        """
-        self._kill_process_type(
-            ray_constants.PROCESS_TYPE_REPORTER, check_alive=check_alive
-        )
-
     def kill_dashboard(self, check_alive: bool = True):
         """Kill the dashboard.
 
@@ -1299,7 +1693,7 @@ class Node:
                 dead.
         """
         self._kill_process_type(
-            ray_constants.PROCESS_TYPE_GCS_SERVER, check_alive=check_alive
+            ray_constants.PROCESS_TYPE_GCS_SERVER, check_alive=check_alive, wait=True
         )
         # Clear GCS client and address to indicate no GCS server is running.
         self._gcs_address = None
@@ -1426,31 +1820,20 @@ class Node:
             from ray._private import external_storage
 
             storage = external_storage.setup_external_storage(
-                object_spilling_config, self._session_name
+                object_spilling_config, self._node_id, self._session_name
             )
             storage.destroy_external_storage()
 
     def validate_external_storage(self):
-        """Make sure we can setup the object spilling external storage.
-        This will also fill up the default setting for object spilling
-        if not specified.
-        """
-        object_spilling_config = self._config.get("object_spilling_config", {})
+        """Make sure we can setup the object spilling external storage."""
+
         automatic_spilling_enabled = self._config.get(
             "automatic_object_spilling_enabled", True
         )
         if not automatic_spilling_enabled:
             return
 
-        if not object_spilling_config:
-            object_spilling_config = os.environ.get("RAY_object_spilling_config", "")
-
-        # If the config is not specified, we fill up the default.
-        if not object_spilling_config:
-            object_spilling_config = json.dumps(
-                {"type": "filesystem", "params": {"directory_path": self._session_dir}}
-            )
-
+        object_spilling_config = self._object_spilling_config
         # Try setting up the storage.
         # Configure the proper system config.
         # We need to set both ray param's system config and self._config
@@ -1470,15 +1853,80 @@ class Node:
         # Validate external storage usage.
         from ray._private import external_storage
 
-        external_storage.setup_external_storage(deserialized_config, self._session_name)
+        # Node ID is available only after GCS is connected. However,
+        # validate_external_storage() needs to be called before it to
+        # be able to validate the configs early. Therefore, we use a
+        # dummy node ID here and make sure external storage can be set
+        # up based on the provided config. This storage is destroyed
+        # right after the validation.
+        dummy_node_id = ray.NodeID.from_random().hex()
+        storage = external_storage.setup_external_storage(
+            deserialized_config, dummy_node_id, self._session_name
+        )
+        storage.destroy_external_storage()
         external_storage.reset_external_storage()
 
+    def _get_object_spilling_config(self):
+        """Consolidate the object spilling config from the ray params, environment
+        variable, and system config. The object spilling directory specified through
+        ray params will override the one specified through environment variable and
+        system config."""
+
+        object_spilling_directory = self._ray_params.object_spilling_directory
+        if not object_spilling_directory:
+            object_spilling_directory = self._config.get(
+                "object_spilling_directory", ""
+            )
+
+        if not object_spilling_directory:
+            object_spilling_directory = os.environ.get(
+                "RAY_object_spilling_directory", ""
+            )
+
+        if object_spilling_directory:
+            return json.dumps(
+                {
+                    "type": "filesystem",
+                    "params": {"directory_path": object_spilling_directory},
+                }
+            )
+
+        object_spilling_config = self._config.get("object_spilling_config", {})
+        if not object_spilling_config:
+            object_spilling_config = os.environ.get("RAY_object_spilling_config", "")
+
+        # If the config is not specified in ray params, system config or environment
+        # variable, we fill up the default.
+        if not object_spilling_config:
+            object_spilling_config = json.dumps(
+                {"type": "filesystem", "params": {"directory_path": self._session_dir}}
+            )
+        else:
+            if not is_in_test():
+                logger.warning(
+                    "The object spilling config is specified from an unstable "
+                    "API - system config or environment variable. This is "
+                    "subject to change in the future. You can use the stable "
+                    "API - --object-spilling-directory in ray start or "
+                    "object_spilling_directory in ray.init() to specify the "
+                    "object spilling directory instead. If you need more "
+                    "advanced settings, please open a github issue with the "
+                    "Ray team."
+                )
+
+        return object_spilling_config
+
     def _record_stats(self):
+        # This is only called when a new node is started.
         # Initialize the internal kv so that the metrics can be put
-        from ray._private.usage.usage_lib import TagKey, record_extra_usage_tag
+        from ray._private.usage.usage_lib import (
+            TagKey,
+            record_extra_usage_tag,
+            record_hardware_usage,
+        )
 
         if not ray.experimental.internal_kv._internal_kv_initialized():
-            ray.experimental.internal_kv._initialize_internal_kv(self.get_gcs_client)
+            ray.experimental.internal_kv._initialize_internal_kv(self.get_gcs_client())
         assert ray.experimental.internal_kv._internal_kv_initialized()
         if self.head:
             # record head node stats
@@ -1486,3 +1934,9 @@ class Node:
                 "redis" if os.environ.get("RAY_REDIS_ADDRESS") is not None else "memory"
             )
             record_extra_usage_tag(TagKey.GCS_STORAGE, gcs_storage_type)
+        cpu_model_name = ray._private.utils.get_current_node_cpu_model_name()
+        if cpu_model_name:
+            # CPU model name can be an arbitrary long string
+            # so we truncate it to the first 50 characters
+            # to avoid any issues.
+            record_hardware_usage(cpu_model_name[:50])

@@ -13,7 +13,9 @@ You can dynamically adjust resource requirements or return values of ``ray.remot
 
 For example, here we instantiate many copies of the same actor with varying resource requirements. Note that to create these actors successfully, Ray will need to be started with sufficient CPU resources and the relevant custom resources:
 
-.. code-block:: python
+.. testcode::
+
+  import ray
 
   @ray.remote(num_cpus=4)
   class Counter(object):
@@ -30,21 +32,28 @@ For example, here we instantiate many copies of the same actor with varying reso
 
 You can specify different resource requirements for tasks (but not for actor methods):
 
-.. code-block:: python
+.. testcode::
+  :hide:
+
+  ray.shutdown()
+
+.. testcode::
+
+    ray.init(num_cpus=1, num_gpus=1)
 
     @ray.remote
     def g():
         return ray.get_gpu_ids()
 
     object_gpu_ids = g.remote()
-    assert ray.get(object_gpu_ids) == [0]
+    assert ray.get(object_gpu_ids) == []
 
     dynamic_object_gpu_ids = g.options(num_cpus=1, num_gpus=1).remote()
     assert ray.get(dynamic_object_gpu_ids) == [0]
 
 And vary the number of return values for tasks (and actor methods too):
 
-.. code-block:: python
+.. testcode::
 
     @ray.remote
     def f(n):
@@ -56,7 +65,7 @@ And vary the number of return values for tasks (and actor methods too):
 
 And specify a name for tasks (and actor methods too) at task submission time:
 
-.. code-block:: python
+.. testcode::
 
    import setproctitle
 
@@ -73,24 +82,6 @@ as the worker process name when this task is executing (if a Python task), and w
 appear as the task name in the logs.
 
 .. image:: images/task_name_dashboard.png
-
-
-.. _accelerator-types:
-
-Accelerator Types
-------------------
-
-Ray supports resource specific accelerator types. The `accelerator_type` field can be used to force to a task to run on a node with a specific type of accelerator. Under the hood, the accelerator type option is implemented as a custom resource demand of ``"accelerator_type:<type>": 0.001``. This forces the task to be placed on a node with that particular accelerator type available. This also lets the multi-node-type autoscaler know that there is demand for that type of resource, potentially triggering the launch of new nodes providing that accelerator.
-
-.. code-block:: python
-
-    from ray.accelerators import NVIDIA_TESLA_V100
-
-    @ray.remote(num_gpus=1, accelerator_type=NVIDIA_TESLA_V100)
-    def train(data):
-        return "This function was run on a node with a Tesla V100 GPU"
-
-See `ray.util.accelerators` to see available accelerator types. Current automatically detected accelerator types include Nvidia GPUs.
 
 
 Overloaded Functions
@@ -172,16 +163,21 @@ To get information about the current nodes in your cluster, you can use ``ray.no
 .. autofunction:: ray.nodes
     :noindex:
 
+.. testcode::
+  :hide:
 
-.. code-block:: python
+  ray.shutdown()
+
+.. testcode::
 
     import ray
 
     ray.init()
-
     print(ray.nodes())
 
-    """
+.. testoutput::
+  :options: +MOCK
+
     [{'NodeID': '2691a0c1aed6f45e262b2372baf58871734332d7',
       'Alive': True,
       'NodeManagerAddress': '192.168.1.82',
@@ -193,7 +189,6 @@ To get information about the current nodes in your cluster, you can use ``ray.no
       'MetricsExportPort': 64860,
       'alive': True,
       'Resources': {'CPU': 16.0, 'memory': 100.0, 'object_store_memory': 34.0, 'node:192.168.1.82': 1.0}}]
-    """
 
 The above information includes:
 
@@ -216,3 +211,77 @@ To get information about the current available resource capacity of your cluster
 
 .. autofunction:: ray.available_resources
     :noindex:
+
+Running Large Ray Clusters
+--------------------------
+
+Here are some tips to run Ray with more than 1k nodes. When running Ray with such
+a large number of nodes, several system settings may need to be tuned to enable
+communication between such a large number of machines.
+
+Tuning Operating System Settings
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Because all nodes and workers connect to the GCS, many network connections will
+be created and the operating system has to support that number of connections.
+
+Maximum open files
+******************
+
+The OS has to be configured to support opening many TCP connections since every
+worker and raylet connects to the GCS. In POSIX systems, the current limit can
+be checked by ``ulimit -n`` and if it's small, it should be increased according to
+the OS manual.
+
+ARP cache
+*********
+
+Another thing that needs to be configured is the ARP cache. In a large cluster,
+all the worker nodes connect to the head node, which adds a lot of entries to
+the ARP table. Ensure that the ARP cache size is large enough to handle this
+many nodes.
+Failure to do this will result in the head node hanging. When this happens,
+``dmesg`` will show errors like ``neighbor table overflow message``.
+
+In Ubuntu, the ARP cache size can be tuned in ``/etc/sysctl.conf`` by increasing
+the value of ``net.ipv4.neigh.default.gc_thresh1`` - ``net.ipv4.neigh.default.gc_thresh3``.
+For more details, please refer to the OS manual.
+
+Benchmark
+~~~~~~~~~
+
+The machine setup:
+
+- 1 head node: m5.4xlarge (16 vCPUs/64GB mem)
+- 2000 worker nodes: m5.large (2 vCPUs/8GB mem)
+
+The OS setup:
+
+- Set the maximum number of opening files to 1048576
+- Increase the ARP cache size:
+    - ``net.ipv4.neigh.default.gc_thresh1=2048``
+    - ``net.ipv4.neigh.default.gc_thresh2=4096``
+    - ``net.ipv4.neigh.default.gc_thresh3=8192``
+
+
+The Ray setup:
+
+- ``RAY_event_stats=false``
+
+Test workload:
+
+- Test script: `code <https://github.com/ray-project/ray/blob/master/release/benchmarks/distributed/many_nodes_tests/actor_test.py>`_
+
+
+
+.. list-table:: Benchmark result
+   :header-rows: 1
+
+   * - Number of actors
+     - Actor launch time
+     - Actor ready time
+     - Total time
+   * - 20k (10 actors / node)
+     - 14.5s
+     - 136.1s
+     - 150.7s

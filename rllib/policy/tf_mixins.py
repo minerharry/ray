@@ -7,10 +7,10 @@ import numpy as np
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.policy.eager_tf_policy import EagerTFPolicy
 from ray.rllib.policy.eager_tf_policy_v2 import EagerTFPolicyV2
-from ray.rllib.policy.policy import Policy, PolicyState
+from ray.rllib.policy.policy import PolicyState
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy.tf_policy import TFPolicy
-from ray.rllib.utils.annotations import DeveloperAPI, override
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import get_variable, try_import_tf
 from ray.rllib.utils.schedules import PiecewiseSchedule
 from ray.rllib.utils.tf_utils import make_tf_callable
@@ -26,11 +26,10 @@ logger = logging.getLogger(__name__)
 tf1, tf, tfv = try_import_tf()
 
 
-@DeveloperAPI
+@OldAPIStack
 class LearningRateSchedule:
     """Mixin for TFPolicy that adds a learning rate schedule."""
 
-    @DeveloperAPI
     def __init__(self, lr, lr_schedule):
         self._lr_schedule = None
         if lr_schedule is None:
@@ -48,7 +47,6 @@ class LearningRateSchedule:
                     self._lr_placeholder, read_value=False
                 )
 
-    @override(Policy)
     def on_global_var_update(self, global_vars):
         super().on_global_var_update(global_vars)
         if self._lr_schedule is not None:
@@ -63,7 +61,6 @@ class LearningRateSchedule:
                 # both TFPolicy and any TFPolicy_eager.
                 self._optimizer.learning_rate.assign(self.cur_lr)
 
-    @override(TFPolicy)
     def optimizer(self):
         if self.framework == "tf":
             return tf1.train.AdamOptimizer(learning_rate=self.cur_lr)
@@ -71,11 +68,10 @@ class LearningRateSchedule:
             return tf.keras.optimizers.Adam(self.cur_lr)
 
 
-@DeveloperAPI
+@OldAPIStack
 class EntropyCoeffSchedule:
     """Mixin for TFPolicy that adds entropy coeff decay."""
 
-    @DeveloperAPI
     def __init__(self, entropy_coeff, entropy_coeff_schedule):
         self._entropy_coeff_schedule = None
         if entropy_coeff_schedule is None:
@@ -112,7 +108,6 @@ class EntropyCoeffSchedule:
                     self._entropy_coeff_placeholder, read_value=False
                 )
 
-    @override(Policy)
     def on_global_var_update(self, global_vars):
         super().on_global_var_update(global_vars)
         if self._entropy_coeff_schedule is not None:
@@ -126,6 +121,7 @@ class EntropyCoeffSchedule:
                 self.entropy_coeff.assign(new_val, read_value=False)
 
 
+@OldAPIStack
 class KLCoeffMixin:
     """Assigns the `update_kl()` and other KL-related methods to a TFPolicy.
 
@@ -185,14 +181,12 @@ class KLCoeffMixin:
         else:
             self.kl_coeff.assign(self.kl_coeff_val, read_value=False)
 
-    @override(Policy)
     def get_state(self) -> PolicyState:
         state = super().get_state()
         # Add current kl-coeff value.
         state["current_kl_coeff"] = self.kl_coeff_val
         return state
 
-    @override(Policy)
     def set_state(self, state: PolicyState) -> None:
         # Set current kl-coeff value first.
         self._set_kl_coeff(state.pop("current_kl_coeff", self.config["kl_coeff"]))
@@ -200,6 +194,7 @@ class KLCoeffMixin:
         super().set_state(state)
 
 
+@OldAPIStack
 class TargetNetworkMixin:
     """Assign the `update_target` method to the policy.
 
@@ -208,7 +203,6 @@ class TargetNetworkMixin:
     """
 
     def __init__(self):
-
         model_vars = self.model.trainable_variables()
         target_model_vars = self.target_model.trainable_variables()
 
@@ -251,7 +245,6 @@ class TargetNetworkMixin:
     def update_target(self, tau: int = None) -> None:
         self._do_update(np.float32(tau or self.config.get("tau", 1.0)))
 
-    @override(TFPolicy)
     def variables(self) -> List[TensorType]:
         return self.model.variables()
 
@@ -265,6 +258,7 @@ class TargetNetworkMixin:
         self.update_target(self.config.get("tau", 1.0))
 
 
+@OldAPIStack
 class ValueNetworkMixin:
     """Assigns the `_value()` method to a TFPolicy.
 
@@ -277,10 +271,9 @@ class ValueNetworkMixin:
     """
 
     def __init__(self, config):
-        # When doing GAE, we need the value function estimate on the
+        # When doing GAE or vtrace, we need the value function estimate on the
         # observation.
-        if config["use_gae"]:
-
+        if config.get("use_gae") or config.get("vtrace"):
             # Input dict is provided to us automatically via the Model's
             # requirements. It's a single-timestep (last one in trajectory)
             # input_dict.
@@ -346,6 +339,7 @@ class ValueNetworkMixin:
         return self._cached_extra_action_fetches
 
 
+@OldAPIStack
 class GradStatsMixin:
     def __init__(self):
         pass
@@ -366,8 +360,6 @@ class GradStatsMixin:
         }
 
 
-# TODO: find a better place for this util, since it's not technically MixIns.
-@DeveloperAPI
 def compute_gradients(
     policy, optimizer: LocalOptimizer, loss: TensorType
 ) -> ModelGradients:

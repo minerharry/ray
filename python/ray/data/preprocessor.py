@@ -1,15 +1,20 @@
 import abc
+import base64
+import collections
+import pickle
 import warnings
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Union, Dict, Any
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from ray.data import Dataset
+from ray.air.util.data_batch_conversion import BatchFormat
 from ray.util.annotations import DeveloperAPI, PublicAPI
 
 if TYPE_CHECKING:
-    import pandas as pd
     import numpy as np
+    import pandas as pd
+
     from ray.air.data_batch_type import DataBatchType
+    from ray.data import Dataset
 
 
 @PublicAPI(stability="beta")
@@ -24,7 +29,7 @@ class Preprocessor(abc.ABC):
     """Implements an ML preprocessing operation.
 
     Preprocessors are stateful objects that can be fitted against a Dataset and used
-    to transform both local data batches and distributed datasets. For example, a
+    to transform both local data batches and distributed data. For example, a
     Normalization preprocessor may calculate the mean and stdev of a field during
     fitting, and uses these attributes to implement its normalization transform.
 
@@ -58,21 +63,29 @@ class Preprocessor(abc.ABC):
     # Preprocessors that do not need to be fitted must override this.
     _is_fittable = True
 
+    def _check_has_fitted_state(self):
+        """Checks if the Preprocessor has fitted state.
+
+        This is also used as an indiciation if the Preprocessor has been fit, following
+        convention from Ray versions prior to 2.6.
+        This allows preprocessors that have been fit in older versions of Ray to be
+        used to transform data in newer versions.
+        """
+
+        fitted_vars = [v for v in vars(self) if v.endswith("_")]
+        return bool(fitted_vars)
+
     def fit_status(self) -> "Preprocessor.FitStatus":
         if not self._is_fittable:
             return Preprocessor.FitStatus.NOT_FITTABLE
-        elif self._check_is_fitted():
+        elif (
+            hasattr(self, "_fitted") and self._fitted
+        ) or self._check_has_fitted_state():
             return Preprocessor.FitStatus.FITTED
         else:
             return Preprocessor.FitStatus.NOT_FITTED
 
-    def transform_stats(self) -> Optional[str]:
-        """Return Dataset stats for the most recent transform call, if any."""
-        if not hasattr(self, "_transform_stats"):
-            return None
-        return self._transform_stats
-
-    def fit(self, dataset: Dataset) -> "Preprocessor":
+    def fit(self, ds: "Dataset") -> "Preprocessor":
         """Fit this Preprocessor to the Dataset.
 
         Fitted state attributes will be directly set in the Preprocessor.
@@ -81,7 +94,7 @@ class Preprocessor(abc.ABC):
         ``preprocessor.fit(A).fit(B)`` is equivalent to ``preprocessor.fit(B)``.
 
         Args:
-            dataset: Input dataset.
+            ds: Input dataset.
 
         Returns:
             Preprocessor: The fitted Preprocessor with state attributes.
@@ -101,9 +114,19 @@ class Preprocessor(abc.ABC):
                 "All previously fitted state will be overwritten!"
             )
 
-        return self._fit(dataset)
+        fitted_ds = self._fit(ds)
+        self._fitted = True
+        return fitted_ds
 
-    def fit_transform(self, dataset: Dataset) -> Dataset:
+    def fit_transform(
+        self,
+        ds: "Dataset",
+        *,
+        transform_num_cpus: Optional[float] = None,
+        transform_memory: Optional[float] = None,
+        transform_batch_size: Optional[int] = None,
+        transform_concurrency: Optional[int] = None,
+    ) -> "Dataset":
         """Fit this Preprocessor to the Dataset and then transform the Dataset.
 
         Calling it more than once will overwrite all previously fitted state:
@@ -111,19 +134,41 @@ class Preprocessor(abc.ABC):
         is equivalent to ``preprocessor.fit_transform(B)``.
 
         Args:
-            dataset: Input Dataset.
+            ds: Input Dataset.
+            transform_num_cpus: [experimental] The number of CPUs to reserve for each parallel map worker.
+            transform_memory: [experimental] The heap memory in bytes to reserve for each parallel map worker.
+            transform_batch_size: [experimental] The maximum number of rows to return.
+            transform_concurrency: [experimental] The maximum number of Ray workers to use concurrently.
 
         Returns:
             ray.data.Dataset: The transformed Dataset.
         """
-        self.fit(dataset)
-        return self.transform(dataset)
+        self.fit(ds)
+        return self.transform(
+            ds,
+            num_cpus=transform_num_cpus,
+            memory=transform_memory,
+            batch_size=transform_batch_size,
+            concurrency=transform_concurrency,
+        )
 
-    def transform(self, dataset: Dataset) -> Dataset:
+    def transform(
+        self,
+        ds: "Dataset",
+        *,
+        batch_size: Optional[int] = None,
+        num_cpus: Optional[float] = None,
+        memory: Optional[float] = None,
+        concurrency: Optional[int] = None,
+    ) -> "Dataset":
         """Transform the given dataset.
 
         Args:
-            dataset: Input Dataset.
+            ds: Input Dataset.
+            batch_size: [experimental] Advanced configuration for adjusting input size for each worker.
+            num_cpus: [experimental] The number of CPUs to reserve for each parallel map worker.
+            memory: [experimental] The heap memory in bytes to reserve for each parallel map worker.
+            concurrency: [experimental] The maximum number of Ray workers to use concurrently.
 
         Returns:
             ray.data.Dataset: The transformed Dataset.
@@ -140,8 +185,13 @@ class Preprocessor(abc.ABC):
                 "`fit` must be called before `transform`, "
                 "or simply use fit_transform() to run both steps"
             )
-        transformed_ds = self._transform(dataset)
-        self._transform_stats = transformed_ds.stats()
+        transformed_ds = self._transform(
+            ds,
+            batch_size=batch_size,
+            num_cpus=num_cpus,
+            memory=memory,
+            concurrency=concurrency,
+        )
         return transformed_ds
 
     def transform_batch(self, data: "DataBatchType") -> "DataBatchType":
@@ -169,34 +219,19 @@ class Preprocessor(abc.ABC):
             )
         return self._transform_batch(data)
 
-    def _check_is_fitted(self) -> bool:
-        """Returns whether this preprocessor is fitted.
-
-        We use the convention that attributes with a trailing ``_`` are set after
-        fitting is complete.
-        """
-        fitted_vars = [v for v in vars(self) if v.endswith("_")]
-        return bool(fitted_vars)
-
     @DeveloperAPI
-    def _fit(self, dataset: Dataset) -> "Preprocessor":
+    def _fit(self, ds: "Dataset") -> "Preprocessor":
         """Sub-classes should override this instead of fit()."""
         raise NotImplementedError()
 
-    def _determine_transform_to_use(self, data_format: str) -> str:
-        """Determine which transform to use based on data format and implementation.
+    def _determine_transform_to_use(self) -> BatchFormat:
+        """Determine which batch format to use based on Preprocessor implementation.
 
-        We will infer and pick the best transform to use:
-            * ``pandas`` data format prioritizes ``pandas`` transform if available.
-            * ``arrow`` and ``numpy`` data format prioritizes ``numpy`` transform if available. # noqa: E501
-            * Fall back to what's available if no preferred path found.
+        * If only `_transform_pandas` is implemented, then use ``pandas`` batch format.
+        * If only `_transform_numpy` is implemented, then use ``numpy`` batch format.
+        * If both are implemented, then use the Preprocessor defined preferred batch
+        format.
         """
-
-        assert data_format in (
-            "pandas",
-            "arrow",
-            "numpy",
-        ), f"Unsupported data format: {data_format}"
 
         has_transform_pandas = (
             self.__class__._transform_pandas != Preprocessor._transform_pandas
@@ -205,56 +240,48 @@ class Preprocessor(abc.ABC):
             self.__class__._transform_numpy != Preprocessor._transform_numpy
         )
 
-        # Infer transform type by prioritizing native transformation to minimize
-        # data conversion cost.
-        if data_format == "pandas":
-            # Perform native pandas transformation if possible.
-            if has_transform_pandas:
-                transform_type = "pandas"
-            elif has_transform_numpy:
-                transform_type = "numpy"
-            else:
-                raise NotImplementedError(
-                    "None of `_transform_numpy` or `_transform_pandas` "
-                    f"are implemented for dataset format `{data_format}`."
-                )
-        elif data_format == "arrow" or data_format == "numpy":
-            # Arrow -> Numpy is more efficient
-            if has_transform_numpy:
-                transform_type = "numpy"
-            elif has_transform_pandas:
-                transform_type = "pandas"
-            else:
-                raise NotImplementedError(
-                    "None of `_transform_numpy` or `_transform_pandas` "
-                    f"are implemented for dataset format `{data_format}`."
-                )
-
-        return transform_type
-
-    def _transform(self, dataset: Dataset) -> Dataset:
-        # TODO(matt): Expose `batch_size` or similar configurability.
-        # The default may be too small for some datasets and too large for others.
-
-        dataset_format = dataset._dataset_format()
-        if dataset_format not in ("pandas", "arrow"):
-            raise ValueError(
-                f"Unsupported Dataset format: '{dataset_format}'. Only 'pandas' "
-                "and 'arrow' Dataset formats are supported."
+        if has_transform_numpy and has_transform_pandas:
+            return self.preferred_batch_format()
+        elif has_transform_numpy:
+            return BatchFormat.NUMPY
+        elif has_transform_pandas:
+            return BatchFormat.PANDAS
+        else:
+            raise NotImplementedError(
+                "None of `_transform_numpy` or `_transform_pandas` are implemented. "
+                "At least one of these transform functions must be implemented "
+                "for Preprocessor transforms."
             )
 
-        transform_type = self._determine_transform_to_use(dataset_format)
+    def _transform(
+        self,
+        ds: "Dataset",
+        batch_size: Optional[int],
+        num_cpus: Optional[float] = None,
+        memory: Optional[float] = None,
+        concurrency: Optional[int] = None,
+    ) -> "Dataset":
+        transform_type = self._determine_transform_to_use()
 
         # Our user-facing batch format should only be pandas or NumPy, other
         # formats {arrow, simple} are internal.
         kwargs = self._get_transform_config()
-        if transform_type == "pandas":
-            return dataset.map_batches(
-                self._transform_pandas, batch_format="pandas", **kwargs
+        if num_cpus is not None:
+            kwargs["num_cpus"] = num_cpus
+        if memory is not None:
+            kwargs["memory"] = memory
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        if concurrency is not None:
+            kwargs["concurrency"] = concurrency
+
+        if transform_type == BatchFormat.PANDAS:
+            return ds.map_batches(
+                self._transform_pandas, batch_format=BatchFormat.PANDAS, **kwargs
             )
-        elif transform_type == "numpy":
-            return dataset.map_batches(
-                self._transform_numpy, batch_format="numpy", **kwargs
+        elif transform_type == BatchFormat.NUMPY:
+            return ds.map_batches(
+                self._transform_numpy, batch_format=BatchFormat.NUMPY, **kwargs
             )
         else:
             raise ValueError(
@@ -271,11 +298,12 @@ class Preprocessor(abc.ABC):
 
     def _transform_batch(self, data: "DataBatchType") -> "DataBatchType":
         # For minimal install to locally import air modules
-        import pandas as pd
         import numpy as np
+        import pandas as pd
+
         from ray.air.util.data_batch_conversion import (
-            convert_batch_type_to_pandas,
             _convert_batch_type_to_numpy,
+            _convert_batch_type_to_pandas,
         )
 
         try:
@@ -283,25 +311,42 @@ class Preprocessor(abc.ABC):
         except ImportError:
             pyarrow = None
 
-        if isinstance(data, pd.DataFrame):
-            data_format = "pandas"
-        elif pyarrow is not None and isinstance(data, pyarrow.Table):
-            data_format = "arrow"
-        elif isinstance(data, (dict, np.ndarray)):
-            data_format = "numpy"
-        else:
-            raise NotImplementedError(
+        if not isinstance(
+            data, (pd.DataFrame, pyarrow.Table, collections.abc.Mapping, np.ndarray)
+        ):
+            raise ValueError(
                 "`transform_batch` is currently only implemented for Pandas "
                 "DataFrames, pyarrow Tables, NumPy ndarray and dictionary of "
                 f"ndarray. Got {type(data)}."
             )
 
-        transform_type = self._determine_transform_to_use(data_format)
+        transform_type = self._determine_transform_to_use()
 
-        if transform_type == "pandas":
-            return self._transform_pandas(convert_batch_type_to_pandas(data))
-        elif transform_type == "numpy":
+        if transform_type == BatchFormat.PANDAS:
+            return self._transform_pandas(_convert_batch_type_to_pandas(data))
+        elif transform_type == BatchFormat.NUMPY:
             return self._transform_numpy(_convert_batch_type_to_numpy(data))
+
+    @classmethod
+    def _derive_and_validate_output_columns(
+        cls, columns: List[str], output_columns: Optional[List[str]]
+    ) -> List[str]:
+        """Returns the output columns after validation.
+
+        Checks if the columns are explicitly set, otherwise defaulting to
+        the input columns.
+
+        Raises:
+            ValueError: If the length of the output columns does not match the
+                length of the input columns.
+        """
+
+        if output_columns and len(columns) != len(output_columns):
+            raise ValueError(
+                "Invalid output_columns: Got len(columns) != len(output_columns). "
+                "The length of columns and output_columns must match."
+            )
+        return output_columns or columns
 
     @DeveloperAPI
     def _transform_pandas(self, df: "pd.DataFrame") -> "pd.DataFrame":
@@ -314,3 +359,32 @@ class Preprocessor(abc.ABC):
     ) -> Union["np.ndarray", Dict[str, "np.ndarray"]]:
         """Run the transformation on a data batch in a NumPy ndarray format."""
         raise NotImplementedError()
+
+    @classmethod
+    @DeveloperAPI
+    def preferred_batch_format(cls) -> BatchFormat:
+        """Batch format hint for upstream producers to try yielding best block format.
+
+        The preferred batch format to use if both `_transform_pandas` and
+        `_transform_numpy` are implemented. Defaults to Pandas.
+
+        Can be overriden by Preprocessor classes depending on which transform
+        path is the most optimal.
+        """
+        return BatchFormat.PANDAS
+
+    @DeveloperAPI
+    def serialize(self) -> str:
+        """Return this preprocessor serialized as a string.
+
+        Note: This is not a stable serialization format as it uses `pickle`.
+        """
+        # Convert it to a plain string so that it can be included as JSON metadata
+        # in Trainer checkpoints.
+        return base64.b64encode(pickle.dumps(self)).decode("ascii")
+
+    @staticmethod
+    @DeveloperAPI
+    def deserialize(serialized: str) -> "Preprocessor":
+        """Load the original preprocessor serialized via `self.serialize()`."""
+        return pickle.loads(base64.b64decode(serialized))

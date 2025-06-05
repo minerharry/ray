@@ -14,178 +14,16 @@
 
 #include "ray/gcs/gcs_server/gcs_kv_manager.h"
 
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_split.h"
 
 namespace ray {
 namespace gcs {
-namespace {
-
-constexpr std::string_view kNamespacePrefix = "@namespace_";
-constexpr std::string_view kNamespaceSep = ":";
-constexpr std::string_view kClusterSeparator = "@";
-
-}  // namespace
-std::string RedisInternalKV::MakeKey(const std::string &ns,
-                                     const std::string &key) const {
-  if (ns.empty()) {
-    return absl::StrCat(external_storage_namespace_, kClusterSeparator, key);
-  }
-  return absl::StrCat(external_storage_namespace_,
-                      kClusterSeparator,
-                      kNamespacePrefix,
-                      ns,
-                      kNamespaceSep,
-                      key);
-}
-
-Status RedisInternalKV::ValidateKey(const std::string &key) const {
-  if (absl::StartsWith(key, kNamespacePrefix)) {
-    return Status::KeyError(absl::StrCat("Key can't start with ", kNamespacePrefix));
-  }
-  return Status::OK();
-}
-
-std::string RedisInternalKV::ExtractKey(const std::string &key) const {
-  auto view = std::string_view(key);
-  RAY_CHECK(absl::StartsWith(view, external_storage_namespace_))
-      << "Invalid key: " << view << ". It should start with "
-      << external_storage_namespace_;
-  view = view.substr(external_storage_namespace_.size() + kClusterSeparator.size());
-  if (absl::StartsWith(view, kNamespacePrefix)) {
-    std::vector<std::string> parts =
-        absl::StrSplit(key, absl::MaxSplits(kNamespaceSep, 1));
-    RAY_CHECK(parts.size() == 2) << "Invalid key: " << key;
-
-    return parts[1];
-  }
-  return std::string(view.begin(), view.end());
-}
-
-RedisInternalKV::RedisInternalKV(const RedisClientOptions &redis_options)
-    : redis_options_(redis_options),
-      external_storage_namespace_(::RayConfig::instance().external_storage_namespace()),
-      work_(io_service_) {
-  RAY_CHECK(!absl::StrContains(external_storage_namespace_, kClusterSeparator))
-      << "Storage namespace (" << external_storage_namespace_ << ") shouldn't contain "
-      << kClusterSeparator << ".";
-  io_thread_ = std::make_unique<std::thread>([this] {
-    SetThreadName("InternalKV");
-    io_service_.run();
-  });
-  redis_client_ = std::make_unique<RedisClient>(redis_options_);
-  RAY_CHECK_OK(redis_client_->Connect(io_service_));
-}
-
-void RedisInternalKV::Get(const std::string &ns,
-                          const std::string &key,
-                          std::function<void(std::optional<std::string>)> callback) {
-  auto true_key = MakeKey(ns, key);
-  std::vector<std::string> cmd = {"HGET", true_key, "value"};
-  RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-      cmd, [callback = std::move(callback)](auto redis_reply) {
-        if (callback) {
-          if (!redis_reply->IsNil()) {
-            callback(redis_reply->ReadAsString());
-          } else {
-            callback(std::nullopt);
-          }
-        }
-      }));
-}
-
-void RedisInternalKV::Put(const std::string &ns,
-                          const std::string &key,
-                          const std::string &value,
-                          bool overwrite,
-                          std::function<void(bool)> callback) {
-  auto true_key = MakeKey(ns, key);
-  std::vector<std::string> cmd = {
-      overwrite ? "HSET" : "HSETNX", true_key, "value", value};
-  RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-      cmd, [callback = std::move(callback)](auto redis_reply) {
-        if (callback) {
-          auto added_num = redis_reply->ReadAsInteger();
-          callback(added_num != 0);
-        }
-      }));
-}
-
-void RedisInternalKV::Del(const std::string &ns,
-                          const std::string &key,
-                          bool del_by_prefix,
-                          std::function<void(int64_t)> callback) {
-  auto true_key = MakeKey(ns, key);
-  if (del_by_prefix) {
-    std::vector<std::string> cmd = {"KEYS", true_key + "*"};
-    RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-        cmd, [this, callback = std::move(callback)](auto redis_reply) {
-          const auto &reply = redis_reply->ReadAsStringArray();
-          // If there are no keys with this prefix, we don't need to send
-          // another delete.
-          if (reply.size() == 0) {
-            if (callback) {
-              callback(0);
-            }
-          } else {
-            std::vector<std::string> del_cmd = {"DEL"};
-            for (const auto &r : reply) {
-              RAY_CHECK(r.has_value());
-              del_cmd.emplace_back(*r);
-            }
-            RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-                del_cmd, [callback = std::move(callback)](auto redis_reply) {
-                  if (callback) {
-                    callback(redis_reply->ReadAsInteger());
-                  }
-                }));
-          }
-        }));
-  } else {
-    std::vector<std::string> cmd = {"DEL", true_key};
-    RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-        cmd, [callback = std::move(callback)](auto redis_reply) {
-          if (callback) {
-            callback(redis_reply->ReadAsInteger());
-          }
-        }));
-  }
-}
-
-void RedisInternalKV::Exists(const std::string &ns,
-                             const std::string &key,
-                             std::function<void(bool)> callback) {
-  auto true_key = MakeKey(ns, key);
-  std::vector<std::string> cmd = {"HEXISTS", true_key, "value"};
-  RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-      cmd, [callback = std::move(callback)](auto redis_reply) {
-        if (callback) {
-          bool exists = redis_reply->ReadAsInteger() > 0;
-          callback(exists);
-        }
-      }));
-}
-
-void RedisInternalKV::Keys(const std::string &ns,
-                           const std::string &prefix,
-                           std::function<void(std::vector<std::string>)> callback) {
-  auto true_prefix = MakeKey(ns, prefix);
-  std::vector<std::string> cmd = {"KEYS", true_prefix + "*"};
-  RAY_CHECK_OK(redis_client_->GetPrimaryContext()->RunArgvAsync(
-      cmd, [this, callback = std::move(callback)](auto redis_reply) {
-        if (callback) {
-          const auto &reply = redis_reply->ReadAsStringArray();
-          std::vector<std::string> results;
-          for (const auto &r : reply) {
-            RAY_CHECK(r.has_value());
-            results.emplace_back(ExtractKey(*r));
-          }
-          callback(std::move(results));
-        }
-      }));
-}
 
 void GcsInternalKVManager::HandleInternalKVGet(
     rpc::InternalKVGetRequest request,
@@ -204,8 +42,33 @@ void GcsInternalKVManager::HandleInternalKVGet(
             send_reply_callback, reply, Status::NotFound("Failed to find the key"));
       }
     };
-    kv_instance_->Get(request.namespace_(), request.key(), std::move(callback));
+    kv_instance_->Get(
+        request.namespace_(), request.key(), {std::move(callback), io_context_});
   }
+}
+
+void GcsInternalKVManager::HandleInternalKVMultiGet(
+    rpc::InternalKVMultiGetRequest request,
+    rpc::InternalKVMultiGetReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  for (auto &key : request.keys()) {
+    auto status = ValidateKey(key);
+    if (!status.ok()) {
+      GCS_RPC_SEND_REPLY(send_reply_callback, reply, status);
+      return;
+    }
+  }
+  auto callback = [reply, send_reply_callback](
+                      absl::flat_hash_map<std::string, std::string> results) {
+    for (auto &&result : std::move(results)) {
+      auto entry = reply->add_results();
+      entry->set_key(result.first);
+      entry->set_value(std::move(result.second));
+    }
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+  };
+  std::vector<std::string> keys(request.keys().begin(), request.keys().end());
+  kv_instance_->MultiGet(request.namespace_(), keys, {std::move(callback), io_context_});
 }
 
 void GcsInternalKVManager::HandleInternalKVPut(
@@ -216,15 +79,16 @@ void GcsInternalKVManager::HandleInternalKVPut(
   if (!status.ok()) {
     GCS_RPC_SEND_REPLY(send_reply_callback, reply, status);
   } else {
-    auto callback = [reply, send_reply_callback](bool newly_added) {
-      reply->set_added_num(newly_added ? 1 : 0);
-      GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
-    };
+    auto callback =
+        [reply, send_reply_callback = std::move(send_reply_callback)](bool newly_added) {
+          reply->set_added(newly_added);
+          GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+        };
     kv_instance_->Put(request.namespace_(),
                       request.key(),
-                      request.value(),
+                      std::move(*request.mutable_value()),
                       request.overwrite(),
-                      std::move(callback));
+                      {std::move(callback), io_context_});
   }
 }
 
@@ -243,7 +107,7 @@ void GcsInternalKVManager::HandleInternalKVDel(
     kv_instance_->Del(request.namespace_(),
                       request.key(),
                       request.del_by_prefix(),
-                      std::move(callback));
+                      {std::move(callback), io_context_});
   }
 }
 
@@ -260,7 +124,8 @@ void GcsInternalKVManager::HandleInternalKVExists(
       reply->set_exists(exists);
       GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
     };
-    kv_instance_->Exists(request.namespace_(), request.key(), std::move(callback));
+    kv_instance_->Exists(
+        request.namespace_(), request.key(), {std::move(callback), io_context_});
   }
 }
 
@@ -278,11 +143,21 @@ void GcsInternalKVManager::HandleInternalKVKeys(
       }
       GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
     };
-    kv_instance_->Keys(request.namespace_(), request.prefix(), std::move(callback));
+    kv_instance_->Keys(
+        request.namespace_(), request.prefix(), {std::move(callback), io_context_});
   }
 }
 
+void GcsInternalKVManager::HandleGetInternalConfig(
+    rpc::GetInternalConfigRequest request,
+    rpc::GetInternalConfigReply *reply,
+    rpc::SendReplyCallback send_reply_callback) {
+  reply->set_config(raylet_config_list_);
+  GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+}
+
 Status GcsInternalKVManager::ValidateKey(const std::string &key) const {
+  constexpr std::string_view kNamespacePrefix = "@namespace_";
   if (absl::StartsWith(key, kNamespacePrefix)) {
     return Status::KeyError(absl::StrCat("Key can't start with ", kNamespacePrefix));
   }

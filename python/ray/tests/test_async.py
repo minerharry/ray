@@ -8,13 +8,16 @@ import numpy as np
 import pytest
 
 import ray
+from ray._common.utils import (
+    get_or_create_event_loop,
+)
 from ray._private.test_utils import wait_for_condition
 
 
 @pytest.fixture
 def init():
     ray.init(num_cpus=4)
-    asyncio.get_event_loop().set_debug(False)
+    get_or_create_event_loop().set_debug(False)
     yield
     ray.shutdown()
 
@@ -35,12 +38,12 @@ def test_simple(init):
         return np.zeros(1024 * 1024, dtype=np.uint8)
 
     future = f.remote().as_future()
-    result = asyncio.get_event_loop().run_until_complete(future)
+    result = get_or_create_event_loop().run_until_complete(future)
     assert isinstance(result, np.ndarray)
 
 
 def test_gather(init):
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
     tasks = gen_tasks()
     futures = [obj_ref.as_future() for obj_ref in tasks]
     results = loop.run_until_complete(asyncio.gather(*futures))
@@ -48,7 +51,7 @@ def test_gather(init):
 
 
 def test_wait(init):
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
     tasks = gen_tasks()
     futures = [obj_ref.as_future() for obj_ref in tasks]
     results, _ = loop.run_until_complete(asyncio.wait(futures))
@@ -56,7 +59,7 @@ def test_wait(init):
 
 
 def test_wait_timeout(init):
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
     tasks = gen_tasks(10)
     futures = [obj_ref.as_future() for obj_ref in tasks]
     fut = asyncio.wait(futures, timeout=5)
@@ -65,7 +68,7 @@ def test_wait_timeout(init):
 
 
 def test_gather_mixup(init):
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
 
     @ray.remote
     def f(n):
@@ -82,7 +85,7 @@ def test_gather_mixup(init):
 
 
 def test_wait_mixup(init):
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
 
     @ray.remote
     def f(n):
@@ -160,9 +163,5 @@ def test_concurrent_future_many(ray_start_regular_shared):
 
 
 if __name__ == "__main__":
-    import os
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

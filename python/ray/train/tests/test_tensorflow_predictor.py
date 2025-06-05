@@ -1,24 +1,27 @@
 import re
-import numpy as np
-import pandas as pd
-import pyarrow as pa
-import pytest
-import tensorflow as tf
-
-import ray
-from ray.air.checkpoint import Checkpoint
-from ray.air.constants import MAX_REPR_LENGTH
-from ray.air.util.data_batch_conversion import (
-    convert_pandas_to_batch_type,
-    convert_batch_type_to_pandas,
-)
-from ray.data.preprocessor import Preprocessor
-from ray.train.batch_predictor import BatchPredictor
-from ray.train.predictor import TYPE_TO_ENUM
-from ray.train.tensorflow import TensorflowCheckpoint, TensorflowPredictor
+import sys
 from typing import Tuple
 
-from dummy_preprocessor import DummyPreprocessor
+import numpy as np
+import pandas as pd
+import pytest
+
+from ray.air.constants import MAX_REPR_LENGTH
+from ray.air.util.data_batch_conversion import (
+    _convert_batch_type_to_pandas,
+    _convert_pandas_to_batch_type,
+)
+from ray.data.preprocessor import Preprocessor
+from ray.train.predictor import TYPE_TO_ENUM
+from ray.train.tests.dummy_preprocessor import DummyPreprocessor
+
+if sys.version_info >= (3, 12):
+    # Tensorflow is not installed for Python 3.12 because of keras compatibility.
+    sys.exit(0)
+else:
+    import tensorflow as tf
+
+    from ray.train.tensorflow import TensorflowCheckpoint, TensorflowPredictor
 
 
 def build_raw_model() -> tf.keras.Model:
@@ -73,7 +76,7 @@ def test_repr():
     assert pattern.match(representation)
 
 
-def create_checkpoint_preprocessor() -> Tuple[Checkpoint, Preprocessor]:
+def create_checkpoint_preprocessor() -> Tuple["TensorflowCheckpoint", Preprocessor]:
     preprocessor = DummyPreprocessor()
     checkpoint = TensorflowCheckpoint.from_model(
         build_model(), preprocessor=preprocessor
@@ -87,9 +90,7 @@ def test_init():
 
     predictor = TensorflowPredictor(model=build_model(), preprocessor=preprocessor)
 
-    checkpoint_predictor = TensorflowPredictor.from_checkpoint(
-        checkpoint, model_definition=build_raw_model
-    )
+    checkpoint_predictor = TensorflowPredictor.from_checkpoint(checkpoint)
 
     assert checkpoint_predictor._model.get_weights() == predictor._model.get_weights()
     assert checkpoint_predictor.get_preprocessor() == predictor.get_preprocessor()
@@ -101,18 +102,12 @@ def test_tensorflow_checkpoint():
     preprocessor = DummyPreprocessor()
 
     checkpoint = TensorflowCheckpoint.from_model(model, preprocessor=preprocessor)
-    assert (
-        checkpoint.get_model(model_definition=build_raw_model).get_weights()
-        == model.get_weights()
-    )
+    assert checkpoint.get_model().get_weights() == model.get_weights()
 
     with checkpoint.as_directory() as path:
         checkpoint = TensorflowCheckpoint.from_directory(path)
         checkpoint_preprocessor = checkpoint.get_preprocessor()
-        assert (
-            checkpoint.get_model(model_definition=build_raw_model).get_weights()
-            == model.get_weights()
-        )
+        assert checkpoint.get_model().get_weights() == model.get_weights()
         assert checkpoint_preprocessor == preprocessor
 
 
@@ -123,8 +118,11 @@ def test_predict_array(use_gpu):
     data_batch = np.asarray([1, 2, 3])
     predictions = predictor.predict(data_batch)
 
-    assert len(predictions) == 3
-    assert predictions.flatten().tolist() == [2, 4, 6]
+    assert len(predictions) == 1
+    # [1 2 3] returns [[2],[4],[6]] with shape: (3,1) from Tensorflow model
+    np.testing.assert_array_equal(
+        predictions["predictions"], np.asarray([[2], [4], [6]])
+    )
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
@@ -139,47 +137,25 @@ def test_predict_array_with_preprocessor(use_gpu):
     data_batch = np.array([1, 2, 3])
     predictions = predictor.predict(data_batch)
 
-    assert len(predictions) == 3
+    assert len(predictions) == 1
+    # [1 2 3] returns [[2],[4],[6]] with shape: (3,1) from Tensorflow model
+    np.testing.assert_array_equal(
+        predictions["predictions"], np.asarray([[2], [4], [6]])
+    )
     assert predictor.get_preprocessor().has_preprocessed
-    assert predictions.flatten().tolist() == [2, 4, 6]
 
 
-@pytest.mark.parametrize("batch_type", [np.ndarray, pd.DataFrame, pa.Table, dict])
+@pytest.mark.parametrize("batch_type", [np.ndarray, pd.DataFrame, dict])
 def test_predict(batch_type):
     predictor = TensorflowPredictor(model=build_model_multi_input())
 
     raw_batch = pd.DataFrame({"A": [0.0, 0.0, 0.0], "B": [1.0, 2.0, 3.0]})
-    data_batch = convert_pandas_to_batch_type(raw_batch, type=TYPE_TO_ENUM[batch_type])
+    data_batch = _convert_pandas_to_batch_type(raw_batch, type=TYPE_TO_ENUM[batch_type])
     raw_predictions = predictor.predict(data_batch)
-    predictions = convert_batch_type_to_pandas(raw_predictions)
+    predictions = _convert_batch_type_to_pandas(raw_predictions)
 
     assert len(predictions) == 3
     assert predictions.to_numpy().flatten().tolist() == [1.0, 2.0, 3.0]
-
-
-@pytest.mark.parametrize("batch_type", [pd.DataFrame, pa.Table])
-def test_predict_batch(ray_start_4_cpus, batch_type):
-    checkpoint = TensorflowCheckpoint.from_model(model=build_model_multi_input())
-    predictor = BatchPredictor.from_checkpoint(
-        checkpoint, TensorflowPredictor, model_definition=build_model_multi_input
-    )
-
-    dummy_data = pd.DataFrame([[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]], columns=["A", "B"])
-
-    # Todo: Ray data does not support numpy dicts
-    if batch_type == np.ndarray:
-        dataset = ray.data.from_numpy(dummy_data.to_numpy())
-    elif batch_type == pd.DataFrame:
-        dataset = ray.data.from_pandas(dummy_data)
-    elif batch_type == pa.Table:
-        dataset = ray.data.from_arrow(pa.Table.from_pandas(dummy_data))
-    else:
-        raise RuntimeError("Invalid batch_type")
-
-    predictions = predictor.predict(dataset)
-
-    assert predictions.count() == 3
-    assert predictions.to_pandas().to_numpy().flatten().tolist() == [1.0, 2.0, 3.0]
 
 
 @pytest.mark.parametrize("use_gpu", [False, True])
@@ -232,18 +208,6 @@ def test_predict_unsupported_output():
         # Each tensor is of size 3
         assert len(v) == 3
         assert v.flatten().tolist() == [1, 2, 3]
-
-
-@pytest.mark.parametrize("use_gpu", [False, True])
-def test_tensorflow_predictor_no_training(use_gpu):
-    model = build_model()
-    checkpoint = TensorflowCheckpoint.from_model(model)
-    batch_predictor = BatchPredictor.from_checkpoint(
-        checkpoint, TensorflowPredictor, model_definition=build_model, use_gpu=use_gpu
-    )
-    predict_dataset = ray.data.range(3)
-    predictions = batch_predictor.predict(predict_dataset)
-    assert predictions.count() == 3
 
 
 if __name__ == "__main__":

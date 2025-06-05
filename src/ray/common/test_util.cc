@@ -23,6 +23,7 @@
 #include "ray/common/ray_config.h"
 #include "ray/common/ray_object.h"
 #include "ray/common/test_util.h"
+#include "ray/util/cmd_line_utils.h"
 #include "ray/util/filesystem.h"
 #include "ray/util/logging.h"
 #include "ray/util/process.h"
@@ -30,18 +31,19 @@
 
 namespace ray {
 
-void TestSetupUtil::StartUpRedisServers(const std::vector<int> &redis_server_ports) {
+void TestSetupUtil::StartUpRedisServers(const std::vector<int> &redis_server_ports,
+                                        bool save) {
   if (redis_server_ports.empty()) {
-    TEST_REDIS_SERVER_PORTS.push_back(StartUpRedisServer(0));
+    TEST_REDIS_SERVER_PORTS.push_back(StartUpRedisServer(0, save));
   } else {
     for (const auto &port : redis_server_ports) {
-      TEST_REDIS_SERVER_PORTS.push_back(StartUpRedisServer(port));
+      TEST_REDIS_SERVER_PORTS.push_back(StartUpRedisServer(port, save));
     }
   }
 }
 
 // start a redis server with specified port, use random one when 0 given
-int TestSetupUtil::StartUpRedisServer(const int &port) {
+int TestSetupUtil::StartUpRedisServer(int port, bool save) {
   int actual_port = port;
   if (port == 0) {
     static std::atomic<bool> srand_called(false);
@@ -51,15 +53,19 @@ int TestSetupUtil::StartUpRedisServer(const int &port) {
     // Use random port (in range [2000, 7000) to avoid port conflicts between UTs.
     do {
       actual_port = rand() % 5000 + 2000;
-    } while (!CheckFree(actual_port));
+    } while (!CheckPortFree(actual_port));
   }
 
   std::string program = TEST_REDIS_SERVER_EXEC_PATH;
 #ifdef _WIN32
   std::vector<std::string> cmdargs({program, "--loglevel", "warning"});
 #else
-  std::vector<std::string> cmdargs(
-      {program, "--loglevel", "warning", "--save", "", "--appendonly", "no"});
+  std::vector<std::string> cmdargs;
+  if (!save) {
+    cmdargs = {program, "--loglevel", "warning", "--save", "", "--appendonly", "no"};
+  } else {
+    cmdargs = {program, "--loglevel", "warning"};
+  }
 #endif
   cmdargs.insert(cmdargs.end(), {"--port", std::to_string(actual_port)});
   RAY_LOG(INFO) << "Start redis command is: " << CreateCommandLine(cmdargs);
@@ -75,7 +81,7 @@ void TestSetupUtil::ShutDownRedisServers() {
   TEST_REDIS_SERVER_PORTS = std::vector<int>();
 }
 
-void TestSetupUtil::ShutDownRedisServer(const int &port) {
+void TestSetupUtil::ShutDownRedisServer(int port) {
   std::vector<std::string> cmdargs(
       {TEST_REDIS_CLIENT_EXEC_PATH, "-p", std::to_string(port), "shutdown"});
   RAY_LOG(INFO) << "Stop redis command is: " << CreateCommandLine(cmdargs);
@@ -91,7 +97,17 @@ void TestSetupUtil::FlushAllRedisServers() {
   }
 }
 
-void TestSetupUtil::FlushRedisServer(const int &port) {
+void TestSetupUtil::ExecuteRedisCmd(int port, std::vector<std::string> cmd) {
+  std::vector<std::string> cmdargs(
+      {TEST_REDIS_CLIENT_EXEC_PATH, "-p", std::to_string(port)});
+  cmdargs.insert(cmdargs.end(), cmd.begin(), cmd.end());
+  RAY_LOG(INFO) << "Send command to redis: " << CreateCommandLine(cmdargs);
+  if (Process::Call(cmdargs)) {
+    RAY_LOG(WARNING) << "Failed to send request to redis.";
+  }
+}
+
+void TestSetupUtil::FlushRedisServer(int port) {
   std::vector<std::string> cmdargs(
       {TEST_REDIS_CLIENT_EXEC_PATH, "-p", std::to_string(port), "flushall"});
   RAY_LOG(INFO) << "Cleaning up redis with command: " << CreateCommandLine(cmdargs);
@@ -246,7 +262,7 @@ std::shared_ptr<RayObject> GenerateRandomObject(
     ref.set_object_id(inlined_id.Binary());
     refs.push_back(ref);
   }
-  return std::shared_ptr<RayObject>(new RayObject(GenerateRandomBuffer(), nullptr, refs));
+  return std::make_shared<RayObject>(GenerateRandomBuffer(), nullptr, refs);
 }
 
 /// Path to redis server executable binary.

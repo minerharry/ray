@@ -1,11 +1,13 @@
-import os
-import jsonschema
-import logging
-from typing import List
 import json
+import logging
+import os
+from typing import List
+
+import jsonschema
+
 from ray._private.runtime_env.constants import (
-    RAY_RUNTIME_ENV_PLUGIN_SCHEMAS_ENV_VAR,
     RAY_RUNTIME_ENV_PLUGIN_SCHEMA_SUFFIX,
+    RAY_RUNTIME_ENV_PLUGIN_SCHEMAS_ENV_VAR,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,9 +26,14 @@ class RuntimeEnvPluginSchemaManager:
     def _load_schemas(cls, schema_paths: List[str]):
         for schema_path in schema_paths:
             try:
-                schema = json.load(open(schema_path))
+                with open(schema_path) as f:
+                    schema = json.load(f)
             except json.decoder.JSONDecodeError:
                 logger.error("Invalid runtime env schema %s, skip it.", schema_path)
+                continue
+            except OSError:
+                logger.error("Cannot open runtime env schema %s, skip it.", schema_path)
+                continue
             if "title" not in schema:
                 logger.error(
                     "No valid title in runtime env schema %s, skip it.", schema_path

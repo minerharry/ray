@@ -3,22 +3,20 @@ TensorFlow policy class used for SAC.
 """
 
 import copy
-import gym
-from gym.spaces import Box, Discrete
+import gymnasium as gym
+from gymnasium.spaces import Box, Discrete
 from functools import partial
 import logging
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 import ray
-import ray.experimental.tf_utils
 from ray.rllib.algorithms.dqn.dqn_tf_policy import (
     postprocess_nstep_and_prio,
     PRIO_WEIGHTS,
 )
 from ray.rllib.algorithms.sac.sac_tf_model import SACTFModel
 from ray.rllib.algorithms.sac.sac_torch_model import SACTorchModel
-from ray.rllib.evaluation.episode import Episode
-from ray.rllib.models import ModelCatalog, MODEL_DEFAULTS
+from ray.rllib.models import ModelCatalog
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.models.tf.tf_action_dist import (
     Beta,
@@ -61,7 +59,7 @@ def build_sac_model(
         policy: The TFPolicy that will use the models.
         obs_space (gym.spaces.Space): The observation space.
         action_space (gym.spaces.Space): The action space.
-        config: The SAC trainer's config dict.
+        config: The SACConfig object.
 
     Returns:
         ModelV2: The ModelV2 to be used by the Policy. Note: An additional
@@ -71,9 +69,9 @@ def build_sac_model(
     # Force-ignore any additionally provided hidden layer sizes.
     # Everything should be configured using SAC's `q_model_config` and
     # `policy_model_config` config settings.
-    policy_model_config = copy.deepcopy(MODEL_DEFAULTS)
+    policy_model_config = copy.deepcopy(config["model"])
     policy_model_config.update(config["policy_model_config"])
-    q_model_config = copy.deepcopy(MODEL_DEFAULTS)
+    q_model_config = copy.deepcopy(config["model"])
     q_model_config.update(config["q_model_config"])
 
     default_model_cls = SACTorchModel if config["framework"] == "torch" else SACTFModel
@@ -123,7 +121,7 @@ def postprocess_trajectory(
     policy: Policy,
     sample_batch: SampleBatch,
     other_agent_batches: Optional[Dict[AgentID, SampleBatch]] = None,
-    episode: Optional[Episode] = None,
+    episode=None,
 ) -> SampleBatch:
     """Postprocesses a trajectory and returns the processed trajectory.
 
@@ -305,7 +303,7 @@ def sac_actor_critic_loss(
         # Discrete case: "Best" means weighted by the policy (prob) outputs.
         q_tp1_best = tf.reduce_sum(tf.multiply(policy_tp1, q_tp1), axis=-1)
         q_tp1_best_masked = (
-            1.0 - tf.cast(train_batch[SampleBatch.DONES], tf.float32)
+            1.0 - tf.cast(train_batch[SampleBatch.TERMINATEDS], tf.float32)
         ) * q_tp1_best
     # Continuous actions case.
     else:
@@ -362,7 +360,7 @@ def sac_actor_critic_loss(
 
         q_tp1_best = tf.squeeze(input=q_tp1, axis=len(q_tp1.shape) - 1)
         q_tp1_best_masked = (
-            1.0 - tf.cast(train_batch[SampleBatch.DONES], tf.float32)
+            1.0 - tf.cast(train_batch[SampleBatch.TERMINATEDS], tf.float32)
         ) * q_tp1_best
 
     # Compute RHS of bellman equation for the Q-loss (critic(s)).
@@ -672,7 +670,7 @@ class ComputeTDErrorMixin:
     def __init__(self, loss_fn):
         @make_tf_callable(self.get_session(), dynamic_shape=True)
         def compute_td_error(
-            obs_t, act_t, rew_t, obs_tp1, done_mask, importance_weights
+            obs_t, act_t, rew_t, obs_tp1, terminateds_mask, importance_weights
         ):
             # Do forward pass on loss to update td errors attribute
             # (one TD-error value per item in batch to update PR weights).
@@ -685,7 +683,7 @@ class ComputeTDErrorMixin:
                     SampleBatch.ACTIONS: tf.convert_to_tensor(act_t),
                     SampleBatch.REWARDS: tf.convert_to_tensor(rew_t),
                     SampleBatch.NEXT_OBS: tf.convert_to_tensor(obs_tp1),
-                    SampleBatch.DONES: tf.convert_to_tensor(done_mask),
+                    SampleBatch.TERMINATEDS: tf.convert_to_tensor(terminateds_mask),
                     PRIO_WEIGHTS: tf.convert_to_tensor(importance_weights),
                 },
             )
@@ -777,7 +775,7 @@ def validate_spaces(
 # above.
 SACTFPolicy = build_tf_policy(
     name="SACTFPolicy",
-    get_default_config=lambda: ray.rllib.algorithms.sac.sac.DEFAULT_CONFIG,
+    get_default_config=lambda: ray.rllib.algorithms.sac.sac.SACConfig(),
     make_model=build_sac_model,
     postprocess_fn=postprocess_trajectory,
     action_distribution_fn=get_distribution_inputs_and_class,

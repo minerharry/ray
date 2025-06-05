@@ -1,5 +1,8 @@
-from collections import defaultdict
+import logging
+from collections import Counter, defaultdict
 from dataclasses import _MISSING_TYPE, dataclass, fields
+import os
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -8,23 +11,26 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Union,
     Tuple,
+    Union,
 )
+import warnings
 
-from ray.air.constants import WILDCARD_KEY
-from ray.util.annotations import PublicAPI
+import pyarrow.fs
+
+import ray
+from ray._private.ray_constants import RESOURCE_CONSTRAINT_PREFIX
+from ray._private.thirdparty.tabulate.tabulate import tabulate
+from ray.util.annotations import PublicAPI, RayDeprecationWarning
 from ray.widgets import Template, make_table_html_repr
 
 if TYPE_CHECKING:
-    from ray.data import Dataset
     from ray.tune.callback import Callback
-    from ray.tune.progress_reporter import ProgressReporter
+    from ray.tune.execution.placement_groups import PlacementGroupFactory
+    from ray.tune.experimental.output import AirVerbosity
     from ray.tune.search.sample import Domain
     from ray.tune.stopper import Stopper
-    from ray.tune.syncer import SyncConfig
     from ray.tune.utils.log import Verbosity
-    from ray.tune.execution.placement_groups import PlacementGroupFactory
 
 
 # Dict[str, List] is to support `tune.grid_search`:
@@ -34,6 +40,10 @@ SampleRange = Union["Domain", Dict[str, List]]
 
 MAX = "max"
 MIN = "min"
+_DEPRECATED_VALUE = "DEPRECATED"
+
+
+logger = logging.getLogger(__name__)
 
 
 def _repr_dataclass(obj, *, default_values: Optional[Dict[str, Any]] = None) -> str:
@@ -58,11 +68,20 @@ def _repr_dataclass(obj, *, default_values: Optional[Dict[str, Any]] = None) -> 
 
     non_default_values = {}  # Maps field name to value.
 
+    def equals(value, default_value):
+        # We need to special case None because of a bug in pyarrow:
+        # https://github.com/apache/arrow/issues/38535
+        if value is None and default_value is None:
+            return True
+        if value is None or default_value is None:
+            return False
+        return value == default_value
+
     for field in fields(obj):
         value = getattr(obj, field.name)
         default_value = default_values.get(field.name, field.default)
         is_required = isinstance(field.default, _MISSING_TYPE)
-        if is_required or value != default_value:
+        if is_required or not equals(value, default_value):
             non_default_values[field.name] = value
 
     string = f"{obj.__class__.__name__}("
@@ -75,13 +94,20 @@ def _repr_dataclass(obj, *, default_values: Optional[Dict[str, Any]] = None) -> 
 
 
 @dataclass
-@PublicAPI(stability="beta")
+@PublicAPI(stability="stable")
 class ScalingConfig:
     """Configuration for scaling training.
 
+    For more details, see :ref:`train_scaling_config`.
+
     Args:
-        trainer_resources: Resources to allocate for the trainer. If None is provided,
-            will default to 1 CPU.
+        trainer_resources: Resources to allocate for the training coordinator.
+            The training coordinator launches the worker group and executes
+            the training function per worker, and this process does NOT require
+            GPUs. The coordinator is always scheduled on the same node as the
+            rank 0 worker, so one example use case is to set a minimum amount
+            of resources (e.g. CPU memory) required by the rank 0 node.
+            By default, this assigns 1 CPU to the training coordinator.
         num_workers: The number of workers (Ray actors) to launch.
             Each worker will reserve 1 CPU by default. The number of CPUs
             reserved by each worker can be overridden with the
@@ -91,27 +117,44 @@ class ScalingConfig:
             worker can be overridden with the ``resources_per_worker``
             argument.
         resources_per_worker: If specified, the resources
-            defined in this Dict will be reserved for each worker. The
-            ``CPU`` and ``GPU`` keys (case-sensitive) can be defined to
-            override the number of CPU/GPUs used by each worker.
+            defined in this Dict is reserved for each worker.
+            Define the ``"CPU"`` key (case-sensitive) to
+            override the number of CPUs used by each worker.
+            This can also be used to request :ref:`custom resources <custom-resources>`.
         placement_strategy: The placement strategy to use for the
             placement group of the Ray actors. See :ref:`Placement Group
             Strategies <pgroup-strategy>` for the possible options.
-        _max_cpu_fraction_per_node: (Experimental) The max fraction of CPUs per node
-            that Train will use for scheduling training actors. The remaining CPUs
-            can be used for dataset tasks. It is highly recommended that you set this
-            to less than 1.0 (e.g., 0.8) when passing datasets to trainers, to avoid
-            hangs / CPU starvation of dataset tasks. Warning: this feature is
-            experimental and is not recommended for use with autoscaling (scale-up will
-            not trigger properly).
+        accelerator_type: [Experimental] If specified, Ray Train will launch the
+            training coordinator and workers on the nodes with the specified type
+            of accelerators.
+            See :ref:`the available accelerator types <accelerator_types>`.
+            Ensure that your cluster has instances with the specified accelerator type
+            or is able to autoscale to fulfill the request.
+
+    Example:
+
+        .. code-block:: python
+
+            from ray.train import ScalingConfig
+            scaling_config = ScalingConfig(
+                # Number of distributed workers.
+                num_workers=2,
+                # Turn on/off GPU.
+                use_gpu=True,
+                # Assign extra CPU/GPU/custom resources per worker.
+                resources_per_worker={"GPU": 1, "CPU": 1, "memory": 1e9, "custom": 1.0},
+                # Try to schedule workers on different nodes.
+                placement_strategy="SPREAD",
+            )
+
     """
 
     trainer_resources: Optional[Union[Dict, SampleRange]] = None
-    num_workers: Optional[Union[int, SampleRange]] = None
+    num_workers: Union[int, SampleRange] = 1
     use_gpu: Union[bool, SampleRange] = False
     resources_per_worker: Optional[Union[Dict, SampleRange]] = None
     placement_strategy: Union[str, SampleRange] = "PACK"
-    _max_cpu_fraction_per_node: Optional[Union[float, SampleRange]] = None
+    accelerator_type: Optional[str] = None
 
     def __post_init__(self):
         if self.resources_per_worker:
@@ -148,13 +191,20 @@ class ScalingConfig:
                 # Note that we don't request any CPUs, which avoids possible
                 # scheduling contention. Generally nodes have many more CPUs than
                 # GPUs, so not requesting a CPU does not lead to oversubscription.
-                return {"GPU": 1}
+                resources_per_worker = {"GPU": 1}
             else:
-                return {"CPU": 1}
-        resources_per_worker = {
-            k: v for k, v in self.resources_per_worker.items() if v != 0
-        }
-        resources_per_worker.setdefault("GPU", int(self.use_gpu))
+                resources_per_worker = {"CPU": 1}
+        else:
+            resources_per_worker = {
+                k: v for k, v in self.resources_per_worker.items() if v != 0
+            }
+
+        if self.use_gpu:
+            resources_per_worker.setdefault("GPU", 1)
+
+        if self.accelerator_type:
+            accelerator = f"{RESOURCE_CONSTRAINT_PREFIX}{self.accelerator_type}"
+            resources_per_worker.setdefault(accelerator, 0.001)
         return resources_per_worker
 
     @property
@@ -170,24 +220,28 @@ class ScalingConfig:
                 try:
                     import google.colab  # noqa: F401
 
-                    trainer_resources = 0
+                    trainer_num_cpus = 0
                 except ImportError:
-                    trainer_resources = 1
+                    trainer_num_cpus = 1
             else:
                 # If there are no additional workers, then always reserve 1 CPU for
                 # the Trainer.
-                trainer_resources = 1
+                trainer_num_cpus = 1
 
-            return {"CPU": trainer_resources}
-        return {k: v for k, v in self.trainer_resources.items() if v != 0}
+            trainer_resources = {"CPU": trainer_num_cpus}
+        else:
+            trainer_resources = {
+                k: v for k, v in self.trainer_resources.items() if v != 0
+            }
+
+        return trainer_resources
 
     @property
     def total_resources(self):
         """Map of total resources required for the trainer."""
         total_resource_map = defaultdict(float, self._trainer_resources_not_none)
-        num_workers = self.num_workers or 0
         for k, value in self._resources_per_worker_not_none.items():
-            total_resource_map[k] += value * num_workers
+            total_resource_map[k] += value * self.num_workers
         return dict(total_resource_map)
 
     @property
@@ -213,61 +267,44 @@ class ScalingConfig:
         """Returns a PlacementGroupFactory to specify resources for Tune."""
         from ray.tune.execution.placement_groups import PlacementGroupFactory
 
-        trainer_resources = self._trainer_resources_not_none
-        trainer_bundle = [trainer_resources]
-        worker_resources = {
-            "CPU": self.num_cpus_per_worker,
-            "GPU": self.num_gpus_per_worker,
-        }
-        worker_resources_extra = (
-            {} if self.resources_per_worker is None else self.resources_per_worker
-        )
-        worker_bundles = [
-            {**worker_resources, **worker_resources_extra}
-            for _ in range(self.num_workers if self.num_workers else 0)
-        ]
-        bundles = trainer_bundle + worker_bundles
-        if self._max_cpu_fraction_per_node is not None:
-            kwargs = {
-                "_max_cpu_fraction_per_node": self._max_cpu_fraction_per_node,
-            }
-        else:
-            kwargs = {}
-        return PlacementGroupFactory(
-            bundles, strategy=self.placement_strategy, **kwargs
-        )
+        trainer_bundle = self._trainer_resources_not_none
+        worker_bundle = self._resources_per_worker_not_none
+
+        # Colocate Trainer and rank0 worker by merging their bundles
+        # Note: This empty bundle is required so that the Tune actor manager schedules
+        # the Trainable onto the combined bundle while taking none of its resources,
+        # rather than a non-empty head bundle.
+        combined_bundle = dict(Counter(trainer_bundle) + Counter(worker_bundle))
+        bundles = [{}, combined_bundle] + [worker_bundle] * (self.num_workers - 1)
+        return PlacementGroupFactory(bundles, strategy=self.placement_strategy)
 
     @classmethod
     def from_placement_group_factory(
         cls, pgf: "PlacementGroupFactory"
     ) -> "ScalingConfig":
-        """Create a ScalingConfig from a Tune's PlacementGroupFactory"""
-        if pgf.head_bundle_is_empty:
-            trainer_resources = {}
-            worker_bundles = pgf.bundles
-        else:
-            trainer_resources = pgf.bundles[0]
-            worker_bundles = pgf.bundles[1:]
+        """Create a ScalingConfig from a Tune's PlacementGroupFactory
 
-        use_gpu = False
+        Note that this is only needed for ResourceChangingScheduler, which
+        modifies a trial's PlacementGroupFactory but doesn't propagate
+        the changes to ScalingConfig. TrainTrainable needs to reconstruct
+        a ScalingConfig from on the trial's PlacementGroupFactory.
+        """
+
+        # pgf.bundles = [{trainer + worker}, {worker}, ..., {worker}]
+        num_workers = len(pgf.bundles)
+        combined_resources = pgf.bundles[0]
+        resources_per_worker = pgf.bundles[-1]
+        use_gpu = bool(resources_per_worker.get("GPU", False))
         placement_strategy = pgf.strategy
-        resources_per_worker = None
-        num_workers = None
-        max_cpu_fraction_per_node = None
 
-        if worker_bundles:
-            first_bundle = worker_bundles[0]
-            if not all(bundle == first_bundle for bundle in worker_bundles[1:]):
-                raise ValueError(
-                    "All worker bundles (any other than the first one) "
-                    "must be equal to each other."
-                )
-            use_gpu = bool(first_bundle.get("GPU"))
-            num_workers = len(worker_bundles)
-            resources_per_worker = first_bundle
-
-        if "_max_cpu_fraction_per_node" in pgf._kwargs:
-            max_cpu_fraction_per_node = pgf._kwargs["_max_cpu_fraction_per_node"]
+        # In `as_placement_group_factory`, we merged the trainer resource into the
+        # first worker resources bundle. We need to calculate the resources diff to
+        # get the trainer resources.
+        # Note: If there's only one worker, we won't be able to calculate the diff.
+        # We'll have empty trainer bundle and assign all resources to the worker.
+        trainer_resources = dict(
+            Counter(combined_resources) - Counter(resources_per_worker)
+        )
 
         return ScalingConfig(
             trainer_resources=trainer_resources,
@@ -275,180 +312,11 @@ class ScalingConfig:
             use_gpu=use_gpu,
             resources_per_worker=resources_per_worker,
             placement_strategy=placement_strategy,
-            _max_cpu_fraction_per_node=max_cpu_fraction_per_node,
         )
 
 
 @dataclass
-@PublicAPI(stability="beta")
-class DatasetConfig:
-    """Configuration for ingest of a single Dataset.
-
-    See :ref:`the AIR Dataset configuration guide <air-configure-ingest>` for
-    usage examples.
-
-    This config defines how the Dataset should be read into the DataParallelTrainer.
-    It configures the preprocessing, splitting, and ingest strategy per-dataset.
-
-    DataParallelTrainers declare default DatasetConfigs for each dataset passed in the
-    ``datasets`` argument. Users have the opportunity to selectively override these
-    configs by passing the ``dataset_config`` argument. Trainers can also define user
-    customizable values (e.g., XGBoostTrainer doesn't support streaming ingest).
-
-    Args:
-        fit: Whether to fit preprocessors on this dataset. This can be set on at most
-            one dataset at a time. True by default for the "train" dataset only.
-        split: Whether the dataset should be split across multiple workers.
-            True by default for the "train" dataset only.
-        required: Whether to raise an error if the Dataset isn't provided by the user.
-            False by default.
-        transform: Whether to transform the dataset with the fitted preprocessor.
-            This must be enabled at least for the dataset that is fit.
-            True by default.
-        use_stream_api: Whether the dataset should be streamed into memory using
-            pipelined reads. When enabled, get_dataset_shard() returns DatasetPipeline
-            instead of Dataset. The amount of memory to use is controlled
-            by `stream_window_size`. False by default.
-        stream_window_size: Configure the streaming window size in bytes.
-            A good value is something like 20% of object store memory.
-            If set to -1, then an infinite window size will be used (similar to
-            bulk ingest). This only has an effect if use_stream_api is set.
-            Set to 1.0 GiB by default.
-        global_shuffle: Whether to enable global shuffle (per pipeline window
-            in streaming mode). Note that this is an expensive all-to-all operation,
-            and most likely you want to use local shuffle instead.
-            See https://docs.ray.io/en/master/data/faq.html and
-            https://docs.ray.io/en/master/ray-air/check-ingest.html.
-            False by default.
-        randomize_block_order: Whether to randomize the iteration order over blocks.
-            The main purpose of this is to prevent data fetching hotspots in the
-            cluster when running many parallel workers / trials on the same data.
-            We recommend enabling it always. True by default.
-    """
-
-    # TODO(ekl) could we unify DataParallelTrainer and Trainer so the same data ingest
-    # strategy applies to all Trainers?
-
-    fit: Optional[bool] = None
-    split: Optional[bool] = None
-    required: Optional[bool] = None
-    transform: Optional[bool] = None
-    use_stream_api: Optional[bool] = None
-    stream_window_size: Optional[float] = None
-    global_shuffle: Optional[bool] = None
-    randomize_block_order: Optional[bool] = None
-
-    def __repr__(self):
-        return _repr_dataclass(self)
-
-    def _repr_html_(self, title=None) -> str:
-        if title is None:
-            title = type(self).__name__
-        return make_table_html_repr(obj=self, title=title)
-
-    def fill_defaults(self) -> "DatasetConfig":
-        """Return a copy of this config with all default values filled in."""
-        return DatasetConfig(
-            fit=self.fit or False,
-            split=self.split or False,
-            required=self.required or False,
-            use_stream_api=self.use_stream_api or False,
-            stream_window_size=self.stream_window_size
-            if self.stream_window_size is not None
-            else 1024 * 1024 * 1024,
-            global_shuffle=self.global_shuffle or False,
-            transform=self.transform if self.transform is not None else True,
-            randomize_block_order=self.randomize_block_order
-            if self.randomize_block_order is not None
-            else True,
-        )
-
-    @staticmethod
-    def merge(
-        a: Dict[str, "DatasetConfig"], b: Optional[Dict[str, "DatasetConfig"]]
-    ) -> Dict[str, "DatasetConfig"]:
-        """Merge two given DatasetConfigs, the second taking precedence.
-
-        Raises:
-            ValueError: if validation fails on the merged configs.
-        """
-        has_wildcard = WILDCARD_KEY in a
-        result = a.copy()
-        if b is None:
-            return result
-        for key in b:
-            if key in a:
-                result[key] = a[key]._merge(b[key])
-            elif has_wildcard:
-                result[key] = a[WILDCARD_KEY]._merge(b[key])
-            else:
-                raise ValueError(
-                    f"Invalid dataset config `{key}`. It must be one of `{list(a)}`."
-                )
-        return result
-
-    @staticmethod
-    def validated(
-        config: Dict[str, "DatasetConfig"], datasets: Dict[str, "Dataset"]
-    ) -> Dict[str, "DatasetConfig"]:
-        """Validate the given config and datasets are usable.
-
-        Returns dict of validated configs with defaults filled out.
-        """
-        has_wildcard = WILDCARD_KEY in config
-        fittable = set()
-        result = {k: v.fill_defaults() for k, v in config.items()}
-        for k, v in result.items():
-            if v.fit:
-                fittable.add(k)
-                if not v.transform:
-                    raise ValueError(
-                        f"Error configuring dataset `{k}`: cannot specify both "
-                        "fit=True and transform=False."
-                    )
-            if v.required:
-                if k not in datasets:
-                    raise ValueError(
-                        f"The required dataset `{k}` was not found in {datasets}."
-                    )
-        if len(fittable) > 1:
-            raise ValueError(
-                f"More than one dataset was specified to be fit: {fittable}"
-            )
-        if not has_wildcard:
-            for k, v in datasets.items():
-                if k not in result:
-                    raise ValueError(
-                        f"An unexpected dataset `{k}` was given. The list of expected "
-                        f"datasets is `{list(result)}`."
-                    )
-        return result
-
-    def _merge(self, other: "DatasetConfig") -> "DatasetConfig":
-        """Merge the given DatasetConfig into this one."""
-        new_config = DatasetConfig(
-            fit=self.fit if other.fit is None else other.fit,
-            split=self.split if other.split is None else other.split,
-            required=self.required if other.required is None else other.required,
-            transform=self.transform if other.transform is None else other.transform,
-            use_stream_api=self.use_stream_api
-            if other.use_stream_api is None
-            else other.use_stream_api,
-            stream_window_size=self.stream_window_size
-            if other.stream_window_size is None
-            else other.stream_window_size,
-            global_shuffle=self.global_shuffle
-            if other.global_shuffle is None
-            else other.global_shuffle,
-            randomize_block_order=self.randomize_block_order
-            if other.randomize_block_order is None
-            else other.randomize_block_order,
-        )
-        return new_config
-
-
-@dataclass
-@PublicAPI(stability="beta")
+@PublicAPI(stability="stable")
 class FailureConfig:
     """Configuration related to failure handling of each training/tuning run.
 
@@ -457,41 +325,32 @@ class FailureConfig:
             Will recover from the latest checkpoint if present.
             Setting to -1 will lead to infinite recovery retries.
             Setting to 0 will disable retries. Defaults to 0.
-        fail_fast: Whether to fail upon the first error. Only used for
-            Ray Tune - this does not apply
-            to single training runs (e.g. with ``Trainer.fit()``).
-            If fail_fast='raise' provided, Ray Tune will automatically
-            raise the exception received by the Trainable. fail_fast='raise'
-            can easily leak resources and should be used with caution (it
-            is best used with `ray.init(local_mode=True)`).
+        fail_fast: Whether to fail upon the first error.
+            If fail_fast='raise' provided, the original error during training will be
+            immediately raised. fail_fast='raise' can easily leak resources and
+            should be used with caution.
     """
 
     max_failures: int = 0
     fail_fast: Union[bool, str] = False
 
     def __post_init__(self):
-        # Same check as in tune.run
-        if self.fail_fast and self.max_failures != 0:
-            raise ValueError("max_failures must be 0 if fail_fast=True.")
-
-        # Same check as in TrialRunner
-        if not (isinstance(self.fail_fast, bool) or self.fail_fast.upper() != "RAISE"):
+        # Same check as in TuneController
+        if not (isinstance(self.fail_fast, bool) or self.fail_fast.upper() == "RAISE"):
             raise ValueError(
                 "fail_fast must be one of {bool, 'raise'}. " f"Got {self.fail_fast}."
+            )
+
+        # Same check as in tune.run
+        if self.fail_fast and self.max_failures != 0:
+            raise ValueError(
+                f"max_failures must be 0 if fail_fast={repr(self.fail_fast)}."
             )
 
     def __repr__(self):
         return _repr_dataclass(self)
 
     def _repr_html_(self):
-        try:
-            from tabulate import tabulate
-        except ImportError:
-            return (
-                "Tabulate isn't installed. Run "
-                "`pip install tabulate` for rich notebook output."
-            )
-
         return Template("scrollableTable.html.j2").render(
             table=tabulate(
                 {
@@ -507,7 +366,7 @@ class FailureConfig:
 
 
 @dataclass
-@PublicAPI(stability="beta")
+@PublicAPI(stability="stable")
 class CheckpointConfig:
     """Configurable parameters for defining the checkpointing strategy.
 
@@ -520,8 +379,7 @@ class CheckpointConfig:
             on disk for this run. If a checkpoint is persisted to disk after
             there are already this many checkpoints, then an existing
             checkpoint will be deleted. If this is ``None`` then checkpoints
-            will not be deleted. If this is ``0`` then no checkpoints will be
-            persisted to disk.
+            will not be deleted. Must be >= 1.
         checkpoint_score_attribute: The attribute that will be used to
             score checkpoints to determine which checkpoints should be kept
             on disk when there are greater than ``num_to_keep`` checkpoints.
@@ -543,21 +401,50 @@ class CheckpointConfig:
             This attribute is only supported by trainers that don't take in
             custom training loops. Defaults to True for trainers that support it
             and False for generic function trainables.
-
+        _checkpoint_keep_all_ranks: This experimental config is deprecated.
+            This behavior is now controlled by reporting `checkpoint=None`
+            in the workers that shouldn't persist a checkpoint.
+            For example, if you only want the rank 0 worker to persist a checkpoint
+            (e.g., in standard data parallel training), then you should save and
+            report a checkpoint if `ray.train.get_context().get_world_rank() == 0`
+            and `None` otherwise.
+        _checkpoint_upload_from_workers: This experimental config is deprecated.
+            Uploading checkpoint directly from the worker is now the default behavior.
     """
 
     num_to_keep: Optional[int] = None
     checkpoint_score_attribute: Optional[str] = None
-    checkpoint_score_order: str = MAX
-    checkpoint_frequency: int = 0
+    checkpoint_score_order: Optional[str] = MAX
+    checkpoint_frequency: Optional[int] = 0
     checkpoint_at_end: Optional[bool] = None
+    _checkpoint_keep_all_ranks: Optional[bool] = _DEPRECATED_VALUE
+    _checkpoint_upload_from_workers: Optional[bool] = _DEPRECATED_VALUE
 
     def __post_init__(self):
-        if self.num_to_keep is not None and self.num_to_keep < 0:
+        if self._checkpoint_keep_all_ranks != _DEPRECATED_VALUE:
+            raise DeprecationWarning(
+                "The experimental `_checkpoint_keep_all_ranks` config is deprecated. "
+                "This behavior is now controlled by reporting `checkpoint=None` "
+                "in the workers that shouldn't persist a checkpoint. "
+                "For example, if you only want the rank 0 worker to persist a "
+                "checkpoint (e.g., in standard data parallel training), "
+                "then you should save and report a checkpoint if "
+                "`ray.train.get_context().get_world_rank() == 0` "
+                "and `None` otherwise."
+            )
+
+        if self._checkpoint_upload_from_workers != _DEPRECATED_VALUE:
+            raise DeprecationWarning(
+                "The experimental `_checkpoint_upload_from_workers` config is "
+                "deprecated. Uploading checkpoint directly from the worker is "
+                "now the default behavior."
+            )
+
+        if self.num_to_keep is not None and self.num_to_keep <= 0:
             raise ValueError(
                 f"Received invalid num_to_keep: "
                 f"{self.num_to_keep}. "
-                f"Must be None or non-negative integer."
+                f"Must be None or an integer >= 1."
             )
         if self.checkpoint_score_order not in (MAX, MIN):
             raise ValueError(
@@ -573,14 +460,6 @@ class CheckpointConfig:
         return _repr_dataclass(self)
 
     def _repr_html_(self) -> str:
-        try:
-            from tabulate import tabulate
-        except ImportError:
-            return (
-                "Tabulate isn't installed. Run "
-                "`pip install tabulate` for rich notebook output."
-            )
-
         if self.num_to_keep is None:
             num_to_keep_repr = "All"
         else:
@@ -636,7 +515,7 @@ class CheckpointConfig:
 
 
 @dataclass
-@PublicAPI(stability="beta")
+@PublicAPI(stability="stable")
 class RunConfig:
     """Runtime configuration for training and tuning runs.
 
@@ -647,27 +526,36 @@ class RunConfig:
     Args:
         name: Name of the trial or experiment. If not provided, will be deduced
             from the Trainable.
-        local_dir: Local dir to save training results to.
-            Defaults to ``~/ray_results``.
+        storage_path: [Beta] Path where all results and checkpoints are persisted.
+            Can be a local directory or a destination on cloud storage.
+            For multi-node training/tuning runs, this must be set to a
+            shared storage location (e.g., S3, NFS).
+            This defaults to the local ``~/ray_results`` directory.
+        storage_filesystem: [Beta] A custom filesystem to use for storage.
+            If this is provided, `storage_path` should be a path with its
+            prefix stripped (e.g., `s3://bucket/path` -> `bucket/path`).
+        failure_config: Failure mode configuration.
+        checkpoint_config: Checkpointing configuration.
+        sync_config: Configuration object for syncing. See train.SyncConfig.
+        verbose: 0, 1, or 2. Verbosity mode.
+            0 = silent, 1 = default, 2 = verbose. Defaults to 1.
+            If the ``RAY_AIR_NEW_OUTPUT=1`` environment variable is set,
+            uses the old verbosity settings:
+            0 = silent, 1 = only status updates, 2 = status and brief
+            results, 3 = status and detailed results.
         stop: Stop conditions to consider. Refer to ray.tune.stopper.Stopper
             for more info. Stoppers should be serializable.
-        callbacks: Callbacks to invoke.
+        callbacks: [DeveloperAPI] Callbacks to invoke.
             Refer to ray.tune.callback.Callback for more info.
             Callbacks should be serializable.
             Currently only stateless callbacks are supported for resumed runs.
             (any state of the callback will not be checkpointed by Tune
             and thus will not take effect in resumed runs).
-        failure_config: Failure mode configuration.
-        sync_config: Configuration object for syncing. See tune.SyncConfig.
-        checkpoint_config: Checkpointing configuration.
-        progress_reporter: Progress reporter for reporting
+        progress_reporter: [DeveloperAPI] Progress reporter for reporting
             intermediate experiment progress. Defaults to CLIReporter if
             running in command-line, or JupyterNotebookReporter if running in
             a Jupyter notebook.
-        verbose: 0, 1, 2, or 3. Verbosity mode.
-            0 = silent, 1 = only status updates, 2 = status and brief
-            results, 3 = status and detailed results. Defaults to 2.
-        log_to_file: Log stdout and stderr to files in
+        log_to_file: [DeveloperAPI] Log stdout and stderr to files in
             trial directories. If this is `False` (default), no files
             are written. If `true`, outputs are written to `trialdir/stdout`
             and `trialdir/stderr`, respectively. If this is a single string,
@@ -679,18 +567,52 @@ class RunConfig:
     """
 
     name: Optional[str] = None
-    local_dir: Optional[str] = None
-    callbacks: Optional[List["Callback"]] = None
-    stop: Optional[Union[Mapping, "Stopper", Callable[[str, Mapping], bool]]] = None
+    storage_path: Optional[str] = None
+    storage_filesystem: Optional[pyarrow.fs.FileSystem] = None
     failure_config: Optional[FailureConfig] = None
-    sync_config: Optional["SyncConfig"] = None
     checkpoint_config: Optional[CheckpointConfig] = None
-    progress_reporter: Optional["ProgressReporter"] = None
-    verbose: Union[int, "Verbosity"] = 3
+    sync_config: Optional["ray.train.SyncConfig"] = None
+    verbose: Optional[Union[int, "AirVerbosity", "Verbosity"]] = None
+    stop: Optional[Union[Mapping, "Stopper", Callable[[str, Mapping], bool]]] = None
+    callbacks: Optional[List["Callback"]] = None
+    progress_reporter: Optional[
+        "ray.tune.progress_reporter.ProgressReporter"  # noqa: F821
+    ] = None
     log_to_file: Union[bool, str, Tuple[str, str]] = False
 
+    # Deprecated
+    local_dir: Optional[str] = None
+
     def __post_init__(self):
-        from ray.tune.syncer import SyncConfig
+        from ray.train import SyncConfig
+        from ray.train.constants import DEFAULT_STORAGE_PATH
+        from ray.tune.experimental.output import AirVerbosity, get_air_verbosity
+
+        if self.local_dir is not None:
+            raise DeprecationWarning(
+                "The `RunConfig(local_dir)` argument is deprecated. "
+                "You should set the `RunConfig(storage_path)` instead."
+                "See the docs: https://docs.ray.io/en/latest/train/user-guides/"
+                "persistent-storage.html#setting-the-local-staging-directory"
+            )
+
+        if self.storage_path is None:
+            self.storage_path = DEFAULT_STORAGE_PATH
+
+            # TODO(justinvyu): [Deprecated]
+            ray_storage_uri: Optional[str] = os.environ.get("RAY_STORAGE")
+            if ray_storage_uri is not None:
+                logger.info(
+                    "Using configured Ray Storage URI as the `storage_path`: "
+                    f"{ray_storage_uri}"
+                )
+                warnings.warn(
+                    "The `RAY_STORAGE` environment variable is deprecated. "
+                    "Please use `RunConfig(storage_path)` instead.",
+                    RayDeprecationWarning,
+                    stacklevel=2,
+                )
+                self.storage_path = ray_storage_uri
 
         if not self.failure_config:
             self.failure_config = FailureConfig()
@@ -701,8 +623,20 @@ class RunConfig:
         if not self.checkpoint_config:
             self.checkpoint_config = CheckpointConfig()
 
+        # Save the original verbose value to check for deprecations
+        self._verbose = self.verbose
+        if self.verbose is None:
+            # Default `verbose` value. For new output engine,
+            # this is AirVerbosity.DEFAULT.
+            # For old output engine, this is Verbosity.V3_TRIAL_DETAILS
+            # Todo (krfricke): Currently uses number to pass test_configs::test_repr
+            self.verbose = get_air_verbosity(AirVerbosity.DEFAULT) or 3
+
+        if isinstance(self.storage_path, Path):
+            self.storage_path = self.storage_path.as_posix()
+
     def __repr__(self):
-        from ray.tune.syncer import SyncConfig
+        from ray.train import SyncConfig
 
         return _repr_dataclass(
             self,
@@ -714,14 +648,6 @@ class RunConfig:
         )
 
     def _repr_html_(self) -> str:
-        try:
-            from tabulate import tabulate
-        except ImportError:
-            return (
-                "Tabulate isn't installed. Run "
-                "`pip install tabulate` for rich notebook output."
-            )
-
         reprs = []
         if self.failure_config is not None:
             reprs.append(

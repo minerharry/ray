@@ -2,21 +2,20 @@ import logging
 from abc import ABCMeta, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-from ray.rllib.evaluation.episode import Episode
 from ray.rllib.policy.policy_map import PolicyMap
 from ray.rllib.policy.sample_batch import MultiAgentBatch, SampleBatch
-from ray.rllib.utils.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.typing import AgentID, EnvID, EpisodeID, PolicyID, TensorType
 
 if TYPE_CHECKING:
-    from ray.rllib.algorithms.callbacks import DefaultCallbacks
+    from ray.rllib.callbacks.callbacks import RLlibCallback
 
 logger = logging.getLogger(__name__)
 
 
 # fmt: off
 # __sphinx_doc_begin__
-@PublicAPI
+@OldAPIStack
 class SampleCollector(metaclass=ABCMeta):
     """Collects samples for all policies and agents from a multi-agent env.
 
@@ -33,7 +32,7 @@ class SampleCollector(metaclass=ABCMeta):
     def __init__(self,
                  policy_map: PolicyMap,
                  clip_rewards: Union[bool, float],
-                 callbacks: "DefaultCallbacks",
+                 callbacks: "RLlibCallback",
                  multiple_episodes_in_batch: bool = True,
                  rollout_fragment_length: int = 200,
                  count_steps_by: str = "env_steps"):
@@ -58,9 +57,16 @@ class SampleCollector(metaclass=ABCMeta):
         self.count_steps_by = count_steps_by
 
     @abstractmethod
-    def add_init_obs(self, episode: Episode, agent_id: AgentID, env_id: EnvID,
-                     policy_id: PolicyID,
-                     init_obs: TensorType, t: int = -1) -> None:
+    def add_init_obs(
+        self,
+        *,
+        episode,
+        agent_id: AgentID,
+        policy_id: PolicyID,
+        init_obs: TensorType,
+        init_infos: Optional[Dict[str, TensorType]] = None,
+        t: int = -1,
+    ) -> None:
         """Adds an initial obs (after reset) to this collector.
 
         Since the very first observation in an environment is collected w/o
@@ -78,28 +84,45 @@ class SampleCollector(metaclass=ABCMeta):
             env_id: The environment index (in a vectorized setup).
             policy_id: Unique id for policy controlling the agent.
             init_obs: Initial observation (after env.reset()).
+            init_obs: Initial observation (after env.reset()).
+            init_infos: Initial infos dict (after env.reset()).
             t: The time step (episode length - 1). The initial obs has
                 ts=-1(!), then an action/reward/next-obs at t=0, etc..
 
-        Examples:
-            >>> obs = env.reset()
-            >>> collector.add_init_obs(my_episode, 0, "pol0", -1, obs)
-            >>> obs, r, done, info = env.step(action)
-            >>> collector.add_action_reward_next_obs(12345, 0, "pol0", False, {
-            ...     "action": action, "obs": obs, "reward": r, "done": done
-            ... })
+        .. testcode::
+            :skipif: True
+
+            obs, infos = env.reset()
+            collector.add_init_obs(
+                episode=my_episode,
+                agent_id=0,
+                policy_id="pol0",
+                t=-1,
+                init_obs=obs,
+                init_infos=infos,
+            )
+            obs, r, terminated, truncated, info = env.step(action)
+            collector.add_action_reward_next_obs(12345, 0, "pol0", False, {
+                "action": action, "obs": obs, "reward": r, "terminated": terminated,
+                "truncated": truncated, "info": info
+            })
         """
         raise NotImplementedError
 
     @abstractmethod
-    def add_action_reward_next_obs(self, episode_id: EpisodeID,
-                                   agent_id: AgentID, env_id: EnvID,
-                                   policy_id: PolicyID, agent_done: bool,
-                                   values: Dict[str, TensorType]) -> None:
+    def add_action_reward_next_obs(
+        self,
+        episode_id: EpisodeID,
+        agent_id: AgentID,
+        env_id: EnvID,
+        policy_id: PolicyID,
+        agent_done: bool,
+        values: Dict[str, TensorType],
+    ) -> None:
         """Add the given dictionary (row) of values to this collector.
 
-        The incoming data (`values`) must include action, reward, done, and
-        next_obs information and may include any other information.
+        The incoming data (`values`) must include action, reward, terminated, truncated,
+        and next_obs information and may include any other information.
         For the initial observation (after Env.reset()) of the given agent/
         episode-ID combination, `add_initial_obs()` must be called instead.
 
@@ -110,24 +133,33 @@ class SampleCollector(metaclass=ABCMeta):
                 values for.
             env_id: The environment index (in a vectorized setup).
             policy_id: Unique id for policy controlling the agent.
-            agent_done: Whether the given agent is done with its
-                trajectory (the multi-agent episode may still be ongoing).
+            agent_done: Whether the given agent is done (terminated or truncated) with
+                its trajectory (the multi-agent episode may still be ongoing).
             values (Dict[str, TensorType]): Row of values to add for this
                 agent. This row must contain the keys SampleBatch.ACTION,
-                REWARD, NEW_OBS, and DONE.
+                REWARD, NEW_OBS, TERMINATED, and TRUNCATED.
 
-        Examples:
-            >>> obs = env.reset()
-            >>> collector.add_init_obs(12345, 0, "pol0", obs)
-            >>> obs, r, done, info = env.step(action)
-            >>> collector.add_action_reward_next_obs(12345, 0, "pol0", False, {
-            ...     "action": action, "obs": obs, "reward": r, "done": done
-            ... })
+        .. testcode::
+            :skipif: True
+
+            obs, info = env.reset()
+            collector.add_init_obs(12345, 0, "pol0", obs)
+            obs, r, terminated, truncated, info = env.step(action)
+            collector.add_action_reward_next_obs(
+                12345,
+                0,
+                "pol0",
+                agent_done=False,
+                values={
+                    "action": action, "obs": obs, "reward": r,
+                    "terminated": terminated, "truncated": truncated
+                },
+            )
         """
         raise NotImplementedError
 
     @abstractmethod
-    def episode_step(self, episode: Episode) -> None:
+    def episode_step(self, episode) -> None:
         """Increases the episode step counter (across all agents) by one.
 
         Args:
@@ -190,23 +222,28 @@ class SampleCollector(metaclass=ABCMeta):
             Dict[str, TensorType]: The input_dict to be passed into the ModelV2
                 for inference/training.
 
-        Examples:
-            >>> obs, r, done, info = env.step(action)
-            >>> collector.add_action_reward_next_obs(12345, 0, "pol0", {
-            ...     "action": action, "obs": obs, "reward": r, "done": done
-            ... })
-            >>> input_dict = collector.get_inference_input_dict(policy.model)
-            >>> action = policy.compute_actions_from_input_dict(input_dict)
-            >>> # repeat
+        .. testcode::
+            :skipif: True
+
+            obs, r, terminated, truncated, info = env.step(action)
+            collector.add_action_reward_next_obs(12345, 0, "pol0", False, {
+                "action": action, "obs": obs, "reward": r,
+                "terminated": terminated, "truncated", truncated
+            })
+            input_dict = collector.get_inference_input_dict(policy.model)
+            action = policy.compute_actions_from_input_dict(input_dict)
+            # repeat
         """
         raise NotImplementedError
 
     @abstractmethod
-    def postprocess_episode(self,
-                            episode: Episode,
-                            is_done: bool = False,
-                            check_dones: bool = False,
-                            build: bool = False) -> Optional[MultiAgentBatch]:
+    def postprocess_episode(
+        self,
+        episode,
+        is_done: bool = False,
+        check_dones: bool = False,
+        build: bool = False,
+    ) -> Optional[MultiAgentBatch]:
         """Postprocesses all agents' trajectories in a given episode.
 
         Generates (single-trajectory) SampleBatches for all Policies/Agents and
@@ -220,7 +257,7 @@ class SampleCollector(metaclass=ABCMeta):
             episode: The Episode object for which
                 to post-process data.
             is_done: Whether the given episode is actually terminated
-                (all agents are done OR we hit a hard horizon). If True, the
+                (all agents are terminated OR truncated). If True, the
                 episode will no longer be used/continued and we may need to
                 recycle/erase it internally. If a soft-horizon is hit, the
                 episode will continue to be used and `is_done` should be set

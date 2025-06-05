@@ -3,238 +3,393 @@
 Input/Output
 ============
 
+.. currentmodule:: ray.data
+
 Synthetic Data
 --------------
 
-.. autofunction:: ray.data.range
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autofunction:: ray.data.range_table
-
-.. autofunction:: ray.data.range_tensor
+   range
+   range_tensor
 
 Python Objects
 --------------
 
-.. autofunction:: ray.data.from_items
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   from_items
 
 Parquet
 -------
 
-.. autofunction:: ray.data.read_parquet
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autofunction:: ray.data.read_parquet_bulk
-
-.. automethod:: ray.data.Dataset.write_parquet
-    :noindex:
+   read_parquet
+   read_parquet_bulk
+   Dataset.write_parquet
 
 CSV
 ---
 
-.. autofunction:: ray.data.read_csv
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.write_csv
-    :noindex:
+   read_csv
+   Dataset.write_csv
 
 JSON
 ----
 
-.. autofunction:: ray.data.read_json
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.write_json
-    :noindex:
+   read_json
+   Dataset.write_json
 
 Text
 ----
 
-.. autofunction:: ray.data.read_text
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-Images (experimental)
----------------------
+   read_text
 
-.. autofunction:: ray.data.read_images
+Audio
+-----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_audio
+
+Avro
+----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_avro
+
+Images
+------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_images
+   Dataset.write_images
 
 Binary
 ------
 
-.. autofunction:: ray.data.read_binary_files
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_binary_files
 
 TFRecords
 ---------
 
-.. autofunction:: ray.data.read_tfrecords
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autofunction:: ray.data.Dataset.write_tfrecords
-    :noindex:
-
+   read_tfrecords
+   Dataset.write_tfrecords
+   TFXReadOptions
 
 Pandas
 ------
 
-.. autofunction:: ray.data.from_pandas
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autofunction:: ray.data.from_pandas_refs
-
-.. automethod:: ray.data.Dataset.to_pandas
-    :noindex:
-
-.. automethod:: ray.data.Dataset.to_pandas_refs
-    :noindex:
+   from_pandas
+   from_pandas_refs
+   Dataset.to_pandas
+   Dataset.to_pandas_refs
 
 NumPy
 -----
 
-.. autofunction:: ray.data.read_numpy
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autofunction:: ray.data.from_numpy
-
-.. autofunction:: ray.data.from_numpy_refs
-
-.. automethod:: ray.data.Dataset.write_numpy
-    :noindex:
-
-.. automethod:: ray.data.Dataset.to_numpy_refs
-    :noindex:
+   read_numpy
+   from_numpy
+   from_numpy_refs
+   Dataset.write_numpy
+   Dataset.to_numpy_refs
 
 Arrow
 -----
 
-.. autofunction:: ray.data.from_arrow
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autofunction:: ray.data.from_arrow_refs
+   from_arrow
+   from_arrow_refs
+   Dataset.to_arrow_refs
 
-.. automethod:: ray.data.Dataset.to_arrow_refs
-    :noindex:
+MongoDB
+-------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_mongo
+   Dataset.write_mongo
+
+BigQuery
+--------
+
+.. autosummary::
+   :toctree: doc/
+
+   read_bigquery
+   Dataset.write_bigquery
+
+SQL Databases
+-------------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_sql
+   Dataset.write_sql
+
+Databricks
+----------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_databricks_tables
+
+Delta Sharing
+-------------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_delta_sharing_tables
+
+Hudi
+----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_hudi
+
+Iceberg
+-------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_iceberg
+   Dataset.write_iceberg
+
+Lance
+-----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_lance
+   Dataset.write_lance
+
+ClickHouse
+----------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_clickhouse
+   Dataset.write_clickhouse
+
+Daft
+----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   from_daft
+   Dataset.to_daft
 
 Dask
 ----
 
-.. autofunction:: ray.data.from_dask
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.to_dask
-    :noindex:
+   from_dask
+   Dataset.to_dask
 
 Spark
 -----
 
-.. autofunction:: ray.data.from_spark
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.to_spark
-    :noindex:
+   from_spark
+   Dataset.to_spark
 
 Modin
 -----
 
-.. autofunction:: ray.data.from_modin
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.to_modin
-    :noindex:
+   from_modin
+   Dataset.to_modin
 
 Mars
 ----
 
-.. autofunction:: ray.data.from_mars
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.to_mars
-    :noindex:
+   from_mars
+   Dataset.to_mars
 
-HuggingFace
+Torch
+-----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   from_torch
+
+Hugging Face
 ------------
 
-.. autofunction:: ray.data.from_huggingface
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
+   from_huggingface
+
+TensorFlow
+----------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   from_tf
+
+Video
+-----
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_videos
+
+WebDataset
+----------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
+
+   read_webdataset
 
 .. _data_source_api:
 
 Datasource API
 --------------
 
-.. autofunction:: ray.data.read_datasource
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. automethod:: ray.data.Dataset.write_datasource
-    :noindex:
+   read_datasource
+   Datasource
+   ReadTask
+   datasource.FilenameProvider
 
-.. autoclass:: ray.data.Datasource
-    :members:
+Datasink API
+------------
 
-.. autoclass:: ray.data.ReadTask
-    :members:
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autoclass:: ray.data.datasource.Reader
-    :members:
-
-
-Built-in Datasources
-####################
-
-.. autoclass:: ray.data.datasource.BinaryDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.CSVDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.FileBasedDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.ImageDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.JSONDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.NumpyDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.ParquetDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.RangeDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.SimpleTensorFlowDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.SimpleTorchDatasource
-    :members:
-
-.. autoclass:: ray.data.datasource.TFRecordDatasource
-    :members:
+   Dataset.write_datasink
+   Datasink
+   datasource.RowBasedFileDatasink
+   datasource.BlockBasedFileDatasink
+   datasource.FileBasedDatasource
+   datasource.WriteResult
+   datasource.WriteReturnType
 
 Partitioning API
 ----------------
 
-.. autoclass:: ray.data.datasource.Partitioning
-    :members:
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autoclass:: ray.data.datasource.PartitionStyle
-    :members:
+   datasource.Partitioning
+   datasource.PartitionStyle
+   datasource.PathPartitionParser
+   datasource.PathPartitionFilter
 
-.. autoclass:: ray.data.datasource.PathPartitionEncoder
-    :members:
-
-.. autoclass:: ray.data.datasource.PathPartitionParser
-    :members:
-
-.. autoclass:: ray.data.datasource.PathPartitionFilter
-
+.. _metadata_provider:
 
 MetadataProvider API
 --------------------
 
-.. autoclass:: ray.data.datasource.FileMetadataProvider
-    :members:
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
+   datasource.FileMetadataProvider
+   datasource.BaseFileMetadataProvider
+   datasource.DefaultFileMetadataProvider
+   datasource.ParquetMetadataProvider
+   datasource.FastFileMetadataProvider
 
-.. autoclass:: ray.data.datasource.BaseFileMetadataProvider
-    :members:
+Shuffling API
+-------------
 
-.. autoclass:: ray.data.datasource.ParquetMetadataProvider
-    :members:
+.. autosummary::
+   :nosignatures:
+   :toctree: doc/
 
-.. autoclass:: ray.data.datasource.DefaultFileMetadataProvider
-    :members:
-
-.. autoclass:: ray.data.datasource.DefaultParquetMetadataProvider
-    :members:
-
-.. autoclass:: ray.data.datasource.FastFileMetadataProvider
-    :members:
+   FileShuffleConfig

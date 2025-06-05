@@ -1,12 +1,15 @@
-import ray
 import os
 import signal
 import time
 import sys
+import warnings
+
 import pytest
 
-from ray._private.test_utils import SignalActor
+import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.state import list_tasks
+from ray._private.test_utils import wait_for_condition
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Fails on windows")
@@ -47,22 +50,22 @@ def test_was_current_actor_reconstructed(shutdown_only):
     @ray.remote(max_restarts=10)
     class A(object):
         def current_job_id(self):
-            return ray.get_runtime_context().job_id
+            return ray.get_runtime_context().get_job_id()
 
         def current_actor_id(self):
-            return ray.get_runtime_context().actor_id
+            return ray.get_runtime_context().get_actor_id()
 
     @ray.remote
     def f():
-        assert ray.get_runtime_context().actor_id is None
-        assert ray.get_runtime_context().task_id is not None
-        assert ray.get_runtime_context().node_id is not None
-        assert ray.get_runtime_context().job_id is not None
+        assert ray.get_runtime_context().get_actor_id() is None
+        assert ray.get_runtime_context().get_task_id() is not None
+        assert ray.get_runtime_context().get_node_id() is not None
+        assert ray.get_runtime_context().get_job_id() is not None
         context = ray.get_runtime_context().get()
         assert "actor_id" not in context
-        assert context["task_id"] == ray.get_runtime_context().task_id
-        assert context["node_id"] == ray.get_runtime_context().node_id
-        assert context["job_id"] == ray.get_runtime_context().job_id
+        assert context["task_id"].hex() == ray.get_runtime_context().get_task_id()
+        assert context["node_id"].hex() == ray.get_runtime_context().get_node_id()
+        assert context["job_id"].hex() == ray.get_runtime_context().get_job_id()
 
     a = A.remote()
     assert ray.get(a.current_job_id.remote()) is not None
@@ -147,106 +150,24 @@ def test_get_assigned_resources(ray_start_10_cpus):
     assert ray.get(result)["CPU"] == 2.0
 
 
-def test_actor_stats_normal_task(ray_start_regular):
-    # Because it works at the core worker level, this API works for tasks.
-    @ray.remote
-    def func():
-        return ray.get_runtime_context()._get_actor_call_stats()
-
-    assert ray.get(func.remote())["func"] == {
-        "pending": 0,
-        "running": 1,
-        "finished": 0,
-    }
-
-
-def test_actor_stats_sync_actor(ray_start_regular):
-    signal = SignalActor.remote()
-
-    @ray.remote
-    class SyncActor:
-        def run(self):
-            return ray.get_runtime_context()._get_actor_call_stats()
-
-        def wait_signal(self):
-            ray.get(signal.wait.remote())
-            return ray.get_runtime_context()._get_actor_call_stats()
-
-    actor = SyncActor.remote()
-    counts = ray.get(actor.run.remote())
-    assert counts == {
-        "SyncActor.run": {"pending": 0, "running": 1, "finished": 0},
-        "SyncActor.__init__": {"pending": 0, "running": 0, "finished": 1},
-    }
-
-    ref = actor.wait_signal.remote()
-    other_refs = [actor.run.remote() for _ in range(3)] + [
-        actor.wait_signal.remote() for _ in range(5)
-    ]
-    ray.wait(other_refs, timeout=1)
-    signal.send.remote()
-    counts = ray.get(ref)
-    assert counts == {
-        "SyncActor.run": {
-            "pending": 3,
-            "running": 0,
-            "finished": 1,  # from previous run
-        },
-        "SyncActor.wait_signal": {
-            "pending": 5,
-            "running": 1,
-            "finished": 0,
-        },
-        "SyncActor.__init__": {"pending": 0, "running": 0, "finished": 1},
-    }
-
-
-def test_actor_stats_threaded_actor(ray_start_regular):
-    signal = SignalActor.remote()
-
-    @ray.remote
-    class ThreadedActor:
-        def func(self):
-            ray.get(signal.wait.remote())
-            return ray.get_runtime_context()._get_actor_call_stats()
-
-    actor = ThreadedActor.options(max_concurrency=3).remote()
-    refs = [actor.func.remote() for _ in range(6)]
-    ready, _ = ray.wait(refs, timeout=1)
-    assert len(ready) == 0
-    signal.send.remote()
-    results = ray.get(refs)
-    assert max(result["ThreadedActor.func"]["running"] for result in results) > 1
-    assert max(result["ThreadedActor.func"]["pending"] for result in results) > 1
-
-
-def test_actor_stats_async_actor(ray_start_regular):
-    signal = SignalActor.remote()
-
-    @ray.remote
-    class AysncActor:
-        async def func(self):
-            await signal.wait.remote()
-            return ray.get_runtime_context()._get_actor_call_stats()
-
-    actor = AysncActor.options(max_concurrency=3).remote()
-    refs = [actor.func.remote() for _ in range(6)]
-    ready, _ = ray.wait(refs, timeout=1)
-    assert len(ready) == 0
-    signal.send.remote()
-    results = ray.get(refs)
-    assert max(result["AysncActor.func"]["running"] for result in results) == 3
-    assert max(result["AysncActor.func"]["pending"] for result in results) == 3
-
-
+# Use default filterwarnings behavior for this test
+@pytest.mark.filterwarnings("default")
 def test_ids(ray_start_regular):
     rtc = ray.get_runtime_context()
     # node id
     assert isinstance(rtc.get_node_id(), str)
-    assert rtc.get_node_id() == rtc.node_id.hex()
+    with warnings.catch_warnings(record=True) as w:
+        assert rtc.get_node_id() == rtc.node_id.hex()
+        assert any("Use get_node_id() instead" in str(warning.message) for warning in w)
+
     # job id
     assert isinstance(rtc.get_job_id(), str)
-    assert rtc.get_job_id() == rtc.job_id.hex()
+    with warnings.catch_warnings(record=True) as w:
+        assert rtc.get_job_id() == rtc.job_id.hex()
+        assert any("Use get_job_id() instead" in str(warning.message) for warning in w)
+
+    assert rtc.get_actor_name() is None
+
     # placement group id
     # Driver doesn't belong to any placement group.
     assert rtc.get_placement_group_id() is None
@@ -263,7 +184,13 @@ def test_ids(ray_start_regular):
     def foo_pg():
         rtc = ray.get_runtime_context()
         assert isinstance(rtc.get_placement_group_id(), str)
-        assert rtc.get_placement_group_id() == rtc.current_placement_group_id.hex()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert rtc.get_placement_group_id() == rtc.current_placement_group_id.hex()
+            assert any(
+                "Use get_placement_group_id() instead" in str(warning.message)
+                for warning in w
+            )
 
     ray.get(
         foo_pg.options(
@@ -279,7 +206,12 @@ def test_ids(ray_start_regular):
     def foo_task():
         rtc = ray.get_runtime_context()
         assert isinstance(rtc.get_task_id(), str)
-        assert rtc.get_task_id() == rtc.task_id.hex()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            assert rtc.get_task_id() == rtc.task_id.hex()
+            assert any(
+                "Use get_task_id() instead" in str(warning.message) for warning in w
+            )
 
     ray.get(foo_task.remote())
 
@@ -291,24 +223,236 @@ def test_ids(ray_start_regular):
         def foo(self):
             rtc = ray.get_runtime_context()
             assert isinstance(rtc.get_actor_id(), str)
-            assert rtc.get_actor_id() == rtc.actor_id.hex()
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                assert rtc.get_actor_id() == rtc.actor_id.hex()
+                assert any(
+                    "Use get_actor_id() instead" in str(warning.message)
+                    for warning in w
+                )
 
     actor = FooActor.remote()
     ray.get(actor.foo.remote())
 
+    # actor name
+    @ray.remote
+    class NamedActor:
+        def name(self):
+            return ray.get_runtime_context().get_actor_name()
 
-# get_runtime_context() can be called outside of Ray so it should not start
-# Ray automatically.
-def test_no_auto_init(shutdown_only):
+    ACTOR_NAME = "actor_name"
+    named_actor = NamedActor.options(name=ACTOR_NAME).remote()
+    assert ray.get(named_actor.name.remote()) == ACTOR_NAME
+
+    # unnamed actor name
+    unnamed_actor = NamedActor.options().remote()
+    assert ray.get(unnamed_actor.name.remote()) == ""
+
+    # task actor name
+    @ray.remote
+    def task_actor_name():
+        ray.get_runtime_context().get_actor_name()
+
+    assert ray.get(task_actor_name.remote()) is None
+
+    # driver actor name
+    assert rtc.get_actor_name() is None
+
+
+def test_auto_init(shutdown_only):
     assert not ray.is_initialized()
     ray.get_runtime_context()
-    assert not ray.is_initialized()
+    assert ray.is_initialized()
+
+
+def test_get_task_name(shutdown_only):
+    ray.init()
+
+    # for a normal task
+    @ray.remote
+    def get_task_name_for_normal_task():
+        return ray.get_runtime_context().get_task_name()
+
+    expected_task_name = "normal_task_name"
+    task_name = ray.get(
+        get_task_name_for_normal_task.options(name=expected_task_name).remote()
+    )
+    assert (
+        task_name == expected_task_name
+    ), f"Check normal task name failed. expected={expected_task_name}, \
+actual={task_name}"
+
+    # for an actor task
+    @ray.remote
+    class Actor:
+        def get_task_name_for_actor_task(self):
+            return ray.get_runtime_context().get_task_name()
+
+    expected_task_name = "Actor.get_task_name_for_actor_task"
+    actor = Actor.remote()
+    task_name = ray.get(actor.get_task_name_for_actor_task.remote())
+    assert (
+        task_name == expected_task_name
+    ), f"Check actor task name failed. expected={expected_task_name}, \
+actual={task_name}"
+
+    # for a threaded actor task
+    @ray.remote
+    class ThreadedActor:
+        def get_task_name_for_threaded_actor_task(self):
+            return ray.get_runtime_context().get_task_name()
+
+    expected_task_name = "ThreadedActor.get_task_name_for_threaded_actor_task"
+    threaded_actor = ThreadedActor.options(max_concurrency=2).remote()
+    task_name = ray.get(threaded_actor.get_task_name_for_threaded_actor_task.remote())
+    assert (
+        task_name == expected_task_name
+    ), f"Check actor task name failed. expected={expected_task_name}, \
+actual={task_name}"
+
+    # for a async actor task
+    @ray.remote
+    class AsyncActor:
+        async def get_task_name_for_async_actor_task(self):
+            return ray.get_runtime_context().get_task_name()
+
+    expected_task_name = "AsyncActor.get_task_name_for_async_actor_task"
+    async_actor = AsyncActor.remote()
+    task_name = ray.get(async_actor.get_task_name_for_async_actor_task.remote())
+    assert (
+        task_name == expected_task_name
+    ), f"Check actor task name failed. expected={expected_task_name}, \
+actual={task_name}"
+
+
+def test_get_task_function_name(shutdown_only):
+    ray.init()
+
+    # for a normal task
+    @ray.remote
+    def get_task_function_name_for_normal_task():
+        return ray.get_runtime_context().get_task_function_name()
+
+    expected_task_function_name = __name__ + ".get_task_function_name_for_normal_task"
+    task_function_name = ray.get(get_task_function_name_for_normal_task.remote())
+    assert (
+        task_function_name == expected_task_function_name
+    ), f"Check normal task function failed. expected={expected_task_function_name}, \
+actual={task_function_name}"
+
+    # for an actor task
+    @ray.remote
+    class Actor:
+        def get_task_function_name_for_actor_task(self):
+            return ray.get_runtime_context().get_task_function_name()
+
+    expected_task_function_name = (
+        __name__ + ".Actor.get_task_function_name_for_actor_task"
+    )
+    actor = Actor.remote()
+    task_function_name = ray.get(actor.get_task_function_name_for_actor_task.remote())
+    assert (
+        task_function_name == expected_task_function_name
+    ), f"Check actor task function failed. expected={expected_task_function_name}, \
+actual={task_function_name}"
+
+    # for a threaded actor task
+    @ray.remote
+    class ThreadedActor:
+        def get_task_function_name_for_threaded_actor_task(self):
+            return ray.get_runtime_context().get_task_function_name()
+
+    expected_task_function_name = (
+        __name__ + ".ThreadedActor.get_task_function_name_for_threaded_actor_task"
+    )
+    threaded_actor = ThreadedActor.options(max_concurrency=2).remote()
+    task_function_name = ray.get(
+        threaded_actor.get_task_function_name_for_threaded_actor_task.remote()
+    )
+    assert (
+        task_function_name == expected_task_function_name
+    ), f"Check actor task function failed. expected={expected_task_function_name}, \
+actual={task_function_name}"
+
+    # for a async actor task
+    @ray.remote
+    class AsyncActor:
+        async def get_task_function_name_for_async_actor_task(self):
+            return ray.get_runtime_context().get_task_function_name()
+
+    expected_task_function_name = (
+        __name__
+        + ".test_get_task_function_name.<locals>.AsyncActor.\
+get_task_function_name_for_async_actor_task"
+    )
+    async_actor = AsyncActor.remote()
+    task_function_name = ray.get(
+        async_actor.get_task_function_name_for_async_actor_task.remote()
+    )
+    assert (
+        task_function_name == expected_task_function_name
+    ), f"Check actor task function failed. expected={expected_task_function_name}, \
+actual={task_function_name}"
+
+
+def test_async_actor_task_id(shutdown_only):
+    ray.init()
+
+    @ray.remote
+    class A:
+        async def f(self):
+            task_id = ray.get_runtime_context().get_task_id()
+            return task_id
+
+    a = A.remote()
+    task_id = ray.get(a.f.remote())
+
+    def verify():
+        tasks = list_tasks(filters=[("name", "=", "A.f")])
+        assert len(tasks) == 1
+        assert tasks[0].task_id == task_id
+        return True
+
+    wait_for_condition(verify)
+
+
+def test_get_node_labels(ray_start_cluster_head):
+    cluster = ray_start_cluster_head
+    cluster.add_node(
+        resources={"worker1": 1},
+        num_cpus=1,
+        labels={
+            "accelerator-type": "A100",
+            "region": "us-west4",
+            "market-type": "spot",
+        },
+    )
+    # ray.init(address=cluster.address)
+
+    @ray.remote
+    class Actor:
+        def get_node_id(self):
+            return ray.get_runtime_context().get_node_id()
+
+        def get_node_labels(self):
+            return ray.get_runtime_context().get_node_labels()
+
+    expected_node_labels = {
+        "accelerator-type": "A100",
+        "region": "us-west4",
+        "market-type": "spot",
+    }
+
+    # Check node labels from Actor runtime context
+    a = Actor.options(label_selector={"accelerator-type": "A100"}).remote()
+    node_labels = ray.get(a.get_node_labels.remote())
+    expected_node_labels["ray.io/node_id"] = ray.get(a.get_node_id.remote())
+    assert expected_node_labels == node_labels
+
+    # Check node labels from driver runtime context (none are set except default)
+    driver_labels = ray.get_runtime_context().get_node_labels()
+    assert {"ray.io/node_id": ray.get_runtime_context().get_node_id()} == driver_labels
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

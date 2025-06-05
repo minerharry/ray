@@ -15,8 +15,6 @@ Theoretical minimum time: 100 seconds
 import os
 
 import ray
-from ray import tune
-from ray.tune.execution.cluster_info import _is_ray_cluster
 
 from ray.tune.utils.release_test_util import timed_tune_run
 
@@ -33,17 +31,12 @@ def main():
 
     max_runtime = 130
 
-    if _is_ray_cluster():
-        # Add constant overhead for SSH connection
-        max_runtime = 130
-
     timed_tune_run(
         name="result throughput cluster",
         num_samples=num_samples,
         results_per_second=results_per_second,
         trial_length_s=trial_length_s,
         max_runtime=max_runtime,
-        sync_config=tune.SyncConfig(syncer=None),
     )  # Tweak!
 
 

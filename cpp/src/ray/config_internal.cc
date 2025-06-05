@@ -26,6 +26,14 @@
 ABSL_FLAG(std::string, ray_address, "", "The address of the Ray cluster to connect to.");
 
 /// absl::flags does not provide a IsDefaultValue method, so use a non-empty dummy default
+/// value to support an empty Redis username.
+ABSL_FLAG(std::string,
+          ray_redis_username,
+          "absl::flags dummy default value",
+          "Prevents external clients without the username from connecting to Redis "
+          "if provided.");
+
+/// absl::flags does not provide a IsDefaultValue method, so use a non-empty dummy default
 /// value to support empty redis password.
 ABSL_FLAG(std::string,
           ray_redis_password,
@@ -84,6 +92,12 @@ ABSL_FLAG(int,
           -1,
           "The computed hash of the runtime env for this worker.");
 
+ABSL_FLAG(std::string,
+          ray_job_namespace,
+          "",
+          "The namespace of job. If not set,"
+          " a unique value will be randomly generated.");
+
 using json = nlohmann::json;
 
 namespace ray {
@@ -113,6 +127,9 @@ void ConfigInternal::Init(RayConfig &config, int argc, char **argv) {
   if (!config.code_search_path.empty()) {
     code_search_path = config.code_search_path;
   }
+  if (config.redis_username_) {
+    redis_username = *config.redis_username_;
+  }
   if (config.redis_password_) {
     redis_password = *config.redis_password_;
   }
@@ -132,11 +149,18 @@ void ConfigInternal::Init(RayConfig &config, int argc, char **argv) {
 
     if (!FLAGS_ray_code_search_path.CurrentValue().empty()) {
       // Code search path like this "/path1/xxx.so:/path2".
+      RAY_LOG(DEBUG) << "The code search path is "
+                     << FLAGS_ray_code_search_path.CurrentValue();
       code_search_path = absl::StrSplit(
           FLAGS_ray_code_search_path.CurrentValue(), ':', absl::SkipEmpty());
     }
     if (!FLAGS_ray_address.CurrentValue().empty()) {
       SetBootstrapAddress(FLAGS_ray_address.CurrentValue());
+    }
+    // Don't rewrite `ray_redis_username` when it is not set in the command line.
+    if (FLAGS_ray_redis_username.CurrentValue() !=
+        FLAGS_ray_redis_username.DefaultValue()) {
+      redis_username = FLAGS_ray_redis_username.CurrentValue();
     }
     // Don't rewrite `ray_redis_password` when it is not set in the command line.
     if (FLAGS_ray_redis_password.CurrentValue() !=
@@ -205,8 +229,13 @@ void ConfigInternal::Init(RayConfig &config, int argc, char **argv) {
     }
   }
   if (worker_type == WorkerType::DRIVER) {
-    ray_namespace =
-        config.ray_namespace.empty() ? GenerateUUIDV4() : config.ray_namespace;
+    ray_namespace = config.ray_namespace;
+    if (!FLAGS_ray_job_namespace.CurrentValue().empty()) {
+      ray_namespace = FLAGS_ray_job_namespace.CurrentValue();
+    }
+    if (ray_namespace.empty()) {
+      ray_namespace = GenerateUUIDV4();
+    }
   }
 
   auto job_config_json_string = std::getenv("RAY_JOB_CONFIG_JSON_ENV_VAR");

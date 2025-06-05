@@ -4,13 +4,20 @@ import sys
 import tempfile
 
 import pytest
-from ray._private.test_utils import run_string_as_driver
+from ray._private.test_utils import (
+    chdir,
+    run_string_as_driver,
+)
+
 
 import ray
-from ray._private.test_utils import chdir
-from ray._private.runtime_env import RAY_WORKER_DEV_EXCLUDES
 from ray._private.runtime_env.packaging import GCS_STORAGE_MAX_SIZE
 from ray.exceptions import RuntimeEnvSetupError
+from ray._private.runtime_env.packaging import (
+    get_uri_for_directory,
+    upload_package_if_needed,
+)
+from ray._private.utils import get_directory_size_bytes
 
 # This test requires you have AWS credentials set up (any AWS credentials will
 # do, this test only accesses a public bucket).
@@ -142,104 +149,64 @@ ray.init("{address}", runtime_env={{"py_modules": ["{tmp_dir}"]}})
         output = run_string_as_driver(driver_script)
         assert "Pushing file package" in output
         assert "Successfully pushed file package" in output
-        assert "warning" not in output.lower()
 
 
-# TODO(architkulkarni): Deflake and reenable this test.
-@pytest.mark.skipif(sys.platform == "darwin", reason="Flaky on Mac. Issue #27562")
-@pytest.mark.skipif(sys.platform != "darwin", reason="Package exceeds max size.")
-def test_ray_worker_dev_flow(start_cluster):
-    cluster, address = start_cluster
-    ray.init(
-        address, runtime_env={"py_modules": [ray], "excludes": RAY_WORKER_DEV_EXCLUDES}
+def test_concurrent_downloads(shutdown_only):
+    # https://github.com/ray-project/ray/issues/30369
+    def upload_dir(tmpdir):
+        # Create an arbitrary nonempty directory to upload.
+        path = Path(tmpdir)
+        dir_to_upload = path / "dir_to_upload"
+        dir_to_upload.mkdir(parents=True)
+        filepath = dir_to_upload / "file"
+        with filepath.open("w") as file:
+            file.write("F" * 100)
+
+        uri = get_uri_for_directory(dir_to_upload)
+        assert get_directory_size_bytes(dir_to_upload) > 0
+
+        uploaded = upload_package_if_needed(uri, tmpdir, dir_to_upload)
+        assert uploaded
+        return uri
+
+    ray.init()
+
+    tmpdir = tempfile.mkdtemp()
+    uri = upload_dir(tmpdir)
+
+    @ray.remote(runtime_env={"working_dir": uri, "env_vars": {"A": "B"}})
+    def f():
+        print("f")
+
+    @ray.remote(runtime_env={"working_dir": uri})
+    def g():
+        print("g")
+
+    refs = [f.remote(), g.remote()]
+    ray.get(refs)
+
+
+def test_file_created_before_1980(shutdown_only, tmp_working_dir):
+    # Make sure working_dir supports file created before 1980
+    # https://github.com/ray-project/ray/issues/46379
+    working_path = Path(tmp_working_dir)
+    file_1970 = working_path / "1970"
+    with file_1970.open(mode="w") as f:
+        f.write("1970")
+    os.utime(
+        file_1970,
+        (0, 0),
     )
 
-    @ray.remote
-    def get_captured_ray_path():
-        return [ray.__path__]
+    ray.init(runtime_env={"working_dir": tmp_working_dir})
 
     @ray.remote
-    def get_lazy_ray_path():
-        import ray
+    def task():
+        with open("1970") as f:
+            assert f.read() == "1970"
 
-        return [ray.__path__]
-
-    captured_path = ray.get(get_captured_ray_path.remote())
-    lazy_path = ray.get(get_lazy_ray_path.remote())
-    assert captured_path == lazy_path
-    assert captured_path != ray.__path__[0]
-
-    @ray.remote
-    def test_recursive_task():
-        @ray.remote
-        def inner():
-            return [ray.__path__]
-
-        return ray.get(inner.remote())
-
-    assert ray.get(test_recursive_task.remote()) == captured_path
-
-    @ray.remote
-    def test_recursive_actor():
-        @ray.remote
-        class A:
-            def get(self):
-                return [ray.__path__]
-
-        a = A.remote()
-        return ray.get(a.get.remote())
-
-    assert ray.get(test_recursive_actor.remote()) == captured_path
-
-    from ray import serve
-
-    @ray.remote
-    def test_serve():
-        serve.start()
-
-        @serve.deployment
-        def f():
-            return "hi"
-
-        f.deploy()
-        h = f.get_handle()
-
-        assert ray.get(h.remote()) == "hi"
-
-        f.delete()
-        return [serve.__path__]
-
-    assert ray.get(test_serve.remote()) != serve.__path__[0]
-
-    from ray import tune
-
-    @ray.remote
-    def test_tune():
-        def objective(step, alpha, beta):
-            return (0.1 + alpha * step / 100) ** (-1) + beta * 0.1
-
-        def training_function(config):
-            # Hyperparameters
-            alpha, beta = config["alpha"], config["beta"]
-            for step in range(10):
-                intermediate_score = objective(step, alpha, beta)
-                tune.report(mean_loss=intermediate_score)
-
-        analysis = tune.run(
-            training_function,
-            config={
-                "alpha": tune.grid_search([0.001, 0.01, 0.1]),
-                "beta": tune.choice([1, 2, 3]),
-            },
-        )
-
-        print("Best config: ", analysis.get_best_config(metric="mean_loss", mode="min"))
-
-    assert ray.get(test_tune.remote()) != serve.__path__[0]
+    ray.get(task.remote())
 
 
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -2,31 +2,41 @@ import os
 import sys
 import time
 
-import numpy as np
 import pytest
+import numpy as np
 
 import ray
 import ray._private.ray_constants as ray_constants
 from ray._private.internal_api import memory_summary
-from ray._private.test_utils import Semaphore, SignalActor, wait_for_condition
+from ray._common.test_utils import Semaphore, SignalActor
+from ray._private.test_utils import wait_for_condition
+import ray.exceptions
+from ray.util.state import list_tasks
 
 # Task status.
 WAITING_FOR_DEPENDENCIES = "PENDING_ARGS_AVAIL"
-SCHEDULED = "PENDING_NODE_ASSIGNMENT"
 FINISHED = "FINISHED"
 WAITING_FOR_EXECUTION = "SUBMITTED_TO_WORKER"
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
-@pytest.mark.parametrize("reconstruction_enabled", [False, True])
-def test_nondeterministic_output(ray_start_cluster, reconstruction_enabled):
+@pytest.fixture
+def config(request):
     config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "max_direct_call_object_size": 100,
-        "task_retry_delay_ms": 100,
+        "health_check_initial_delay_ms": 5000,
+        "health_check_period_ms": 100,
+        "health_check_failure_threshold": 20,
         "object_timeout_milliseconds": 200,
     }
+    yield config
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
+@pytest.mark.parametrize("reconstruction_enabled", [False, True])
+def test_nondeterministic_output(config, ray_start_cluster, reconstruction_enabled):
+    config["max_direct_call_object_size"] = 100
+    config["task_retry_delay_ms"] = 100
+    config["object_timeout_milliseconds"] = 200
+
     cluster = ray_start_cluster
     # Head node with no resources.
     cluster.add_node(
@@ -64,15 +74,12 @@ def test_nondeterministic_output(ray_start_cluster, reconstruction_enabled):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows.")
-def test_reconstruction_hangs(ray_start_cluster):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "max_direct_call_object_size": 100,
-        "task_retry_delay_ms": 100,
-        "object_timeout_milliseconds": 200,
-        "fetch_warn_timeout_milliseconds": 1000,
-    }
+def test_reconstruction_hangs(config, ray_start_cluster):
+    config["max_direct_call_object_size"] = 100
+    config["task_retry_delay_ms"] = 100
+    config["object_timeout_milliseconds"] = 200
+    config["fetch_warn_timeout_milliseconds"] = 1000
+
     cluster = ray_start_cluster
     # Head node with no resources.
     cluster.add_node(
@@ -107,13 +114,8 @@ def test_reconstruction_hangs(ray_start_cluster):
         ray.get(x)
 
 
-def test_lineage_evicted(ray_start_cluster):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "object_timeout_milliseconds": 200,
-        "max_lineage_bytes": 10_000,
-    }
+def test_lineage_evicted(config, ray_start_cluster):
+    config["max_lineage_bytes"] = 10_000
 
     cluster = ray_start_cluster
     # Head node with no resources.
@@ -163,12 +165,7 @@ def test_lineage_evicted(ray_start_cluster):
 
 
 @pytest.mark.parametrize("reconstruction_enabled", [False, True])
-def test_multiple_returns(ray_start_cluster, reconstruction_enabled):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "object_timeout_milliseconds": 200,
-    }
+def test_multiple_returns(config, ray_start_cluster, reconstruction_enabled):
     # Workaround to reset the config to the default value.
     if not reconstruction_enabled:
         config["lineage_pinning_enabled"] = False
@@ -215,13 +212,8 @@ def test_multiple_returns(ray_start_cluster, reconstruction_enabled):
 
 
 @pytest.mark.parametrize("reconstruction_enabled", [False, True])
-def test_nested(ray_start_cluster, reconstruction_enabled):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "object_timeout_milliseconds": 200,
-        "fetch_fail_timeout_milliseconds": 10_000,
-    }
+def test_nested(config, ray_start_cluster, reconstruction_enabled):
+    config["fetch_fail_timeout_milliseconds"] = 10_000
     # Workaround to reset the config to the default value.
     if not reconstruction_enabled:
         config["lineage_pinning_enabled"] = False
@@ -283,12 +275,7 @@ def test_nested(ray_start_cluster, reconstruction_enabled):
 
 
 @pytest.mark.parametrize("reconstruction_enabled", [False, True])
-def test_spilled(ray_start_cluster, reconstruction_enabled):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "object_timeout_milliseconds": 200,
-    }
+def test_spilled(config, ray_start_cluster, reconstruction_enabled):
     # Workaround to reset the config to the default value.
     if not reconstruction_enabled:
         config["lineage_pinning_enabled"] = False
@@ -336,13 +323,7 @@ def test_spilled(ray_start_cluster, reconstruction_enabled):
             ray.get(obj, timeout=60)
 
 
-def test_memory_util(ray_start_cluster):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "object_timeout_milliseconds": 200,
-    }
-
+def test_memory_util(config, ray_start_cluster):
     cluster = ray_start_cluster
     # Head node with no resources.
     cluster.add_node(
@@ -374,17 +355,23 @@ def test_memory_util(ray_start_cluster):
         print(info)
         info = info.split("\n")
         reconstructing_waiting = [
-            line
-            for line in info
-            if "Attempt #2" in line and WAITING_FOR_DEPENDENCIES in line
+            fields
+            for fields in [[part.strip() for part in line.split("|")] for line in info]
+            if len(fields) == 9
+            and fields[4] == WAITING_FOR_DEPENDENCIES
+            and fields[5] == "2"
         ]
         reconstructing_scheduled = [
-            line
-            for line in info
-            if "Attempt #2" in line and WAITING_FOR_EXECUTION in line
+            fields
+            for fields in [[part.strip() for part in line.split("|")] for line in info]
+            if len(fields) == 9
+            and fields[4] == WAITING_FOR_EXECUTION
+            and fields[5] == "2"
         ]
         reconstructing_finished = [
-            line for line in info if "Attempt #2" in line and FINISHED in line
+            fields
+            for fields in [[part.strip() for part in line.split("|")] for line in info]
+            if len(fields) == 9 and fields[4] == FINISHED and fields[5] == "2"
         ]
         return (
             len(reconstructing_waiting),
@@ -477,12 +464,7 @@ def test_override_max_retries(ray_start_cluster, override_max_retries):
 
 
 @pytest.mark.parametrize("reconstruction_enabled", [False, True])
-def test_reconstruct_freed_object(ray_start_cluster, reconstruction_enabled):
-    config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
-        "object_timeout_milliseconds": 200,
-    }
+def test_reconstruct_freed_object(config, ray_start_cluster, reconstruction_enabled):
     # Workaround to reset the config to the default value.
     if not reconstruction_enabled:
         config["lineage_pinning_enabled"] = False
@@ -524,10 +506,104 @@ def test_reconstruct_freed_object(ray_start_cluster, reconstruction_enabled):
             ray.get(obj)
 
 
-if __name__ == "__main__":
-    import pytest
+def test_object_reconstruction_dead_actor(config, ray_start_cluster):
+    # Test to make sure that if object reconstruction fails
+    # due to dead actor, pending_creation is set back to false.
+    # https://github.com/ray-project/ray/issues/47606
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=0, _system_config=config)
+    ray.init(address=cluster.address)
+    node1 = cluster.add_node(resources={"node1": 1})
+    node2 = cluster.add_node(resources={"node2": 1})
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    @ray.remote(max_restarts=0, max_task_retries=-1, resources={"node1": 0.1})
+    class Worker:
+        def func_in(self):
+            return np.random.rand(1024000)
+
+    @ray.remote(max_retries=-1, resources={"node2": 0.1})
+    def func_out(data):
+        return np.random.rand(1024000)
+
+    worker = Worker.remote()
+
+    ref_in = worker.func_in.remote()
+    ref_out = func_out.remote(ref_in)
+
+    ray.wait([ref_in, ref_out], num_returns=2, timeout=None, fetch_local=False)
+
+    def func_out_resubmitted():
+        tasks = list_tasks(filters=[("name", "=", "func_out")])
+        assert len(tasks) == 2
+        assert (
+            tasks[0]["state"] == "PENDING_NODE_ASSIGNMENT"
+            or tasks[1]["state"] == "PENDING_NODE_ASSIGNMENT"
+        )
+        return True
+
+    cluster.remove_node(node2, allow_graceful=False)
+    # ref_out will reconstruct, wait for the lease request to reach raylet.
+    wait_for_condition(func_out_resubmitted)
+
+    cluster.remove_node(node1, allow_graceful=False)
+    # ref_in is lost and the reconstruction will
+    # fail with ActorDiedError
+
+    node1 = cluster.add_node(resources={"node1": 1})
+    node2 = cluster.add_node(resources={"node2": 1})
+
+    with pytest.raises(ray.exceptions.RayTaskError) as exc_info:
+        ray.get(ref_out)
+    assert "input arguments for this task could not be computed" in str(exc_info.value)
+
+
+def test_object_reconstruction_pending_creation(config, ray_start_cluster):
+    # Test to make sure that an object being reconstructured
+    # has pending_creation set to true.
+    config["fetch_fail_timeout_milliseconds"] = (
+        5000 if sys.platform == "linux" else 9000
+    )
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=0, resources={"head": 1}, _system_config=config)
+    ray.init(address=cluster.address)
+
+    @ray.remote(num_cpus=0, resources={"head": 0.1})
+    class Counter:
+        def __init__(self):
+            self.count = 0
+
+        def inc(self):
+            self.count = self.count + 1
+            return self.count
+
+    counter = Counter.remote()
+
+    @ray.remote(num_cpus=1, max_retries=-1)
+    def generator(counter):
+        if ray.get(counter.inc.remote()) == 1:
+            # first attempt
+            yield np.zeros(10**6, dtype=np.uint8)
+            time.sleep(10000000)
+            yield np.zeros(10**6, dtype=np.uint8)
+        else:
+            time.sleep(10000000)
+            yield np.zeros(10**6, dtype=np.uint8)
+            time.sleep(10000000)
+            yield np.zeros(10**6, dtype=np.uint8)
+
+    worker = cluster.add_node(num_cpus=8)
+    gen = generator.remote(counter)
+    obj = next(gen)
+
+    cluster.remove_node(worker, allow_graceful=False)
+    # After removing the node, the generator task will be retried
+    # and the obj will be reconstructured and has pending_creation set to true.
+    cluster.add_node(num_cpus=8)
+
+    # This should raise GetTimeoutError instead of ObjectFetchTimedOutError
+    with pytest.raises(ray.exceptions.GetTimeoutError):
+        ray.get(obj, timeout=10)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -26,15 +26,13 @@ kind: RayCluster
 metadata:
   name: raycluster-complete
 spec:
-  rayVersion: "2.0.0"
+  rayVersion: "2.3.0"
   enableInTreeAutoscaling: true
   autoscalerOptions:
      ...
   headGroupSpec:
     serviceType: ClusterIP # Options are ClusterIP, NodePort, and LoadBalancer
-    enableIngress: false # Optional
     rayStartParams:
-      block: true
       dashboard-host: "0.0.0.0"
       ...
     template: # Pod template
@@ -42,7 +40,7 @@ spec:
         spec: # Pod spec
             containers:
             - name: ray-head
-              image: rayproject/ray-ml:2.0.0
+              image: rayproject/ray-ml:2.3.0
               resources:
                 limits:
                   cpu: 14
@@ -50,11 +48,6 @@ spec:
                 requests:
                   cpu: 14
                   memory: 54Gi
-              # Keep this preStop hook in each Ray container config.
-              lifecycle:
-                preStop:
-                  exec:
-                    command: ["/bin/sh","-c","ray stop"]
               ports: # Optional service port overrides
               - containerPort: 6379
                 name: gcs
@@ -74,11 +67,6 @@ spec:
         ...
     template: # Pod template
       spec:
-        # Keep this initContainer in each workerGroup template.
-        initContainers:
-        - name: init-myservice
-          image: busybox:1.28
-          command: ['sh', '-c', "until nslookup $RAY_IP.$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace).svc.cluster.local; do echo waiting for myservice; sleep 2; done"]
         ...
   # Another workerGroup
   - groupName: medium-group
@@ -133,49 +121,40 @@ Here are some of the subfields of the pod `template` to pay attention to:
 #### containers
 A Ray pod template specifies at minimum one container, namely the container
 that runs the Ray processes. A Ray pod template may also specify additional sidecar
-containers, for purposes such as {ref}`log processing <kuberay-logging>`. However, the KubeRay operator assumes that
+containers, for purposes such as {ref}`log processing <persist-kuberay-custom-resource-logs>`. However, the KubeRay operator assumes that
 the first container in the containers list is the main Ray container.
 Therefore, make sure to specify any sidecar containers
 **after** the main Ray container. In other words, the Ray container should be the **first**
 in the `containers` list.
 
 #### resources
-It’s important to specify container CPU and memory requests and limits for
-each group spec. For GPU workloads, you may also wish to specify GPU
-limits. For example, set `nvidia.com/gpu:2` if using an Nvidia GPU device plugin
+
+It's important to specify container CPU and memory resources for each group spec. Since CPU is a
+[compressible resource], you may want to set only CPU requests and not limits to guarantee your
+workloads a minimum amount of CPU but [allow them to take advantage of unused CPU and not get
+throttled][1] if they use more than their requested CPU.
+
+For GPU workloads, you may also wish to specify GPU
+limits. For example, set `nvidia.com/gpu: 2` if using an NVIDIA GPU device plugin
 and you wish to specify a pod with access to 2 GPUs.
 See {ref}`this guide <kuberay-gpu>` for more details on GPU support.
 
+KubeRay automatically configures Ray to use the CPU, memory, and GPU **limits** in the Ray container
+config. These values are the logical resource capacities of Ray pods in the head or
+worker group. As of KubeRay 1.3.0, KubeRay uses the CPU request if the limit is absent.
+KubeRay rounds up CPU quantities to the nearest integer. You can override these resource capacities
+with {ref}`rayStartParams`. KubeRay ignores memory and GPU **requests**. So
+**set memory and GPU resource requests equal to their limits** when possible
+
 It's ideal to size each Ray pod to take up the
-entire Kubernetes node on which it is scheduled. In other words, it’s
+entire Kubernetes node. In other words, it's
 best to run one large Ray pod per Kubernetes node.
-In general, it is more efficient to use a few large Ray pods than many small ones.
+In general, it's more efficient to use a few large Ray pods than many small ones.
 The pattern of fewer large Ray pods has the following advantages:
+
 - more efficient use of each Ray pod's shared memory object store
 - reduced communication overhead between Ray pods
 - reduced redundancy of per-pod Ray control structures such as Raylets
-
-The CPU, GPU, and memory **limits** specified in the Ray container config
-will be automatically advertised to Ray. These values will be used as
-the logical resource capacities of Ray pods in the head or worker group.
-Note that CPU quantities will be rounded up to the nearest integer
-before being relayed to Ray.
-The resource capacities advertised to Ray may be overridden in the {ref}`rayStartParams`.
-
-:::{warning}
-Due to a  [bug](https://github.com/ray-project/kuberay/pull/497) in KubeRay 0.3.0,
-the following piece of configuration is required to advertise the presence of GPUs
-to Ray.
-```yaml
-rayStartParams:
-    num-gpus: "1"
-```
-Future releases of KubeRay will not require this. (GPU quantities will be correctly auto-detected
-from container limits.)
-:::
-
-On the other hand CPU, GPU, and memory **requests** will be ignored by Ray.
-For this reason, it is best when possible to **set resource requests equal to resource limits**.
 
 #### nodeSelector and tolerations
 You can control the scheduling of worker groups' Ray pods by setting the `nodeSelector` and
@@ -187,19 +166,24 @@ for more about Pod-to-Node assignment.
 #### image
 The Ray container images specified in the `RayCluster` CR should carry
 the same Ray version as the CR's `spec.rayVersion`.
-If you are using a nightly or development Ray image, it is fine to specify Ray's
+If you are using a nightly or development Ray image, you can specify Ray's
 latest release version under `spec.rayVersion`.
 
-Code dependencies for a given Ray task or actor must be installed on each Ray node that
+For Apple M1 or M2 MacBooks, see [Use ARM-based docker images for Apple M1 or M2 MacBooks](docker-image-for-apple-macbooks) to specify the
+correct image.
+
+You must install code dependencies for a given Ray task or actor on each Ray node that
 might run the task or actor.
-To achieve this, it is simplest to use the same Ray image for the Ray head and all worker groups.
+The simplest way to achieve this configuration is to use the same Ray image for the Ray head and all worker groups.
 In any case, do make sure that all Ray images in your CR carry the same Ray version and
 Python version.
 To distribute custom code dependencies across your cluster, you can build a custom container image,
-using one of the [official Ray images](https://hub.docker.com/r/rayproject/ray>) as the base.
+using one of the [official Ray images](https://hub.docker.com/r/rayproject/ray) as the base.
 See {ref}`this guide <docker-images>` to learn more about the official Ray images.
-For dynamic dependency management geared towards iteration and developement,
+For dynamic dependency management geared towards iteration and development,
 you can also use {ref}`Runtime Environments <runtime-environments>`.
+
+For `kuberay-operator` versions 1.1.0 and later, the Ray container image must have `wget` installed in it.
 
 #### metadata.name and metadata.generateName
 The KubeRay operator will ignore the values of `metadata.name` and `metadata.generateName` set by users.
@@ -212,18 +196,12 @@ The ``rayStartParams`` field of each group spec is a string-string map of argume
 container’s `ray start` entrypoint. For the full list of arguments, refer to
 the documentation for {ref}`ray start <ray-start-doc>`. We make special note of the following arguments:
 
-### block
-For most use-cases, this field should be set to "true" for all Ray pod. The container's Ray
-entrypoint will then block forever until a Ray process exits, at which point the container
-will exit. If this field is omitted, `ray start` will start Ray processes in the background and the container
-will subsequently sleep forever until terminated. (Future versions of KubeRay may set
-block to true by default. See [KubeRay issue #368](https://github.com/ray-project/kuberay/issues/368).)
-
 ### dashboard-host
 For most use-cases, this field should be set to "0.0.0.0" for the Ray head pod.
 This is required to expose the Ray dashboard outside the Ray cluster. (Future versions might set
 this parameter by default.)
 
+(kuberay-num-cpus)=
 ### num-cpus
 This optional field tells the Ray scheduler and autoscaler how many CPUs are
 available to the Ray pod. The CPU count can be autodetected from the
@@ -277,6 +255,7 @@ for several services of the Ray head pod, including
 - Ray Dashboard (default port 8265)
 - Ray GCS server (default port 6379)
 - Ray Serve (default port 8000)
+- Ray Prometheus metrics (default port 8080)
 
 The name of the configured Kubernetes Service is the name, `metadata.name`, of the RayCluster
 followed by the suffix <nobr>`head-svc`</nobr>. For the example CR given on this page, the name of
@@ -292,26 +271,9 @@ The Ray Client server can be accessed from a pod in another namespace using
 ```python
 ray.init("ray://raycluster-example-head-svc.default.svc.cluster.local:10001")
 ```
-(This assumes the Ray cluster was deployed into the default Kuberentes namespace.
+(This assumes the Ray cluster was deployed into the default Kubernetes namespace.
 If the Ray cluster is deployed in a non-default namespace, use that namespace in
 place of `default`.)
-
-### ServiceType, Ingresses
-Ray Client and other services can be exposed outside the Kubernetes cluster
-using port-forwarding or an ingress.
-The simplest way to access the Ray head's services is to use port-forwarding.
-
-Other means of exposing the head's services outside the cluster may require using
-a service of type LoadBalancer or NodePort. Set `headGroupSpec.serviceType`
-to the appropriate type for your application.
-
-You may wish to set up an ingress to expose the Ray head's services outside the cluster.
-If you set the optional boolean field `headGroupSpec.enableIngress` to `true`,
-the KubeRay operator will create an ingress for your Ray cluster. See the [KubeRay documentation][IngressDoc]
-for details. However, it is up to you to set up an ingress controller.
-Moreover, the ingress created by the KubeRay operator [might not be compatible][IngressIssue] with your network setup.
-It is valid to omit the `headGroupSpec.enableIngress` field and configure an ingress object yourself.
-
 
 ### Specifying non-default ports.
 If you wish to override the ports exposed by the Ray head service, you may do so by specifying
@@ -339,35 +301,6 @@ rayStartParams:
   ray-client-server-port: "10002"
   ...
 ```
-(kuberay-config-miscellaneous)=
-## Pod and container lifecyle: preStop hooks and initContainers
-There are two pieces of pod configuration that should always be included
-in the RayCluster CR. Future versions of KubeRay may configure these elements automatically.
 
-## initContainer
-It is required for the configuration of each `workerGroupSpec`'s pod template to include
-the following block:
-```yaml
-initContainers:
-- name: init-myservice
-  image: busybox:1.28
-  command: ['sh', '-c', "until nslookup $RAY_IP.$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace).svc.cluster.local; do echo waiting for myservice; sleep 2; done"]
-```
-This instructs the worker pod to wait for creation of the Ray head service. The worker's `ray start`
-command will use this service to connect to the Ray head.
-
-(It is not required to include this init container in the Ray head pod's configuration.)
-
-## preStopHook
-It is recommended for every Ray container's configuration
-to include the following blocking block:
-```yaml
-lifecycle:
-  preStop:
-    exec:
-      command: ["/bin/sh","-c","ray stop"]
-```
-To ensure graceful termination, `ray stop` is executed prior to the Ray pod's termination.
-
-[IngressDoc]: https://ray-project.github.io/kuberay/guidance/ingress/
-[IngressIssue]: https://github.com/ray-project/kuberay/issues/441
+[compressible resource]: https://kubernetes.io/blog/2021/11/26/qos-memory-resources/#:~:text=CPU%20is%20considered%20a%20%22compressible%22%20resource.%20If%20your%20app%20starts%20hitting%20your%20CPU%20limits%2C%20Kubernetes%20starts%20throttling%20your%20container%2C%20giving%20your%20app%20potentially%20worse%20performance.%20However%2C%20it%20won%E2%80%99t%20be%20terminated.%20That%20is%20what%20%22compressible%22%20means
+[1]: https://home.robusta.dev/blog/stop-using-cpu-limits

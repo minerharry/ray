@@ -15,10 +15,13 @@
 #pragma once
 
 #include <list>
+#include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/synchronization/mutex.h"
 #include "ray/util/logging.h"
+#include "ray/util/mutex_protected.h"
 
 /// \class CounterMap
 ///
@@ -34,7 +37,7 @@
 template <typename K>
 class CounterMap {
  public:
-  CounterMap(){};
+  CounterMap() = default;
 
   CounterMap(const CounterMap &other) = delete;
 
@@ -44,7 +47,7 @@ class CounterMap {
   /// Changes are buffered until `FlushOnChangeCallbacks()` is called to enable
   /// batching for performance reasons.
   void SetOnChangeCallback(std::function<void(const K &)> on_change) {
-    on_change_ = on_change;
+    on_change_ = std::move(on_change);
   }
 
   /// Flush any pending on change callbacks.
@@ -59,6 +62,14 @@ class CounterMap {
 
   /// Increment the specified key by `val`, default to 1.
   void Increment(const K &key, int64_t val = 1) {
+    // If value is 0, it is no-op and only registers the callback.
+    if (val == 0) {
+      if (on_change_ != nullptr) {
+        pending_changes_.insert(key);
+      }
+      return;
+    }
+
     counters_[key] += val;
     total_ += val;
     if (on_change_ != nullptr) {
@@ -70,6 +81,13 @@ class CounterMap {
   /// to zero, the entry for the key is erased from the counter. It is not allowed for the
   /// count to be decremented below zero.
   void Decrement(const K &key, int64_t val = 1) {
+    // If value is 0, it is no-op and only registers the callback.
+    if (val == 0) {
+      if (on_change_ != nullptr) {
+        pending_changes_.insert(key);
+      }
+      return;
+    }
     auto it = counters_.find(key);
     RAY_CHECK(it != counters_.end());
     it->second -= val;
@@ -118,9 +136,77 @@ class CounterMap {
     }
   }
 
+  /// Return a snapshot of all the counters.
+  absl::flat_hash_map<K, int64_t> GetAll() const { return counters_; }
+
  private:
   absl::flat_hash_map<K, int64_t> counters_;
   absl::flat_hash_set<K> pending_changes_;
   std::function<void(const K &)> on_change_;
   size_t total_ = 0;
+};
+
+/// \class A thread safe version of CounterMap with mutex guarded all methods.
+template <typename K>
+class CounterMapThreadSafe {
+ public:
+  CounterMapThreadSafe() = default;
+
+  void SetOnChangeCallback(std::function<void(const K &)> on_change) {
+    auto write_locked = counter_map_.LockForWrite();
+    write_locked.Get().SetOnChangeCallback(std::move(on_change));
+  }
+
+  void FlushOnChangeCallbacks() {
+    auto write_locked = counter_map_.LockForWrite();
+    write_locked.Get().FlushOnChangeCallbacks();
+  }
+
+  void Increment(const K &key, int64_t val = 1) {
+    auto write_locked = counter_map_.LockForWrite();
+    write_locked.Get().Increment(key, val);
+  }
+
+  void Decrement(const K &key, int64_t val = 1) {
+    auto write_locked = counter_map_.LockForWrite();
+    write_locked.Get().Decrement(key, val);
+  }
+
+  int64_t Get(const K &key) const {
+    const auto read_locked = counter_map_.LockForRead();
+    return read_locked.Get().Get(key);
+  }
+
+  void Swap(const K &old_key, const K &new_key, int64_t val = 1) {
+    auto write_locked = counter_map_.LockForWrite();
+    write_locked.Get().Swap(old_key, new_key, val);
+  }
+
+  size_t Size() const {
+    const auto read_locked = counter_map_.LockForRead();
+    return read_locked.Get().Size();
+  }
+
+  size_t Total() const {
+    const auto read_locked = counter_map_.LockForRead();
+    return read_locked.Get().Total();
+  }
+
+  size_t NumPendingCallbacks() const {
+    const auto read_locked = counter_map_.LockForRead();
+    return read_locked.Get().NumPendingCallbacks();
+  }
+
+  void ForEachEntry(std::function<void(const K &, int64_t)> callback) const {
+    const auto read_locked = counter_map_.LockForRead();
+    read_locked.Get().ForEachEntry(std::move(callback));
+  }
+
+  absl::flat_hash_map<K, int64_t> GetAll() const {
+    const auto read_locked = counter_map_.LockForRead();
+    return read_locked.Get().GetAll();
+  }
+
+ private:
+  ray::MutexProtected<CounterMap<K>> counter_map_;
 };

@@ -4,12 +4,12 @@ It also checks that it is usable with a separate scheduler.
 
 Requires the Nevergrad library to be installed (`pip install nevergrad`).
 """
+
 import time
 
-from ray import air, tune
-from ray.air import session
-from ray.tune.search import ConcurrencyLimiter
+from ray import tune
 from ray.tune.schedulers import AsyncHyperBandScheduler
+from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.nevergrad import NevergradSearch
 
 
@@ -25,31 +25,20 @@ def easy_objective(config):
         # Iterative training function - can be any arbitrary training procedure
         intermediate_score = evaluation_fn(step, width, height)
         # Feed the score back back to Tune.
-        session.report({"iterations": step, "mean_loss": intermediate_score})
+        tune.report({"iterations": step, "mean_loss": intermediate_score})
         time.sleep(0.1)
 
 
 if __name__ == "__main__":
     import argparse
+
     import nevergrad as ng
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--smoke-test", action="store_true", help="Finish quickly for testing"
     )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
     args, _ = parser.parse_known_args()
-
-    if args.server_address:
-        import ray
-
-        ray.init(f"ray://{args.server_address}")
 
     # Optional: Pass the parameter space yourself
     # space = ng.p.Dict(
@@ -75,7 +64,7 @@ if __name__ == "__main__":
             scheduler=scheduler,
             num_samples=10 if args.smoke_test else 50,
         ),
-        run_config=air.RunConfig(name="nevergrad"),
+        run_config=tune.RunConfig(name="nevergrad"),
         param_space={
             "steps": 100,
             "width": tune.uniform(0, 20),

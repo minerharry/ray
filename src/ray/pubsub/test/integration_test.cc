@@ -14,6 +14,8 @@
 
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
@@ -50,8 +52,6 @@ class SubscriberServiceImpl final : public rpc::SubscriberService::CallbackServi
                                               std::function<void()> failure_cb) {
                                       // Long polling should always succeed.
                                       RAY_CHECK_OK(status);
-                                      RAY_CHECK(success_cb == nullptr);
-                                      RAY_CHECK(failure_cb == nullptr);
                                       reactor->Finish(grpc::Status::OK);
                                     });
     return reactor;
@@ -111,7 +111,7 @@ class CallbackSubscriberClient final : public pubsub::SubscriberClientInterface 
     auto *reply = new rpc::PubsubLongPollingReply;
     stub_->async()->PubsubLongPolling(
         context, &request, reply, [callback, context, reply](grpc::Status s) {
-          callback(GrpcStatusToRayStatus(s), *reply);
+          callback(GrpcStatusToRayStatus(s), std::move(*reply));
           delete reply;
           delete context;
         });
@@ -124,7 +124,7 @@ class CallbackSubscriberClient final : public pubsub::SubscriberClientInterface 
     auto *reply = new rpc::PubsubCommandBatchReply;
     stub_->async()->PubsubCommandBatch(
         context, &request, reply, [callback, context, reply](grpc::Status s) {
-          callback(GrpcStatusToRayStatus(s), *reply);
+          callback(GrpcStatusToRayStatus(s), std::move(*reply));
           delete reply;
           delete context;
         });
@@ -143,14 +143,16 @@ class IntegrationTest : public ::testing::Test {
     address_proto_.set_port(7928);
     address_proto_.set_worker_id(UniqueID::FromRandom().Binary());
     io_service_.Run();
-    periodic_runner_ = std::make_unique<PeriodicalRunner>(*io_service_.Get());
+    periodical_runner_ = PeriodicalRunner::Create(*io_service_.Get());
 
     SetupServer();
   }
 
   ~IntegrationTest() {
+    RAY_LOG(INFO) << "Shutting down server.";
     // Stop callback runners.
     io_service_.Stop();
+    RAY_LOG(INFO) << "Shutting down server1.";
     // Assume no new subscriber is connected after the unregisteration above. Otherwise
     // shutdown would hang below.
     server_->Shutdown();
@@ -166,7 +168,7 @@ class IntegrationTest : public ::testing::Test {
         std::vector<rpc::ChannelType>{
             rpc::ChannelType::GCS_ACTOR_CHANNEL,
         },
-        /*periodic_runner=*/periodic_runner_.get(),
+        /*periodical_runner=*/*periodical_runner_,
         /*get_time_ms=*/[]() -> double { return absl::ToUnixMicros(absl::Now()); },
         /*subscriber_timeout_ms=*/absl::ToInt64Microseconds(absl::Seconds(30)),
         /*batch_size=*/100);
@@ -178,6 +180,8 @@ class IntegrationTest : public ::testing::Test {
     builder.RegisterService(subscriber_service_.get());
     server_ = builder.BuildAndStart();
   }
+
+  void RestartServer() { SetupServer(); }
 
   std::unique_ptr<Subscriber> CreateSubscriber() {
     return std::make_unique<Subscriber>(
@@ -198,7 +202,7 @@ class IntegrationTest : public ::testing::Test {
   std::string address_;
   rpc::Address address_proto_;
   IOServicePool io_service_ = IOServicePool(3);
-  std::unique_ptr<PeriodicalRunner> periodic_runner_;
+  std::shared_ptr<PeriodicalRunner> periodical_runner_;
   std::unique_ptr<SubscriberServiceImpl> subscriber_service_;
   std::unique_ptr<grpc::Server> server_;
 };
@@ -287,19 +291,17 @@ TEST_F(IntegrationTest, SubscribersToOneIDAndAllIDs) {
       rpc::ChannelType::GCS_ACTOR_CHANNEL, address_proto_, subscribed_actor);
   subscriber_2->UnsubscribeChannel(rpc::ChannelType::GCS_ACTOR_CHANNEL, address_proto_);
 
-  // Flush all the inflight long polling.
-  subscriber_service_->GetPublisher().UnregisterAll();
-
   // Waiting here is necessary to avoid invalid memory access during shutdown.
   // TODO(mwtian): cancel inflight polls during subscriber shutdown, and remove the
   // logic below.
   int wait_count = 0;
   while (!(subscriber_1->CheckNoLeaks() && subscriber_2->CheckNoLeaks())) {
-    ASSERT_LT(wait_count, 15) << "Subscribers still have inflight operations after 15s";
+    // Flush all the inflight long polling.
+    subscriber_service_->GetPublisher().UnregisterAll();
+    ASSERT_LT(wait_count, 60) << "Subscribers still have inflight operations after 60s";
     ++wait_count;
     absl::SleepFor(absl::Seconds(1));
   }
 }
-
 }  // namespace pubsub
 }  // namespace ray

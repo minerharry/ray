@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 
-import numpy as np
 import argparse
 import random
 
+import numpy as np
+
 import ray
-from ray import air, tune
+from ray import tune
 from ray.tune.schedulers import PopulationBasedTraining
 
 
@@ -86,26 +87,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smoke-test", action="store_true", help="Finish quickly for testing"
     )
-    parser.add_argument(
-        "--cluster", action="store_true", help="Distribute tuning on a cluster"
-    )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
     args, _ = parser.parse_known_args()
 
-    if args.server_address:
-        ray.init(f"ray://{args.server_address}")
-    elif args.cluster:
-        ray.init(address="auto")
-    elif args.smoke_test:
+    if args.smoke_test:
         ray.init(num_cpus=2)  # force pausing to happen for test
-    else:
-        ray.init()
 
     perturbation_interval = 5
     pbt = PopulationBasedTraining(
@@ -121,7 +106,7 @@ if __name__ == "__main__":
 
     tuner = tune.Tuner(
         PBTBenchmarkExample,
-        run_config=air.RunConfig(
+        run_config=tune.RunConfig(
             name="pbt_class_api_example",
             # Stop when done = True or at some # of train steps (whichever comes first)
             stop={
@@ -136,10 +121,10 @@ if __name__ == "__main__":
             # This is to ensure that the lastest checkpoints are being used by PBT
             # when trials decide to exploit. If checkpointing and perturbing are not
             # aligned, then PBT may use a stale checkpoint to resume from.
-            checkpoint_config=air.CheckpointConfig(
+            checkpoint_config=tune.CheckpointConfig(
                 checkpoint_frequency=perturbation_interval,
                 checkpoint_score_attribute="mean_accuracy",
-                num_to_keep=2,
+                num_to_keep=4,
             ),
         ),
         tune_config=tune.TuneConfig(

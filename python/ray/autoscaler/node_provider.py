@@ -91,7 +91,7 @@ class NodeProvider:
                 public or private.
 
         Raises:
-            ValueError if not found.
+            ValueError: If not found.
         """
 
         def find_node_id():
@@ -133,14 +133,15 @@ class NodeProvider:
         """
         raise NotImplementedError
 
-    def create_node_with_resources(
+    def create_node_with_resources_and_labels(
         self,
         node_config: Dict[str, Any],
         tags: Dict[str, str],
         count: int,
         resources: Dict[str, float],
+        labels: Dict[str, str],
     ) -> Optional[Dict[str, Any]]:
-        """Create nodes with a given resource config.
+        """Create nodes with a given resource and label config.
 
         This is the method actually called by the autoscaler. Prefer to
         implement this when possible directly, otherwise it delegates to the
@@ -207,18 +208,18 @@ class NodeProvider:
         """Returns the CommandRunner class used to perform SSH commands.
 
         Args:
-        log_prefix: stores "NodeUpdater: {}: ".format(<node_id>). Used
-            to print progress in the CommandRunner.
-        node_id: the node ID.
-        auth_config: the authentication configs from the autoscaler
-            yaml file.
-        cluster_name: the name of the cluster.
-        process_runner: the module to use to run the commands
-            in the CommandRunner. E.g., subprocess.
-        use_internal_ip: whether the node_id belongs to an internal ip
-            or external ip.
-        docker_config: If set, the docker information of the docker
-            container that commands should be run on.
+            log_prefix: stores "NodeUpdater: {}: ".format(<node_id>). Used
+                to print progress in the CommandRunner.
+            node_id: the node ID.
+            auth_config: the authentication configs from the autoscaler
+                yaml file.
+            cluster_name: the name of the cluster.
+            process_runner: the module to use to run the commands
+                in the CommandRunner. E.g., subprocess.
+            use_internal_ip: whether the node_id belongs to an internal ip
+                or external ip.
+            docker_config: If set, the docker information of the docker
+                container that commands should be run on.
         """
         common_args = {
             "log_prefix": log_prefix,
@@ -244,3 +245,19 @@ class NodeProvider:
     ) -> Dict[str, Any]:
         """Fills out missing "resources" field for available_node_types."""
         return cluster_config
+
+    def safe_to_scale(self) -> bool:
+        """Optional condition to determine if it's safe to proceed with an autoscaling
+        update. Can be used to wait for convergence of state managed by an external
+        cluster manager.
+
+        Called by the autoscaler immediately after non_terminated_nodes().
+        If False is returned, the autoscaler will abort the update.
+        """
+        return True
+
+    def post_process(self) -> None:
+        """This optional method is executed at the end of
+        StandardAutoscaler._update().
+        """
+        pass

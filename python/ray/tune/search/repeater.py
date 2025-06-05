@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ray.tune.search import Searcher
+from ray.tune.search.searcher import Searcher
 from ray.tune.search.util import _set_search_properties_backwards_compatible
 from ray.util import PublicAPI
 
@@ -184,6 +184,12 @@ class Repeater(Searcher):
 
     def set_state(self, state: Dict):
         self.__dict__.update(state)
+
+    def save(self, checkpoint_path: str):
+        self.searcher.save(checkpoint_path)
+
+    def restore(self, checkpoint_path: str):
+        self.searcher.restore(checkpoint_path)
 
     def set_search_properties(
         self, metric: Optional[str], mode: Optional[str], config: Dict, **spec

@@ -1,12 +1,20 @@
-from typing import Any, Dict, List, Optional
-
-import numpy as np
 import copy
 import logging
 from functools import partial
-import pickle
+from typing import Any, Dict, List, Optional
 
+import numpy as np
+
+# Use cloudpickle instead of pickle to make lambda funcs in HyperOpt pickleable
+from ray import cloudpickle
+from ray.tune.error import TuneError
 from ray.tune.result import DEFAULT_METRIC
+from ray.tune.search import (
+    UNDEFINED_METRIC_MODE,
+    UNDEFINED_SEARCH_SPACE,
+    UNRESOLVED_SEARCH_SPACE,
+    Searcher,
+)
 from ray.tune.search.sample import (
     Categorical,
     Domain,
@@ -16,12 +24,6 @@ from ray.tune.search.sample import (
     Normal,
     Quantized,
     Uniform,
-)
-from ray.tune.search import (
-    UNRESOLVED_SEARCH_SPACE,
-    UNDEFINED_METRIC_MODE,
-    UNDEFINED_SEARCH_SPACE,
-    Searcher,
 )
 from ray.tune.search.variant_generator import assign_value, parse_spec_vars
 from ray.tune.utils import flatten_dict
@@ -35,7 +37,6 @@ except ImportError:
     hpo = None
     Apply = None
 
-from ray.tune.error import TuneError
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ class HyperOptSearch(Searcher):
             for future parameters. Needs to be a list of dicts containing the
             configurations.
         n_initial_points: number of random evaluations of the
-            objective function before starting to aproximate it with
+            objective function before starting to approximate it with
             tree parzen estimators. Defaults to 20.
         random_state_seed: seed for reproducible
             results. Defaults to None.
@@ -433,18 +434,21 @@ class HyperOptSearch(Searcher):
         self.rstate.set_state(state["rstate"])
 
     def save(self, checkpoint_path: str) -> None:
+        save_object = self.__dict__.copy()
+        save_object["__rstate"] = self.rstate.get_state()
         with open(checkpoint_path, "wb") as f:
-            pickle.dump(self.get_state(), f)
+            cloudpickle.dump(save_object, f)
 
     def restore(self, checkpoint_path: str) -> None:
         with open(checkpoint_path, "rb") as f:
-            trials_object = pickle.load(f)
+            save_object = cloudpickle.load(f)
 
-        if isinstance(trials_object, tuple):
-            self._hpopt_trials = trials_object[0]
-            self.rstate.set_state(trials_object[1])
+        if "__rstate" not in save_object:
+            # Backwards compatibility
+            self.set_state(save_object)
         else:
-            self.set_state(trials_object)
+            self.rstate.set_state(save_object.pop("__rstate"))
+            self.__dict__.update(save_object)
 
     @staticmethod
     def convert_search_space(spec: Dict, prefix: str = "") -> Dict:
@@ -517,17 +521,25 @@ class HyperOptSearch(Searcher):
                     return hpo.hp.choice(
                         par,
                         [
-                            HyperOptSearch.convert_search_space(category, prefix=par)
-                            if isinstance(category, dict)
-                            else HyperOptSearch.convert_search_space(
-                                dict(enumerate(category)), prefix=f"{par}/{i}"
+                            (
+                                HyperOptSearch.convert_search_space(
+                                    category, prefix=par
+                                )
+                                if isinstance(category, dict)
+                                else (
+                                    HyperOptSearch.convert_search_space(
+                                        dict(enumerate(category)), prefix=f"{par}/{i}"
+                                    )
+                                    if isinstance(category, list)
+                                    and len(category) > 0
+                                    and isinstance(category[0], Domain)
+                                    else (
+                                        resolve_value(f"{par}/{i}", category)
+                                        if isinstance(category, Domain)
+                                        else category
+                                    )
+                                )
                             )
-                            if isinstance(category, list)
-                            and len(category) > 0
-                            and isinstance(category[0], Domain)
-                            else resolve_value(f"{par}/{i}", category)
-                            if isinstance(category, Domain)
-                            else category
                             for i, category in enumerate(domain.categories)
                         ],
                     )

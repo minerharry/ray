@@ -1,8 +1,10 @@
-from collections import defaultdict
-import pytest
-from typing import Dict
-import numpy as np
 import sys
+from collections import defaultdict
+from typing import Dict
+
+import pytest
+import requests
+import numpy as np
 
 import ray
 from ray._private.test_utils import (
@@ -10,6 +12,7 @@ from ray._private.test_utils import (
     wait_for_condition,
 )
 from ray._private.worker import RayContext
+from ray.dashboard.consts import RAY_DASHBOARD_STATS_UPDATING_INTERVAL
 
 KiB = 1 << 10
 MiB = 1 << 20
@@ -62,13 +65,19 @@ def approx_eq_dict_in(actual: Dict, expected: Dict, e: int) -> bool:
 @pytest.mark.skipif(
     sys.platform == "darwin", reason="Timing out on macos. Not enough time to run."
 )
-def test_all_shared_memory(shutdown_only):
+def test_shared_memory_and_inline_worker_heap(shutdown_only):
     """Test objects allocated in shared memory"""
     import numpy as np
 
     info = ray.init(
         object_store_memory=100 * MiB,
-        _system_config=_SYSTEM_CONFIG,
+        _system_config={
+            **_SYSTEM_CONFIG,
+            **{
+                "max_direct_call_object_size": 10 * MiB,
+                "task_rpc_inlined_bytes_limit": 100 * MiB,
+            },
+        },
     )
 
     # Allocate 80MiB data
@@ -80,27 +89,54 @@ def test_all_shared_memory(shutdown_only):
         "MMAP_SHM": 80 * MiB,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
 
     wait_for_condition(
         # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 1 * KiB),
+        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 2 * KiB),
+        timeout=20,
+        retry_interval_ms=500,
+    )
+
+    # Allocate inlined task returns
+    @ray.remote(num_cpus=0.1)
+    def func():
+        return np.zeros(4 * MiB, dtype=np.uint8)
+
+    tasks_with_inlined_return = [func.remote() for _ in range(5)]
+
+    expected = {
+        "MMAP_SHM": 80 * MiB,
+        "MMAP_DISK": 0,
+        "SPILLED": 0,
+        "WORKER_HEAP": 20 * MiB,
+    }
+
+    returns = ray.get(tasks_with_inlined_return)
+
+    wait_for_condition(
+        # 4 KiB for metadata difference
+        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 4 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
 
     # Free all of them
     del objs_in_use
+    del returns
+    del tasks_with_inlined_return
 
     expected = {
         "MMAP_SHM": 0,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
 
     wait_for_condition(
         # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 1 * KiB),
+        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 2 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
@@ -130,6 +166,7 @@ def test_spilling(object_spilling_config, shutdown_only):
         "MMAP_SHM": 100 * MiB,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
 
     wait_for_condition(
@@ -143,6 +180,7 @@ def test_spilling(object_spilling_config, shutdown_only):
     objs2 = [ray.put(np.zeros(50 * MiB, dtype=np.uint8)) for _ in range(2)]
 
     expected = {
+        "WORKER_HEAP": 0,
         "MMAP_SHM": 100 * MiB,
         "MMAP_DISK": 0,
         "SPILLED": 100 * MiB,
@@ -160,6 +198,7 @@ def test_spilling(object_spilling_config, shutdown_only):
         "MMAP_SHM": 100 * MiB,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
     wait_for_condition(
         # 1KiB for metadata difference
@@ -174,6 +213,7 @@ def test_spilling(object_spilling_config, shutdown_only):
         "MMAP_SHM": 0,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
     wait_for_condition(
         # 1KiB for metadata difference
@@ -181,42 +221,6 @@ def test_spilling(object_spilling_config, shutdown_only):
         timeout=20,
         retry_interval_ms=500,
     )
-
-
-@pytest.mark.skipif(
-    sys.platform == "darwin", reason="Timing out on macos. Not enough time to run."
-)
-@pytest.mark.parametrize("metric_report_interval_ms", [500, 1000, 3000])
-def test_object_metric_report_interval(shutdown_only, metric_report_interval_ms):
-    """Test object store metric on raylet controlled by `metric_report_interval_ms`"""
-    import time
-
-    info = ray.init(
-        object_store_memory=100 * MiB,
-        _system_config={"metrics_report_interval_ms": metric_report_interval_ms},
-    )
-
-    # Put object to make sure metric shows up
-    obj = ray.get(ray.put(np.zeros(20 * MiB, dtype=np.uint8)))
-
-    expected = {
-        "MMAP_SHM": 20 * MiB,
-        "MMAP_DISK": 0,
-        "SPILLED": 0,
-    }
-    start = time.time()
-    wait_for_condition(
-        # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 1 * KiB),
-        timeout=10,
-        retry_interval_ms=100,
-    )
-
-    end = time.time()
-    # Also shouldn't have metrics reported too quickly
-    assert (end - start) * 1000 > metric_report_interval_ms, "Reporting too quickly"
-
-    del obj
 
 
 @pytest.mark.skipif(
@@ -248,11 +252,12 @@ def test_fallback_memory(shutdown_only):
         "MMAP_SHM": expected_in_memory * obj_size_mb * MiB,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
 
     wait_for_condition(
         # 2KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 2 * KiB),
+        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 3 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
@@ -275,11 +280,12 @@ def test_fallback_memory(shutdown_only):
         "MMAP_SHM": expected_in_memory * obj_size_mb * MiB,
         "MMAP_DISK": expected_fallback * obj_size_mb * MiB,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
 
     wait_for_condition(
-        # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 2 * KiB),
+        # 3KiB for metadata difference
+        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 3 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
@@ -294,11 +300,12 @@ def test_fallback_memory(shutdown_only):
         "MMAP_SHM": 0,
         "MMAP_DISK": 0,
         "SPILLED": 0,
+        "WORKER_HEAP": 0,
     }
 
     wait_for_condition(
-        # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 2 * KiB),
+        # 3KiB for metadata difference
+        lambda: approx_eq_dict_in(objects_by_loc(info), expected, 3 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
@@ -328,7 +335,7 @@ def test_seal_memory(shutdown_only):
 
     wait_for_condition(
         # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_seal_state(info), expected, 1 * KiB),
+        lambda: approx_eq_dict_in(objects_by_seal_state(info), expected, 2 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
@@ -342,17 +349,42 @@ def test_seal_memory(shutdown_only):
 
     wait_for_condition(
         # 1KiB for metadata difference
-        lambda: approx_eq_dict_in(objects_by_seal_state(info), expected, 1 * KiB),
+        lambda: approx_eq_dict_in(objects_by_seal_state(info), expected, 2 * KiB),
         timeout=20,
         retry_interval_ms=500,
     )
 
 
-if __name__ == "__main__":
-    import sys
-    import os
+def test_object_store_memory_matches_dashboard_obj_memory(shutdown_only):
+    # https://github.com/ray-project/ray/issues/32092
+    # Verify the dashboard's object store memory report is same as
+    # the one from metrics
+    ctx = ray.init(
+        object_store_memory=500 * MiB,
+    )
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    def verify():
+        resources = raw_metrics(ctx)["ray_resources"]
+        object_store_memory_bytes_from_metrics = 0
+        for sample in resources:
+            # print(sample)
+            if sample.labels["Name"] == "object_store_memory":
+                object_store_memory_bytes_from_metrics += sample.value
+
+        r = requests.get(f"http://{ctx.dashboard_url}/nodes?view=summary")
+        object_store_memory_bytes_from_dashboard = int(
+            r.json()["data"]["summary"][0]["raylet"]["objectStoreAvailableMemory"]
+        )
+
+        assert (
+            object_store_memory_bytes_from_dashboard
+            == object_store_memory_bytes_from_metrics
+        )
+        assert object_store_memory_bytes_from_dashboard == 500 * MiB
+        return True
+
+    wait_for_condition(verify, timeout=RAY_DASHBOARD_STATS_UPDATING_INTERVAL * 1.5)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -3,8 +3,8 @@ import numpy as np
 import tree  # pip install dm_tree
 from typing import Dict
 
-from ray.rllib.utils.annotations import DeveloperAPI
 from ray.rllib.policy.sample_batch import DEFAULT_POLICY_ID
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.typing import PolicyID
 
 # Instant metrics (keys for metrics.info).
@@ -14,7 +14,7 @@ LEARNER_INFO = "learner"
 LEARNER_STATS_KEY = "learner_stats"
 
 
-@DeveloperAPI
+@OldAPIStack
 class LearnerInfoBuilder:
     def __init__(self, num_devices: int = 1):
         self.num_devices = num_devices
@@ -90,6 +90,7 @@ class LearnerInfoBuilder:
         return info
 
 
+@OldAPIStack
 def _all_tower_reduce(path, *tower_data):
     """Reduces stats across towers based on their stats-dict paths."""
     # TD-errors: Need to stay per batch item in order to be able to update
@@ -100,6 +101,13 @@ def _all_tower_reduce(path, *tower_data):
         return None
 
     if isinstance(path[-1], str):
+        # TODO(sven): We need to fix this terrible dependency on `str.starts_with`
+        #  for determining, how to aggregate these stats! As "num_..." might
+        #  be a good indicator for summing, it will fail if the stats is e.g.
+        #  `num_samples_per_sec" :)
+        # Counter stats: Reduce sum.
+        # if path[-1].startswith("num_"):
+        #    return np.nansum(tower_data)
         # Min stats: Reduce min.
         if path[-1].startswith("min_"):
             return np.nanmin(tower_data)

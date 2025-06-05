@@ -13,12 +13,38 @@
 // limitations under the License.
 
 syntax = "proto3";
-option cc_enable_arenas = true;
 package ray.rpc.syncer;
 
 enum MessageType {
   RESOURCE_VIEW = 0;
   COMMANDS = 1;
+}
+
+message CommandsSyncMessage {
+  // Whether this node manager is requesting global GC.
+  bool should_global_gc = 1;
+  // Whether this node has detected a resource deadlock (full of actors).
+  bool cluster_full_of_actors_detected = 2;
+}
+
+message ResourceViewSyncMessage {
+  // Resource capacity currently available on this node manager.
+  map<string, double> resources_available = 1;
+  // Total resource capacity configured for this node manager.
+  map<string, double> resources_total = 2;
+  // Whether this node has object pulls queued. This can happen if
+  // the node has more pull requests than available object store
+  // memory. This is a proxy for available object store memory.
+  bool object_pulls_queued = 3;
+  // The duration in ms during which all the node's resources are idle. If the
+  // node currently has any resource being used, this will be 0.
+  int64 idle_duration_ms = 4;
+  // Whether the node is being drained.
+  bool is_draining = 5;
+  // Timestamp when the node to be drained will be force killed.
+  int64 draining_deadline_timestamp_ms = 6;
+  // Why the node is not idle.
+  repeated string node_activity = 7;
 }
 
 message RaySyncMessage {
@@ -32,37 +58,6 @@ message RaySyncMessage {
   bytes node_id = 4;
 }
 
-message RaySyncMessages {
-  // The bached messages.
-  repeated RaySyncMessage sync_messages = 1;
-}
-
-message StartSyncRequest {
-  bytes node_id = 1;
-}
-
-message StartSyncResponse {
-  bytes node_id = 1;
-}
-
-message DummyRequest {}
-message DummyResponse {}
-
 service RaySyncer {
-  // Ideally these should be a streaming API like this
-  //   rpc StartSync(stream RaySyncMessages) returns (stream RaySyncMessages);
-  // But to make sure it's the same as the current protocol, we still use
-  // unary rpc.
-  // TODO (iycheng): Using grpc streaming for the protocol.
-
-  // This is the first message that should be sent. It will initialize
-  // some structure between nodes.
-  rpc StartSync(StartSyncRequest) returns (StartSyncResponse);
-
-  // These two RPCs are for messages reporting and broadcasting.
-  // Update is used by the client to send update request to the server.
-  rpc Update(RaySyncMessages) returns (DummyResponse);
-
-  // LongPolling is used by the server to send request to the client.
-  rpc LongPolling(DummyRequest) returns (RaySyncMessages);
+  rpc StartSync(stream RaySyncMessage) returns (stream RaySyncMessage);
 }

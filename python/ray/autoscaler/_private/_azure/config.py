@@ -64,7 +64,7 @@ def _configure_resource_group(config):
     if "tags" in config["provider"]:
         params["tags"] = config["provider"]["tags"]
 
-    logger.info("Creating/Updating Resource Group: %s", resource_group)
+    logger.info("Creating/Updating resource group: %s", resource_group)
     rg_create_or_update = get_azure_sdk_function(
         client=resource_client.resource_groups, function_name="create_or_update"
     )
@@ -76,17 +76,19 @@ def _configure_resource_group(config):
     with open(template_path, "r") as template_fp:
         template = json.load(template_fp)
 
+    logger.info("Using cluster name: %s", config["cluster_name"])
+
     # set unique id for resources in this cluster
     unique_id = config["provider"].get("unique_id")
     if unique_id is None:
         hasher = sha256()
         hasher.update(config["provider"]["resource_group"].encode("utf-8"))
-        hasher.update(config["cluster_name"].encode("utf-8"))
         unique_id = hasher.hexdigest()[:UNIQUE_ID_LEN]
     else:
         unique_id = str(unique_id)
     config["provider"]["unique_id"] = unique_id
     logger.info("Using unique id: %s", unique_id)
+    cluster_id = "{}-{}".format(config["cluster_name"], unique_id)
 
     subnet_mask = config["provider"].get("subnet_mask")
     if subnet_mask is None:
@@ -95,13 +97,64 @@ def _configure_resource_group(config):
         subnet_mask = "10.{}.0.0/16".format(random.randint(1, 254))
     logger.info("Using subnet mask: %s", subnet_mask)
 
+    # Copy over properties from existing subnet.
+    # Addresses issue (https://github.com/Azure/azure-quickstart-templates/issues/2786)
+    # where existing subnet properties will get overwritten unless explicitly specified
+    # during multiple deployments even if vnet/subnet do not change.
+    # May eventually be fixed by passing empty subnet list if they already exist:
+    # https://techcommunity.microsoft.com/t5/azure-networking-blog/azure-virtual-network-now-supports-updates-without-subnet/ba-p/4067952
+    list_by_rg = get_azure_sdk_function(
+        client=resource_client.resources, function_name="list_by_resource_group"
+    )
+    existing_vnets = list(
+        list_by_rg(
+            resource_group,
+            f"substringof('{unique_id}', name) and "
+            "resourceType eq 'Microsoft.Network/virtualNetworks'",
+        )
+    )
+    if len(existing_vnets) > 0:
+        vnid = existing_vnets[0].id
+        get_by_id = get_azure_sdk_function(
+            client=resource_client.resources, function_name="get_by_id"
+        )
+        subnet = get_by_id(vnid, resource_client.DEFAULT_API_VERSION).properties[
+            "subnets"
+        ][0]
+        template_vnet = next(
+            (
+                rs
+                for rs in template["resources"]
+                if rs["type"] == "Microsoft.Network/virtualNetworks"
+            ),
+            None,
+        )
+        if template_vnet is not None:
+            template_subnets = template_vnet["properties"].get("subnets")
+            if template_subnets is not None:
+                template_subnets[0]["properties"].update(subnet["properties"])
+
+    # Get or create an MSI name and resource group.
+    # Defaults to current resource group if not provided.
+    use_existing_msi = (
+        "msi_name" in config["provider"] and "msi_resource_group" in config["provider"]
+    )
+    msi_resource_group = config["provider"].get("msi_resource_group", resource_group)
+    msi_name = config["provider"].get("msi_name", f"ray-{cluster_id}-msi")
+    logger.info(
+        "Using msi_name: %s from msi_resource_group: %s", msi_name, msi_resource_group
+    )
+
     parameters = {
         "properties": {
             "mode": DeploymentMode.incremental,
             "template": template,
             "parameters": {
                 "subnet": {"value": subnet_mask},
-                "uniqueId": {"value": unique_id},
+                "clusterId": {"value": cluster_id},
+                "msiName": {"value": msi_name},
+                "msiResourceGroup": {"value": msi_resource_group},
+                "createMsi": {"value": not use_existing_msi},
             },
         }
     }

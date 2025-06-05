@@ -2,15 +2,15 @@ import os
 import sys
 import tempfile
 import unittest
-from typing import Dict
+from typing import Dict, Callable
 from unittest.mock import patch
 
 import yaml
+from github import Repository
 
 from ray_release.buildkite.concurrency import (
     get_test_resources_from_cluster_compute,
     get_concurrency_group,
-    CONCURRENY_GROUPS,
 )
 from ray_release.buildkite.filter import filter_tests, group_tests
 from ray_release.buildkite.settings import (
@@ -26,10 +26,10 @@ from ray_release.buildkite.step import (
     get_step,
     RELEASE_QUEUE_DEFAULT,
     RELEASE_QUEUE_CLIENT,
+    DOCKER_PLUGIN_KEY,
 )
-from ray_release.config import Test
+from ray_release.test import Test
 from ray_release.exception import ReleaseTestConfigError
-from ray_release.tests.test_glue import MockReturn
 from ray_release.wheels import (
     DEFAULT_BRANCH,
 )
@@ -43,12 +43,34 @@ class MockBuildkiteAgent:
         return self.return_dict.get(key, None)
 
 
+class MockReturn:
+    return_dict = {}
+
+    def __getattribute__(self, item):
+        return_dict = object.__getattribute__(self, "return_dict")
+        if item in return_dict:
+            mocked = return_dict[item]
+            if isinstance(mocked, Callable):
+                return mocked()
+            else:
+                return lambda *a, **kw: mocked
+        return object.__getattribute__(self, item)
+
+
 class MockBuildkitePythonAPI(MockReturn):
     def builds(self):
         return self
 
     def artifacts(self):
         return self
+
+
+class MockTest(Test):
+    def update_from_s3(self) -> None:
+        self["update_from_s3"] = True
+
+    def is_jailed_with_open_issue(self, ray_github: Repository) -> bool:
+        return False
 
 
 class BuildkiteSettingsTest(unittest.TestCase):
@@ -155,7 +177,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
         os.environ["RELEASE_FREQUENCY"] = "nightly"
         os.environ["RAY_TEST_REPO"] = "https://github.com/user/ray.git"
         os.environ["RAY_TEST_BRANCH"] = "sub/branch"
-        os.environ["RAY_WHEELS"] = "custom-wheels"
         os.environ["TEST_NAME"] = "name_filter"
         os.environ["RELEASE_PRIORITY"] = "manual"
         updated_settings = settings.copy()
@@ -167,7 +188,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
                 "frequency": Frequency.NIGHTLY,
                 "prefer_smoke_tests": False,
                 "test_attr_regex_filters": {"name": "name_filter"},
-                "ray_wheels": "custom-wheels",
                 "ray_test_repo": "https://github.com/user/ray.git",
                 "ray_test_branch": "sub/branch",
                 "priority": Priority.MANUAL,
@@ -183,7 +203,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
                 "frequency": Frequency.ANY,
                 "prefer_smoke_tests": True,
                 "test_attr_regex_filters": {"name": "name_filter"},
-                "ray_wheels": "custom-wheels",
                 "ray_test_repo": "https://github.com/user/ray.git",
                 "ray_test_branch": "sub/branch",
                 "priority": Priority.MANUAL,
@@ -271,7 +290,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
             "ray_release.buildkite.settings.get_buildkite_prompt_value",
             self.buildkite_mock,
         ):
-
             # With no buildkite variables, default settings shouldn't be updated
             updated_settings = settings.copy()
             update_settings_from_buildkite(updated_settings)
@@ -321,7 +339,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
             self.buildkite.update(buildkite)
             self.buildkite["release-frequency"] = "nightly"
             self.buildkite["release-ray-test-repo-branch"] = "user:sub/branch"
-            self.buildkite["release-ray-wheels"] = "custom-wheels"
             self.buildkite["release-test-name"] = "name_filter"
             self.buildkite["release-priority"] = "manual"
             updated_settings = settings.copy()
@@ -333,7 +350,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
                     "frequency": Frequency.NIGHTLY,
                     "prefer_smoke_tests": False,
                     "test_attr_regex_filters": {"name": "name_filter"},
-                    "ray_wheels": "custom-wheels",
                     "ray_test_repo": "https://github.com/user/ray.git",
                     "ray_test_branch": "sub/branch",
                     "priority": Priority.MANUAL,
@@ -350,7 +366,6 @@ class BuildkiteSettingsTest(unittest.TestCase):
                     "frequency": Frequency.ANY,
                     "prefer_smoke_tests": True,
                     "test_attr_regex_filters": {"name": "name_filter"},
-                    "ray_wheels": "custom-wheels",
                     "ray_test_repo": "https://github.com/user/ray.git",
                     "ray_test_branch": "sub/branch",
                     "priority": Priority.MANUAL,
@@ -362,35 +377,43 @@ class BuildkiteSettingsTest(unittest.TestCase):
         filtered = filter_tests(*args, **kwargs)
         return [(t[0]["name"], t[1]) for t in filtered]
 
-    def testFilterTests(self):
+    @patch(
+        "ray_release.test_automation.state_machine.TestStateMachine.get_ray_repo",
+        return_value=None,
+    )
+    def testFilterTests(self, *args):
+        test = MockTest(
+            {
+                "name": "test_1",
+                "frequency": "nightly",
+                "smoke_test": {"frequency": "nightly"},
+                "team": "team_1",
+                "run": {"type": "job"},
+            }
+        )
         tests = [
-            Test(
-                {
-                    "name": "test_1",
-                    "frequency": "nightly",
-                    "smoke_test": {"frequency": "nightly"},
-                    "team": "team_1",
-                }
-            ),
-            Test(
+            test,
+            MockTest(
                 {
                     "name": "test_2",
                     "frequency": "weekly",
                     "smoke_test": {"frequency": "nightly"},
                     "team": "team_2",
+                    "run": {"type": "client"},
                 }
             ),
-            Test({"name": "other_1", "frequency": "weekly", "team": "team_2"}),
-            Test(
+            MockTest({"name": "other_1", "frequency": "weekly", "team": "team_2"}),
+            MockTest(
                 {
                     "name": "other_2",
                     "frequency": "nightly",
                     "smoke_test": {"frequency": "multi"},
                     "team": "team_2",
+                    "run": {"type": "job"},
                 }
             ),
-            Test({"name": "other_3", "frequency": "disabled", "team": "team_2"}),
-            Test({"name": "test_3", "frequency": "nightly", "team": "team_2"}),
+            MockTest({"name": "other_3", "frequency": "manual", "team": "team_2"}),
+            MockTest({"name": "test_3", "frequency": "nightly", "team": "team_2"}),
         ]
 
         filtered = self._filter_names_smoke(tests, frequency=Frequency.ANY)
@@ -401,9 +424,11 @@ class BuildkiteSettingsTest(unittest.TestCase):
                 ("test_2", False),
                 ("other_1", False),
                 ("other_2", False),
+                ("other_3", False),
                 ("test_3", False),
             ],
         )
+        assert not test.get("update_from_s3")
 
         filtered = self._filter_names_smoke(
             tests,
@@ -417,6 +442,7 @@ class BuildkiteSettingsTest(unittest.TestCase):
                 ("test_2", True),
                 ("other_1", False),
                 ("other_2", True),
+                ("other_3", False),
                 ("test_3", False),
             ],
         )
@@ -490,6 +516,28 @@ class BuildkiteSettingsTest(unittest.TestCase):
         )
         self.assertSequenceEqual(filtered, [("test_1", False), ("test_2", True)])
 
+        # Filter by nested properties
+        filtered = self._filter_names_smoke(
+            tests,
+            frequency=Frequency.ANY,
+            test_attr_regex_filters={"run/type": "job"},
+        )
+        self.assertSequenceEqual(filtered, [("test_1", False), ("other_2", False)])
+
+        filtered = self._filter_names_smoke(
+            tests,
+            frequency=Frequency.ANY,
+            test_attr_regex_filters={"run/type": "client"},
+        )
+        self.assertSequenceEqual(filtered, [("test_2", False)])
+
+        filtered = self._filter_names_smoke(
+            tests,
+            frequency=Frequency.ANY,
+            test_attr_regex_filters={"run/invalid": "xxx"},
+        )
+        self.assertSequenceEqual(filtered, [])
+
     def testGroupTests(self):
         tests = [
             (Test(name="x1", group="x"), False),
@@ -508,7 +556,7 @@ class BuildkiteSettingsTest(unittest.TestCase):
         self.assertEqual(len(grouped["y"]), 1)
 
     def testGetStep(self):
-        test = Test(
+        test = MockTest(
             {
                 "name": "test",
                 "frequency": "nightly",
@@ -518,10 +566,12 @@ class BuildkiteSettingsTest(unittest.TestCase):
         )
 
         step = get_step(test, smoke_test=False)
-        self.assertNotIn("--smoke-test", step["command"])
+        self.assertNotIn(
+            "--smoke-test", step["plugins"][0][DOCKER_PLUGIN_KEY]["command"]
+        )
 
         step = get_step(test, smoke_test=True)
-        self.assertIn("--smoke-test", step["command"])
+        self.assertIn("--smoke-test", step["plugins"][0][DOCKER_PLUGIN_KEY]["command"])
 
         step = get_step(test, priority_val=20)
         self.assertEqual(step["priority"], 20)
@@ -584,9 +634,8 @@ class BuildkiteSettingsTest(unittest.TestCase):
                 "ray_release.buildkite.concurrency.get_test_resources",
                 _return((cpu, gpu)),
             ):
-                group_name, limit = get_concurrency_group(test)
+                group_name, _ = get_concurrency_group(test)
                 self.assertEqual(group_name, group)
-                self.assertEqual(limit, CONCURRENY_GROUPS[group_name])
 
         test_concurrency(12800, 9, "large-gpu")
         test_concurrency(12800, 8, "small-gpu")
@@ -598,8 +647,10 @@ class BuildkiteSettingsTest(unittest.TestCase):
         test_concurrency(512, 0, "medium")
         test_concurrency(129, 0, "medium")
         test_concurrency(128, 0, "small")
-        test_concurrency(1, 0, "tiny")
+        test_concurrency(9, 0, "tiny")
         test_concurrency(32, 0, "tiny")
+        test_concurrency(8, 0, "minuscule")
+        test_concurrency(1, 0, "minuscule")
         test_concurrency(33, 0, "small")
 
     def testConcurrencyGroupSmokeTest(self):
@@ -636,7 +687,7 @@ class BuildkiteSettingsTest(unittest.TestCase):
             with open(cluster_config_smoke_path, "w") as fp:
                 yaml.safe_dump(cluster_config_smoke, fp)
 
-            test = Test(
+            test = MockTest(
                 {
                     "name": "test_1",
                     "cluster": {"cluster_compute": cluster_config_full_path},
@@ -646,20 +697,20 @@ class BuildkiteSettingsTest(unittest.TestCase):
                 }
             )
             step = get_step(test, smoke_test=False)
-            self.assertEquals(step["concurrency_group"], "medium")
+            self.assertEqual(step["concurrency_group"], "medium")
 
             step = get_step(test, smoke_test=True)
-            self.assertEquals(step["concurrency_group"], "small")
+            self.assertEqual(step["concurrency_group"], "small")
 
     def testStepQueueClient(self):
-        test_regular = Test(
+        test_regular = MockTest(
             {
                 "name": "test",
                 "frequency": "nightly",
                 "run": {"script": "test_script.py"},
             }
         )
-        test_client = Test(
+        test_client = MockTest(
             {
                 "name": "test",
                 "frequency": "nightly",

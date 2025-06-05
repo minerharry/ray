@@ -4,18 +4,18 @@ from typing import Any
 from ray.rllib.connectors.connector import (
     AgentConnector,
     ConnectorContext,
-    register_connector,
 )
+from ray.rllib.connectors.registry import register_connector
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils.typing import (
     AgentConnectorDataType,
     AgentConnectorsOutput,
 )
-from ray.util.annotations import PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.evaluation.collectors.agent_collector import AgentCollector
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 class ViewRequirementAgentConnector(AgentConnector):
     """This connector does 2 things:
     1. It filters data columns based on view_requirements for training and inference.
@@ -36,6 +36,7 @@ class ViewRequirementAgentConnector(AgentConnector):
         super().__init__(ctx)
 
         self._view_requirements = ctx.view_requirements
+        _enable_new_api_stack = False
 
         # a dict of env_id to a dict of agent_id to a list of agent_collector objects
         self.agent_collectors = defaultdict(
@@ -55,6 +56,7 @@ class ViewRequirementAgentConnector(AgentConnector):
                     # to behave in inference mode, so they don't accumulate episode data
                     # that is not useful for inference.
                     is_training=False,
+                    _enable_new_api_stack=_enable_new_api_stack,
                 )
             )
         )
@@ -66,7 +68,7 @@ class ViewRequirementAgentConnector(AgentConnector):
     def transform(self, ac_data: AgentConnectorDataType) -> AgentConnectorDataType:
         d = ac_data.data
         assert (
-            type(d) == dict
+            type(d) is dict
         ), "Single agent data must be of type Dict[str, TensorStructType]"
 
         env_id = ac_data.env_id
@@ -79,25 +81,37 @@ class ViewRequirementAgentConnector(AgentConnector):
             "and agent_id({agent_id})"
         )
 
-        vr = self._view_requirements
-        assert vr, "ViewRequirements required by ViewRequirementAgentConnector"
+        assert (
+            self._view_requirements
+        ), "ViewRequirements required by ViewRequirementAgentConnector"
 
         # Note(jungong) : we need to keep the entire input dict here.
         # A column may be used by postprocessing (GAE) even if its
-        # iew_requirement.used_for_training is False.
+        # view_requirement.used_for_training is False.
         training_dict = d
 
         agent_collector = self.agent_collectors[env_id][agent_id]
 
         if SampleBatch.NEXT_OBS not in d:
             raise ValueError(f"connector data {d} should contain next_obs.")
-
+        # TODO(avnishn; kourosh) Unsure how agent_index is necessary downstream
+        # since there is no mapping from agent_index to agent_id that exists.
+        # need to remove this from the SampleBatch later.
+        # fall back to using dummy index if no index is available
+        if SampleBatch.AGENT_INDEX in d:
+            agent_index = d[SampleBatch.AGENT_INDEX]
+        else:
+            try:
+                agent_index = float(agent_id)
+            except ValueError:
+                agent_index = -1
         if agent_collector.is_empty():
             agent_collector.add_init_obs(
                 episode_id=episode_id,
-                agent_index=agent_id,
+                agent_index=agent_index,
                 env_id=env_id,
                 init_obs=d[SampleBatch.NEXT_OBS],
+                init_infos=d.get(SampleBatch.INFOS),
             )
         else:
             agent_collector.add_action_reward_next_obs(d)

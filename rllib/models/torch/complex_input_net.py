@@ -1,9 +1,7 @@
-from gym.spaces import Box, Discrete, MultiDiscrete
+from gymnasium.spaces import Box, Discrete, MultiDiscrete
 import numpy as np
 import tree  # pip install dm_tree
 
-# TODO (sven): add IMPALA-style option.
-# from ray.rllib.examples.models.impala_vision_nets import TorchImpalaVisionNet
 from ray.rllib.models.torch.misc import (
     normc_initializer as torch_normc_initializer,
     SlimFC,
@@ -13,7 +11,7 @@ from ray.rllib.models.modelv2 import ModelV2, restore_original_dimensions
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models.utils import get_filter_config
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.spaces.space_utils import flatten_space
 from ray.rllib.utils.torch_utils import one_hot
@@ -21,6 +19,7 @@ from ray.rllib.utils.torch_utils import one_hot
 torch, nn = try_import_torch()
 
 
+@OldAPIStack
 class ComplexInputNetwork(TorchModelV2, nn.Module):
     """TorchModelV2 concat'ing CNN outputs to flat input(s), followed by FC(s).
 
@@ -60,14 +59,15 @@ class ComplexInputNetwork(TorchModelV2, nn.Module):
         #     "conv_type", "atari")
 
         # Build the CNN(s) given obs_space's image components.
-        self.cnns = {}
-        self.one_hot = {}
+        self.cnns = nn.ModuleDict()
+        self.one_hot = nn.ModuleDict()
         self.flatten_dims = {}
-        self.flatten = {}
+        self.flatten = nn.ModuleDict()
         concat_size = 0
         for i, component in enumerate(self.flattened_input_space):
+            i = str(i)
             # Image space.
-            if len(component.shape) == 3:
+            if len(component.shape) == 3 and isinstance(component, Box):
                 config = {
                     "conv_filters": model_config["conv_filters"]
                     if "conv_filters" in model_config
@@ -118,7 +118,7 @@ class ComplexInputNetwork(TorchModelV2, nn.Module):
                 self.add_module("one_hot_{}".format(i), self.one_hot[i])
             # Everything else (1D Box).
             else:
-                size = int(np.product(component.shape))
+                size = int(np.prod(component.shape))
                 config = {
                     "fcnet_hiddens": model_config["fcnet_hiddens"],
                     "fcnet_activation": model_config.get("fcnet_activation"),
@@ -185,6 +185,7 @@ class ComplexInputNetwork(TorchModelV2, nn.Module):
         # (CNNs, one-hot + FC, etc..).
         outs = []
         for i, component in enumerate(tree.flatten(orig_obs)):
+            i = str(i)
             if i in self.cnns:
                 cnn_out, _ = self.cnns[i](SampleBatch({SampleBatch.OBS: component}))
                 outs.append(cnn_out)
@@ -198,7 +199,7 @@ class ComplexInputNetwork(TorchModelV2, nn.Module):
                 ]:
                     one_hot_in = {
                         SampleBatch.OBS: one_hot(
-                            component, self.flattened_input_space[i]
+                            component, self.flattened_input_space[int(i)]
                         )
                     }
                 else:

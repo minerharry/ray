@@ -12,13 +12,13 @@ import ray._private.ray_constants as ray_constants
 import ray._private.utils
 from ray._private.ray_constants import DEBUG_AUTOSCALING_ERROR
 from ray._private.test_utils import (
-    Semaphore,
     get_error_message,
     get_log_batch,
     init_error_pubsub,
     run_string_as_driver_nonblocking,
     wait_for_condition,
 )
+from ray._common.test_utils import Semaphore
 from ray.cluster_utils import cluster_not_supported
 from ray.experimental.internal_kv import _internal_kv_get
 
@@ -41,13 +41,13 @@ def test_warning_for_too_many_actors(shutdown_only):
     assert len(actor_group1) == num_cpus * 10
     errors = get_error_message(p, 1, ray_constants.WORKER_POOL_LARGE_ERROR)
     assert len(errors) == 1
-    assert errors[0].type == ray_constants.WORKER_POOL_LARGE_ERROR
+    assert errors[0]["type"] == ray_constants.WORKER_POOL_LARGE_ERROR
 
     actor_group2 = [Foo.remote() for _ in range(num_cpus * 3)]
     assert len(actor_group2) == num_cpus * 3
     errors = get_error_message(p, 1, ray_constants.WORKER_POOL_LARGE_ERROR)
     assert len(errors) == 1
-    assert errors[0].type == ray_constants.WORKER_POOL_LARGE_ERROR
+    assert errors[0]["type"] == ray_constants.WORKER_POOL_LARGE_ERROR
     p.close()
 
 
@@ -99,8 +99,9 @@ def test_warning_for_too_many_nested_tasks(shutdown_only):
     [g.remote(remote_waits, nested_waits) for _ in range(num_root_tasks)]
 
     errors = get_error_message(p, 1, ray_constants.WORKER_POOL_LARGE_ERROR)
+
     assert len(errors) == 1
-    assert errors[0].type == ray_constants.WORKER_POOL_LARGE_ERROR
+    assert errors[0]["type"] == ray_constants.WORKER_POOL_LARGE_ERROR
     p.close()
 
 
@@ -126,7 +127,7 @@ def test_warning_for_dead_node(ray_start_cluster_2_nodes, error_pubsub):
 
     # Extract the client IDs from the error messages. This will need to be
     # changed if the error message changes.
-    warning_node_ids = {error.error_message.split(" ")[5] for error in errors}
+    warning_node_ids = {error["error_message"].split(" ")[5] for error in errors}
 
     assert node_ids == warning_node_ids
 
@@ -262,8 +263,9 @@ def test_serialized_id(ray_start_cluster):
 )
 def test_fate_sharing(ray_start_cluster, use_actors, node_failure):
     config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
+        "health_check_initial_delay_ms": 0,
+        "health_check_period_ms": 100,
+        "health_check_failure_threshold": 10,
     }
     cluster = ray_start_cluster
     # Head node with no resources.
@@ -416,9 +418,4 @@ time.sleep(60)
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

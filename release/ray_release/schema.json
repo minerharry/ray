@@ -15,38 +15,35 @@
 				"working_dir": {
 					"type": "string"
 				},
-                "env": {
-					"type": "string"
+				"repeated_run": {
+					"type": "integer"
 				},
-				"legacy": {
-					"$ref": "#/definitions/Legacy"
+				"env": {
+					"type": "string"
 				},
 				"stable": {
 					"type": "boolean"
 				},
-                "python": {
+				"python": {
 					"type": "string",
 					"enum": [
-						"3.6",
-						"3.7",
-						"3.8",
-						"3.9"
-                    ]
+						"3.9",
+						"3.11",
+						"3.12"
+					]
 				},
 				"frequency": {
 					"type": "string",
 					"enum": [
-						"disabled",
+						"manual",
 						"multi",
 						"nightly",
 						"nightly-3x",
-						"weekly"
+						"weekly",
+						"monthly"
 					]
 				},
 				"team": {
-					"type": "string"
-				},
-				"driver_setup": {
 					"type": "string"
 				},
 				"cluster": {
@@ -76,9 +73,6 @@
 			"type": "object",
 			"additionalProperties": false,
 			"properties": {
-				"cluster_env": {
-					"type": "string"
-				},
 				"cluster_compute": {
 					"type": "string"
 				},
@@ -89,32 +83,41 @@
 				"cloud_id": {
 					"type": "string"
 				},
+				"project_id": {
+					"type": "string"
+				},
 				"cloud_name": {
 					"type": "string"
+				},
+				"byod": {
+					"$ref": "#/definitions/Byod"
 				}
 			},
 			"required": [
-				"cluster_compute",
-				"cluster_env"
+				"byod",
+				"cluster_compute"
 			],
 			"title": "Cluster"
 		},
-		"Legacy": {
+		"Byod": {
 			"type": "object",
 			"additionalProperties": false,
 			"properties": {
-				"test_name": {
+				"type": {
 					"type": "string"
 				},
-				"test_suite": {
+				"post_build_script": {
 					"type": "string"
+				},
+				"pip": {
+					"type": "array"
+				},
+				"runtime_env": {
+					"type": "array"
 				}
 			},
-			"required": [
-				"test_name",
-				"test_suite"
-			],
-			"title": "Legacy"
+			"required": [],
+			"title": "Byod"
 		},
 		"Run": {
 			"type": "object",
@@ -126,16 +129,8 @@
 						"command",
 						"sdk_command",
 						"job",
-						"client"
-					]
-				},
-				"file_manager": {
-					"type": "string",
-					"enum": [
-
-						"sdk",
 						"client",
-						"job"
+						"anyscale_job"
 					]
 				},
 				"wait_for_nodes": {
@@ -155,6 +150,9 @@
 				},
 				"long_running": {
 					"type": "boolean"
+				},
+				"artifact_path": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -187,10 +185,7 @@
 				"working_dir": {
 					"type": "string"
 				},
-                "env": {
-					"type": "string"
-				},
-                "driver_setup": {
+				"env": {
 					"type": "string"
 				},
 				"cluster": {
@@ -199,17 +194,18 @@
 				"run": {
 					"type": "object"
 				},
-                "alert": {
+				"alert": {
 					"type": "string"
 				},
 				"frequency": {
 					"type": "string",
 					"enum": [
-						"disabled",
+						"manual",
 						"multi",
 						"nightly",
 						"nightly-3x",
-						"weekly"
+						"weekly",
+						"monthly"
 					]
 				}
 			},

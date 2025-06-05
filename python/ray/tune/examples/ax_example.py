@@ -2,13 +2,14 @@
 
 It also checks that it is usable with a separate scheduler.
 
-Requires the Ax library to be installed (`pip install ax-platform sqlalchemy`).
+Requires the Ax library to be installed (`pip install ax-platform`).
 """
-import numpy as np
+
 import time
 
-from ray import air, tune
-from ray.air import session
+import numpy as np
+
+from ray import tune
 from ray.tune.schedulers import AsyncHyperBandScheduler
 from ray.tune.search.ax import AxSearch
 
@@ -43,7 +44,7 @@ def hartmann6(x):
 def easy_objective(config):
     for i in range(config["iterations"]):
         x = np.array([config.get("x{}".format(i + 1)) for i in range(6)])
-        session.report(
+        tune.report(
             {
                 "timesteps_total": i,
                 "hartmann6": hartmann6(x),
@@ -60,19 +61,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smoke-test", action="store_true", help="Finish quickly for testing"
     )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using Ray Client.",
-    )
     args, _ = parser.parse_known_args()
-
-    if args.server_address:
-        import ray
-
-        ray.init(f"ray://{args.server_address}")
 
     algo = AxSearch(
         parameter_constraints=["x1 + x2 <= 2.0"],  # Optional.
@@ -83,7 +72,7 @@ if __name__ == "__main__":
     scheduler = AsyncHyperBandScheduler()
     tuner = tune.Tuner(
         easy_objective,
-        run_config=air.RunConfig(
+        run_config=tune.RunConfig(
             name="ax",
             stop={"timesteps_total": 100},
         ),

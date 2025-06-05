@@ -13,16 +13,15 @@ You can post questions or issues or feedback through the following channels:
 To contribute a patch:
 ----------------------
 
-We welcome your contribution!  Please see https://docs.ray.io/en/master/getting-involved.html for instructions.
-
-For instructions on setting up your development environment, check out the
-`getting involved`_ documentation page.
+We welcome contributions! See `Getting Involved`_. To set up your development environment, see
+the `Setting up your development environment`_ section.
 
 
 .. _`Discourse forum`: https://discuss.ray.io/
 .. _`GitHub Issues`: https://github.com/ray-project/ray/issues
 .. _`StackOverflow`: https://stackoverflow.com/questions/tagged/ray
-.. _`getting involved`: https://docs.ray.io/en/master/getting-involved.html
+.. _`Getting Involved`: https://docs.ray.io/en/latest/ray-contribute/getting-involved.html
+.. _`Setting up your development environment`: https://docs.ray.io/en/latest/ray-contribute/getting-involved.html#setting-up-your-development-environment
 
 PR Review Process
 -----------------
@@ -30,7 +29,7 @@ PR Review Process
 For contributors who are in the ray-project organization:
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- When you first create a PR, add an reviewer to the `assignee` section.
+- When you first create a PR, add a reviewer to the `assignee` section.
 - Assignees will review your PR and add `@author-action-required` label if further actions are required.
 - Address their comments and remove `@author-action-required` label from the PR.
 - Repeat this process until assignees approve your PR.
