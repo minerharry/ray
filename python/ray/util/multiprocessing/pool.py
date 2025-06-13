@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from multiprocessing import TimeoutError
-from typing import Any, Callable, Dict, Hashable, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generic, Hashable, Iterable, List, Optional, Tuple, TypeVar
 
 import ray
 from ray._private.usage import usage_lib
@@ -201,8 +201,8 @@ class ResultThread(threading.Thread):
         self,
         object_refs: list,
         single_result: bool = False,
-        callback: callable = None,
-        error_callback: callable = None,
+        callback: Optional[callable] = None,
+        error_callback: Optional[Callable[[Exception], None]] = None,
         total_object_refs: Optional[int] = None,
     ):
         threading.Thread.__init__(self, daemon=True)
@@ -380,7 +380,7 @@ class AsyncResult:
 class IMapIterator:
     """Base class for OrderedIMapIterator and UnorderedIMapIterator."""
 
-    def __init__(self, pool, func, iterable, chunksize=None):
+    def __init__(self, pool, func, iterable, chunksize=None,error_callback=None):
         self._pool = pool
         self._func = func
         self._next_chunk_index = 0
@@ -389,7 +389,12 @@ class IMapIterator:
         # submitted chunks. Ordering mirrors that in the in the ResultThread.
         self._submitted_chunks = []
         self._ready_objects = collections.deque()
-        self._iterator = iter(iterable)
+        try:
+            self._iterator = iter(iterable)
+        except TypeError:
+            # for compatibility with prior releases, encapsulate non-iterable in a list
+            iterable = [iterable]
+            self._iterator = iter(iterable)
         if isinstance(iterable, collections.abc.Iterator):
             # Got iterator (which has no len() function).
             # Make default chunksize 1 instead of using _calculate_chunksize().
@@ -400,7 +405,7 @@ class IMapIterator:
             self._chunksize = chunksize or pool._calculate_chunksize(iterable)
             result_list_size = div_round_up(len(iterable), chunksize)
 
-        self._result_thread = ResultThread([], total_object_refs=result_list_size)
+        self._result_thread = ResultThread([], total_object_refs=result_list_size,error_callback=error_callback);
         self._result_thread.start()
 
         for _ in range(len(self._pool._actor_pool)):
@@ -411,7 +416,7 @@ class IMapIterator:
         if self._finished_iterating:
             return
 
-        actor_index = len(self._submitted_chunks) % len(self._pool._actor_pool)
+        actor_index = self._get_next_free_actor_index();
         chunk_iterator = itertools.islice(self._iterator, self._chunksize)
 
         # Check whether we have run out of samples.
@@ -434,6 +439,13 @@ class IMapIterator:
         # If we submitted the final chunk, notify the result thread
         if self._finished_iterating:
             self._result_thread.add_object_ref(ResultThread.END_SENTINEL)
+
+    def _get_next_free_actor_index(self):
+        ref_map = {actor[0].ping.remote():(actor[1],k) for k,actor in enumerate(self._pool._actor_pool)}; #objref:count,actorindex
+        ready, _ = ray.wait(list(ref_map.keys()));
+        ready_actors = [ref_map[ref] for ref in ready];
+        ready_index = min(ready_actors,key=lambda r:r[0])[1]; #get ready actor with fewest tasks
+        return ready_index;
 
     def __iter__(self):
         return self
@@ -505,7 +517,6 @@ class UnorderedIMapIterator(IMapIterator):
                 # Finish when all chunks have been dispatched and processed
                 # Notify the calling process that the work is done.
                 raise StopIteration
-
             index = self._result_thread.next_ready_index(timeout=timeout)
             self._submit_next_chunk()
 
@@ -540,9 +551,9 @@ class PoolActor:
                 results.append(PoolTaskError(e))
         return results
 
-
+FuncType = TypeVar("FuncType")
 # https://docs.python.org/3/library/multiprocessing.html#module-multiprocessing.pool
-class Pool:
+class Pool(Generic[FuncType]):
     """A pool of actor processes that is used to process tasks in parallel.
 
     Args:
@@ -605,10 +616,7 @@ class Pool:
                 RAY_ADDRESS_ENV in os.environ
                 or ray._private.utils.read_ray_address() is not None
             ):
-                init_kwargs = {}
-                if os.environ.get(RAY_ADDRESS_ENV) == "local":
-                    init_kwargs["num_cpus"] = processes
-                ray.init(**init_kwargs)
+                ray.init()
             elif ray_address is not None:
                 init_kwargs = {}
                 if ray_address == "local":
@@ -687,7 +695,7 @@ class Pool:
 
     def apply(
         self,
-        func: Callable,
+        func: FuncType,
         args: Optional[Tuple] = None,
         kwargs: Optional[Dict] = None,
     ):
@@ -707,7 +715,7 @@ class Pool:
 
     def apply_async(
         self,
-        func: Callable,
+        func: FuncType,
         args: Optional[Tuple] = None,
         kwargs: Optional[Dict] = None,
         callback: Callable[[Any], None] = None,
@@ -735,7 +743,7 @@ class Pool:
         object_ref = self._run_batch(self._next_actor_index(), func, [(args, kwargs)])
         return AsyncResult([object_ref], callback, error_callback, single_result=True)
 
-    def _convert_to_ray_batched_calls_if_needed(self, func: Callable) -> Callable:
+    def _convert_to_ray_batched_calls_if_needed(self, func: FuncType) -> FuncType:
         """Convert joblib's BatchedCalls to RayBatchedCalls for ObjectRef caching.
 
         This converts joblib's BatchedCalls callable, which is a collection of
@@ -827,7 +835,7 @@ class Pool:
         )
         return AsyncResult(object_refs, callback, error_callback)
 
-    def map(self, func: Callable, iterable: Iterable, chunksize: Optional[int] = None):
+    def map(self, func: FuncType, iterable: Iterable, chunksize: Optional[int] = None):
         """Run the given function on each element in the iterable round-robin
         on the actor processes and return the results synchronously.
 
@@ -848,7 +856,7 @@ class Pool:
 
     def map_async(
         self,
-        func: Callable,
+        func: FuncType,
         iterable: Iterable,
         chunksize: Optional[int] = None,
         callback: Callable[[List], None] = None,
@@ -895,7 +903,7 @@ class Pool:
 
     def starmap_async(
         self,
-        func: Callable,
+        func: FuncType,
         iterable: Iterable,
         callback: Callable[[List], None] = None,
         error_callback: Callable[[Exception], None] = None,
@@ -912,7 +920,10 @@ class Pool:
             error_callback=error_callback,
         )
 
-    def imap(self, func: Callable, iterable: Iterable, chunksize: Optional[int] = 1):
+    def imap(
+        self, func: FuncType, iterable: Iterable, chunksize: Optional[int] = 1, 
+        error_callback: Callable[[Exception], None] = None
+    ):
         """Same as `map`, but only submits one batch of tasks to each actor
         process at a time.
 
@@ -927,10 +938,11 @@ class Pool:
         """
 
         self._check_running()
-        return OrderedIMapIterator(self, func, iterable, chunksize=chunksize)
+        return OrderedIMapIterator(self, func, iterable, chunksize=chunksize,error_callback=error_callback)
 
     def imap_unordered(
-        self, func: Callable, iterable: Iterable, chunksize: Optional[int] = 1
+        self, func: FuncType, iterable: Iterable, chunksize: Optional[int] = 1, 
+        error_callback: Callable[[Exception], None] = None
     ):
         """Same as `map`, but only submits one batch of tasks to each actor
         process at a time.
@@ -945,7 +957,7 @@ class Pool:
         """
 
         self._check_running()
-        return UnorderedIMapIterator(self, func, iterable, chunksize=chunksize)
+        return UnorderedIMapIterator(self, func, iterable, chunksize=chunksize,error_callback=error_callback)
 
     def _check_running(self):
         if self._closed:
