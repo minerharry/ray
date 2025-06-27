@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import ray
 import ray.exceptions
-from ray._raylet import SerializedObject
+from ray._raylet import SerializedObject, ReaderRefInfo
 from ray.experimental.channel import utils
 from ray.experimental.channel.common import ChannelInterface, ChannelOutputType
 from ray.experimental.channel.intra_process_channel import IntraProcessChannel
@@ -59,14 +59,6 @@ def _create_channel_ref(
         raise
     return object_ref
 
-
-# Compiled Graph maintains 1 reader object reference (also called buffer) per node.
-# reader_ref: The object reference.
-# ref_owner_actor_id: The actor who created the object reference.
-# num_readers: The number of reader actors who reads this object reference.
-ReaderRefInfo = namedtuple(
-    "ReaderRefInfo", ["reader_ref", "ref_owner_actor_id", "num_reader_actors"]
-)
 
 
 class _ResizeChannel:

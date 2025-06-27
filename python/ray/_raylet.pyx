@@ -2945,6 +2945,17 @@ cdef class _TestOnly_GcsActorSubscriber(_GcsSubscriber):
         return [(key_id, info)]
 
 
+# RenderRefInfo: namedtuple input to CoreWorker's experimental_channel_register_writer
+# Compiled Graph maintains 1 reader object reference (also called buffer) per node.
+# reader_ref: The object reference.
+# ref_owner_actor_id: The actor who created the object reference.
+# num_readers: The number of reader actors who reads this object reference.
+class ReaderRefInfo(NamedTuple):
+    reader_ref: ObjectRef[bytes]
+    ref_owner_actor_id:ActorID
+    num_reader_actors:int
+
+
 cdef class CoreWorker:
 
     def __cinit__(self, worker_type, store_socket, raylet_socket,
