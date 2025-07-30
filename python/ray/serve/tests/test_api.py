@@ -27,7 +27,8 @@ from ray.serve._private.request_router.replica_wrapper import (
 from ray.serve._private.request_router.request_router import (
     RequestRouter,
 )
-from ray.serve._private.test_utils import get_application_url, get_application_urls
+from ray.serve._private.test_utils import get_application_url
+from ray.serve.config import RequestRouterConfig
 from ray.serve.deployment import Application
 from ray.serve.exceptions import RayServeException
 from ray.serve.handle import DeploymentHandle
@@ -80,8 +81,14 @@ class FakeRequestRouter(RequestRouter):
     ) -> List[List[RunningReplica]]:
         return [candidate_replicas]
 
+    def initialize_state(self, test_parameter: int = 0):
+        print("Called initialize_state in FakeRequestRouter")
+        self.test_parameter = test_parameter
 
-@serve.deployment(request_router_class=FakeRequestRouter)
+
+@serve.deployment(
+    request_router_config=RequestRouterConfig(request_router_class=FakeRequestRouter)
+)
 class AppWithCustomRequestRouter:
     def __call__(self) -> str:
         return "Hello, world!"
@@ -433,14 +440,15 @@ def test_delete_application(serve_instance):
     assert httpx.get(url).text == "got f"
 
     serve.delete("app_f")
-    assert "Path '/' not found" in httpx.get(url).text
+    url = "http://localhost:8000/app_f"
+    assert "Path '/app_f' not found" in httpx.get(url).text
 
     # delete again, no exception & crash expected.
     serve.delete("app_f")
 
     # make sure no affect to app_g
     assert g_handle.remote().result() == "got g"
-    url = f"{get_application_url(app_name='app_g')}"
+    url = get_application_url("HTTP", app_name="app_g")
     assert httpx.get(url).text == "got g"
 
 
@@ -549,6 +557,12 @@ def test_deploy_application_with_same_name(serve_instance):
     # Redeploy with same app to update route prefix
     serve.run(Model1.bind(), name="app", route_prefix="/my_app")
     url_new = get_application_url("HTTP", app_name="app")
+    # Reread the url to get the correct port value
+    old_url_route_prefix = "/"
+    url = (
+        get_application_url("HTTP", app_name="app", exclude_route_prefix=True)
+    ) + old_url_route_prefix
+
     assert httpx.get(url_new).text == "got model1"
     assert httpx.get(url).status_code == 404
 
@@ -1102,6 +1116,24 @@ def test_deploy_app_with_custom_request_router(serve_instance):
     deployment decorator."""
 
     handle = serve.run(AppWithCustomRequestRouter.bind())
+    assert handle.remote().result() == "Hello, world!"
+
+
+@serve.deployment(
+    request_router_config=RequestRouterConfig(
+        request_router_class="ray.serve.tests.test_api.FakeRequestRouter",
+        request_router_kwargs=dict(test_parameter=4848),
+    )
+)
+class AppWithCustomRequestRouterAndKwargs:
+    def __call__(self) -> str:
+        return "Hello, world!"
+
+
+def test_custom_request_router_kwargs(serve_instance):
+    """Check that custom kwargs can be passed to the request router."""
+
+    handle = serve.run(AppWithCustomRequestRouterAndKwargs.bind())
     assert handle.remote().result() == "Hello, world!"
 
 
