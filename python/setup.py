@@ -639,6 +639,8 @@ def build(build_python, build_java, build_cpp):
     if setup_spec.build_type == BuildType.TSAN:
         bazel_flags.append("--config=tsan")
 
+    bazel_flags.append("--jobs=1")
+
     return bazel_invoke(
         subprocess.check_call,
         bazel_precmd_flags + ["build"] + bazel_flags + ["--"] + bazel_targets,

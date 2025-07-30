@@ -364,7 +364,7 @@ def test_concurrency(shutdown_only):
 def test_flat_map_generator(ray_start_regular_shared):
     ds = ray.data.range(3)
 
-    def map_generator(item: dict) -> Iterator[int]:
+    def map_generator(item: dict) -> Iterator[dict[str, int]]:
         for _ in range(2):
             yield {"id": item["id"] + 1}
 
