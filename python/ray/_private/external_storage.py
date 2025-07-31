@@ -123,11 +123,9 @@ class ExternalStorage(metaclass=abc.ABCMeta):
         # issue: https://github.com/ray-project/ray/pull/13831
         return self.core_worker.get_if_local(object_refs)
 
-    def _put_object_to_store(
-        self, metadata, data_size, file_like, object_ref, owner_address
-    ):
+    def _put_object_to_store(self, metadata, data_size, file_like, object_ref):
         self.core_worker.put_file_like_object(
-            metadata, data_size, file_like, object_ref, owner_address
+            metadata, data_size, file_like, object_ref
         )
 
     def _write_multiple_objects(

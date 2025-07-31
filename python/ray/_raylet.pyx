@@ -3238,8 +3238,7 @@ cdef class CoreWorker:
         return move(c_address)
 
     def put_file_like_object(
-            self, metadata, data_size, file_like, ObjectRef object_ref,
-            owner_address):
+            self, metadata, data_size, file_like, ObjectRef object_ref):
         """Directly create a new Plasma Store object from a file like
         object. This avoids extra memory copy.
 
