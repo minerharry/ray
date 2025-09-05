@@ -13,7 +13,7 @@ def _set_future_helper(
 )->None: ...
 
 
-_OR = TypeVar("_OR",bound=ObjectRef)
+_OR = TypeVar("_OR",bound="ObjectRef")
 class ObjectRef(BaseID,Awaitable[_T]):
 
 

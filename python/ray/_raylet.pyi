@@ -328,7 +328,7 @@ class ObjectRefGenerator(Generic[_R],Generator[ObjectRef[_R],None,None],AsyncGen
 
 
 
-    def __init__(self, generator_ref: ObjectRef[None], worker: "Worker")->None: ...
+    def __init__(self, generator_ref: "ObjectRef[None]", worker: "Worker")->None: ...
 
     """
     Public APIs
