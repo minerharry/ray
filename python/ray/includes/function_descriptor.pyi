@@ -27,7 +27,7 @@ class FunctionDescriptor(Generic[_FDArgs,_FDReturn]): # TODO: FUNCTION DESCRIPTO
 
 class EmptyFunctionDescriptor(FunctionDescriptor[Any,None]):
 
-    def __reduce__(self)->tuple[type[EmptyFunctionDescriptor],tuple[()]]: ...
+    def __reduce__(self)->tuple[type["EmptyFunctionDescriptor"],tuple[()]]: ...
 
 class JavaFunctionDescriptor(FunctionDescriptor[_FDArgs,_FDReturn]):
 
@@ -36,7 +36,7 @@ class JavaFunctionDescriptor(FunctionDescriptor[_FDArgs,_FDReturn]):
                   function_name:str,
                   signature:str)->None: ...
 
-    def __reduce__(self)->tuple[type[JavaFunctionDescriptor[_FDArgs,_FDReturn]],tuple[str,str,str]]: ...
+    def __reduce__(self)->tuple[type["JavaFunctionDescriptor[_FDArgs,_FDReturn]"],tuple[str,str,str]]: ...
 
     @property
     def class_name(self)->str: ...
@@ -56,11 +56,11 @@ class PythonFunctionDescriptor(FunctionDescriptor[_FDArgs,_FDReturn]):
                   class_name:str="",
                   function_source_hash:str=""): ...
 
-    def __reduce__(self)->tuple[type[PythonFunctionDescriptor[_FDArgs,_FDReturn]],tuple[str,str,str,str]]: ...
+    def __reduce__(self)->tuple[type["PythonFunctionDescriptor[_FDArgs,_FDReturn]"],tuple[str,str,str,str]]: ...
 
 
     @classmethod
-    def from_function(cls:type[PythonFunctionDescriptor], function:Callable[_FDArgs,_FDReturn], function_uuid:UUID)->PythonFunctionDescriptor[_FDArgs,_FDReturn]:
+    def from_function(cls:type["PythonFunctionDescriptor"], function:Callable[_FDArgs,_FDReturn], function_uuid:UUID)->"PythonFunctionDescriptor[_FDArgs,_FDReturn]":
         """Create a FunctionDescriptor from a function instance.
 
         This function is used to create the function descriptor from
@@ -82,7 +82,7 @@ class PythonFunctionDescriptor(FunctionDescriptor[_FDArgs,_FDReturn]):
         ...
 
     @classmethod
-    def from_class(cls:type[PythonFunctionDescriptor], target_class:type[_Initializable[_FDArgs]])->PythonFunctionDescriptor[_FDArgs,None]:
+    def from_class(cls:type["PythonFunctionDescriptor"], target_class:type[_Initializable[_FDArgs]])->"PythonFunctionDescriptor[_FDArgs,None]":
         """Create a FunctionDescriptor from a class.
 
         Args:
@@ -186,7 +186,7 @@ class CppFunctionDescriptor(FunctionDescriptor):
     def __init__(self, # originally __cinit__
                   function_name:str, caller:str, class_name:str=""): ...
 
-    def __reduce__(self)->tuple[type[CppFunctionDescriptor],tuple[str,str,str]]: ...
+    def __reduce__(self)->tuple[type["CppFunctionDescriptor"],tuple[str,str,str]]: ...
 
 
     @property

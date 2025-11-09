@@ -15,6 +15,7 @@ import cython
 import inspect
 import uuid
 import ray._private.ray_constants as ray_constants
+from _collections_abc import GenericAlias
 
 
 ctypedef object (*FunctionDescriptor_from_cpp)(const CFunctionDescriptor &)
@@ -33,6 +34,8 @@ cdef CFunctionDescriptorToPython(CFunctionDescriptor function_descriptor):
 
 @cython.auto_pickle(False)
 cdef class FunctionDescriptor:
+    __class_getitem__ = classmethod(GenericAlias) # make FunctionDescriptor type-subscriptable at runtime
+
     def __cinit__(self, *args, **kwargs):
         if type(self) == FunctionDescriptor:
             raise Exception("type {} is abstract".format(type(self).__name__))

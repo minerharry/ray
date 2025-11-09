@@ -471,7 +471,7 @@ class ObjectRefGenerator:
 
     def _next_sync(
         self,
-        timeout_s: Optional[int | float] = None
+        timeout_s: Optional[Union[int, float]] = None
     ) -> ObjectRef:
         """Waits for timeout_s and returns the object ref if available.
 
@@ -540,7 +540,7 @@ class ObjectRefGenerator:
 
     async def _next_async(
             self,
-            timeout_s: Optional[int | float] = None
+            timeout_s: Optional[Union[int, float]] = None
     ):
         """Same API as _next_sync, but it is for async context."""
         core_worker = self.worker.core_worker

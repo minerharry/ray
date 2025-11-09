@@ -51,9 +51,8 @@ from  ray.includes.unique_ids import (
     FunctionID,
     ActorClassID,
     ClusterID,
-    ObjectID,
+    ObjectID, # stub-testing: remove
     PlacementGroupID,
-    _ID_TYPES,
 )
 from ray.includes.gcs_client import InnerGcsClient
 
@@ -200,7 +199,6 @@ __all__ = [
     "TaskID",
     "UniqueID",
     "WorkerID",
-    "_ID_TYPES",
     "check_id",
 
     # ray.includes.setproctitle
@@ -286,25 +284,25 @@ GRPC_STATUS_CODE_DEADLINE_EXCEEDED: int
 GRPC_STATUS_CODE_RESOURCE_EXHAUSTED: int
 GRPC_STATUS_CODE_UNIMPLEMENTED: int
 
-current_task_id: TaskID|None
+current_task_id: Optional[TaskID]
 current_task_id_lock: threading.Lock
 
 job_config_initialized: bool
 job_config_initialization_lock: threading.Lock
 
-async_task_id:contextvars.ContextVar[TaskID|None]
-async_task_name:contextvars.ContextVar[str|None]
-async_task_function_name:contextvars.ContextVar[str|None]
+async_task_id:contextvars.ContextVar[Optional[TaskID]]
+async_task_name:contextvars.ContextVar[Optional[str]]
+async_task_function_name:contextvars.ContextVar[Optional[str]]
 
 
 class HasReadInto(Protocol):
-    def readinto(self,b:bytearray|memoryview,/)->None: ...
+    def readinto(self,b:Union[bytearray, memoryview],/)->None: ...
 
 _R = TypeVar("_R") # for ObjectRefs
 _R2 = TypeVar("_R2")
 
 
-_ORG = TypeVar("_ORG",bound=ObjectRefGenerator)
+_ORG = TypeVar("_ORG",bound="ObjectRefGenerator")
 class ObjectRefGenerator(Generic[_R],Generator[ObjectRef[_R],None,None],AsyncGenerator[ObjectRef[_R],None]):
     """A generator to obtain object references
     from a task in a streaming manner.
@@ -323,7 +321,7 @@ class ObjectRefGenerator(Generic[_R],Generator[ObjectRef[_R],None,None],AsyncGen
     """
 
     _generator_ref:ObjectRef
-    _generator_task_exception:Exception|None
+    _generator_task_exception:Optional[Exception]
     worker:Worker
 
 
@@ -416,7 +414,7 @@ class ObjectRefGenerator(Generic[_R],Generator[ObjectRef[_R],None,None],AsyncGen
 
     def _next_sync(
         self,
-        timeout_s: Optional[int | float] = None
+        timeout_s: Optional[Union[int, float]] = None
     ) -> ObjectRef[_R]: # ObjectRef could be nil
         """Waits for timeout_s and returns the object ref if available.
 
@@ -445,7 +443,7 @@ class ObjectRefGenerator(Generic[_R],Generator[ObjectRef[_R],None,None],AsyncGen
 
     async def _next_async(
             self,
-            timeout_s: Optional[int | float] = None
+            timeout_s: Optional[Union[int, float]] = None
     )->ObjectRef[_R]: # ObjectRef could be nil
         """Same API as _next_sync, but it is for async context."""
         ...
@@ -532,7 +530,7 @@ class CoreWorker:
 
     def run_task_loop(self)->None: ...
 
-    def drain_and_exit_worker(self, exit_type: str, detail:Union[str,bytes])->None:
+    def drain_and_exit_worker(self, exit_type: str, detail:Union[str, bytes])->None:
         """
         Exit the current worker process. This API should only be used by
         a worker. If this API is called, the worker will wait to finish
@@ -598,9 +596,9 @@ class CoreWorker:
 
     def update_task_is_debugger_paused(self, task_id:TaskID, is_debugger_paused:bool)->None: ...
 
-    def set_webui_display(self, key:Union[str,bytes], message:Union[str,bytes])->bool: ...
+    def set_webui_display(self, key:Union[str, bytes], message:Union[str, bytes])->bool: ...
 
-    def set_actor_repr_name(self, repr_name:Union[str,bytes])->None: ...
+    def set_actor_repr_name(self, repr_name:Union[str, bytes])->None: ...
 
     def get_objects(self, object_refs:Iterable[ObjectRef], timeout_ms:int=-1)->list[SerializedRayObject]: ...
 
@@ -686,38 +684,38 @@ class CoreWorker:
     def get_memory_store_size(self)->int: ...
 
     def submit_task(self,
-                    language:Language,
+                    language:"Language",
                     function_descriptor:FunctionDescriptor[_FDArgs,_FDReturn],
-                    args:Iterable[ObjectRef|Any],
-                    name:str|bytes,
+                    args:Iterable[Union[ObjectRef, Any]],
+                    name:Union[str, bytes],
                     num_returns:int,
-                    resources:dict[str,int|float],
+                    resources:dict[str,Union[int, float]],
                     max_retries:int,
                     retry_exceptions:bool,
-                    retry_exception_allowlist:tuple[type[Exception],...]|None,
+                    retry_exception_allowlist:Optional[tuple[type[Exception],...]],
                     scheduling_strategy:str,
-                    debugger_breakpoint:str|bytes,
-                    serialized_runtime_env_info:str|bytes,
+                    debugger_breakpoint:Union[str, bytes],
+                    serialized_runtime_env_info:Union[str, bytes],
                     generator_backpressure_num_objects:int,
                     enable_task_events:bool,
                     labels:dict[str,str],
                     label_selector:dict[str,str])->list[ObjectRef[_FDReturn]]: ...
 
     def create_actor(self,
-                     language:Language,
+                     language:"Language",
                      function_descriptor:FunctionDescriptor,
-                     args:Iterable[ObjectRef|Any],
+                     args:Iterable[Union[ObjectRef, Any]],
                      max_restarts:int,
                      max_task_retries:int,
-                     resources:dict[str,int|float],
-                     placement_resources:dict[str,int|float],
+                     resources:dict[str,Union[int, float]],
+                     placement_resources:dict[str,Union[int, float]],
                      max_concurrency:int,
-                     is_detached:Any|None,
-                     name:str|bytes,
-                     ray_namespace:str|bytes,
+                     is_detached:Optional[Any],
+                     name:Union[str, bytes],
+                     ray_namespace:Union[str, bytes],
                      is_asyncio:bool,
-                     extension_data:str|bytes,
-                     serialized_runtime_env_info:str|bytes,
+                     extension_data:Union[str, bytes],
+                     serialized_runtime_env_info:Union[str, bytes],
                      concurrency_groups_dict:dict[str,Any],
                      max_pending_calls:int,
                      scheduling_strategy:str,
@@ -729,12 +727,12 @@ class CoreWorker:
 
     def create_placement_group(
                             self,
-                            name:str|bytes,
-                            bundles:list[dict[str|bytes, float]],
-                            strategy:str|bytes,
+                            name:Union[str, bytes],
+                            bundles:list[dict[Union[str, bytes], float]],
+                            strategy:Union[str, bytes],
                             is_detached:bool,
-                            soft_target_node_id:str|bytes|None,
-                            bundle_label_selector:list[dict[str|bytes, str|bytes]])->PlacementGroupID: ...
+                            soft_target_node_id:Optional[Union[str, bytes]],
+                            bundle_label_selector:list[dict[Union[str, bytes], Union[str, bytes]]])->PlacementGroupID: ...
 
     def remove_placement_group(self, placement_group_id:PlacementGroupID): ...
 
@@ -743,17 +741,17 @@ class CoreWorker:
                                    timeout_seconds:int)->bool: ...
 
     def submit_actor_task(self,
-                          language:Language,
+                          language:"Language",
                           actor_id:ActorID,
                           function_descriptor:FunctionDescriptor[_FDArgs,_FDReturn],
-                          args:Iterable[ObjectRef|Any],
-                          name:str|bytes,
+                          args:Iterable[Union[ObjectRef, Any]],
+                          name:Union[str, bytes],
                           num_returns:int,
                           max_retries:int,
                           retry_exceptions:bool,
-                          retry_exception_allowlist:tuple[type[Exception],...]|None,
+                          retry_exception_allowlist:Optional[tuple[type[Exception],...]],
                           num_method_cpus:float,
-                          concurrency_group_name:str|bytes,
+                          concurrency_group_name:Union[str, bytes],
                           generator_backpressure_num_objects:int,
                           enable_task_events:bool,
                           py_tensor_transport:int)->list[ObjectRef[_FDReturn]]: ...
@@ -766,11 +764,11 @@ class CoreWorker:
 
     def resource_ids(self)->dict[str,list[tuple[int,float]]]: ...
 
-    def profile_event(self, event_type:str|bytes, extra_data=None)->ProfileEvent|EmptyProfileEvent: ...
+    def profile_event(self, event_type:Union[str, bytes], extra_data=None)->Union[ProfileEvent, EmptyProfileEvent]: ...
 
     def remove_actor_handle_reference(self, actor_id:ActorID)->None: ...
 
-    def get_local_actor_state(self, actor_id:ActorID)->int|None: ...
+    def get_local_actor_state(self, actor_id:ActorID)->Optional[int]: ...
 
     def deserialize_and_register_actor_handle(self, bytes:bytes,
                                               outer_object_ref:ObjectRef[ActorHandle[_R]],
@@ -810,7 +808,7 @@ class CoreWorker:
 
     def reset_event_loop_executor(self, executor: concurrent.futures.ThreadPoolExecutor)->None: ...
 
-    def get_event_loop(self, function_descriptor:PythonFunctionDescriptor, specified_cgname:str)->tuple[asyncio.AbstractEventLoop|None,threading.Thread]: ...
+    def get_event_loop(self, function_descriptor:PythonFunctionDescriptor, specified_cgname:str)->tuple[Optional[asyncio.AbstractEventLoop],threading.Thread]: ...
 
     def run_async_func_or_coro_in_event_loop(
           self,
@@ -906,12 +904,12 @@ def _call_actor_shutdown()->None:
 
 class StreamRedirector:
     @staticmethod
-    def redirect_stdout(file_path:Union[str,bytes], rotation_max_size:int, rotation_max_file_count:int, tee_to_stdout:bool, tee_to_stderr:bool)->None: ...
+    def redirect_stdout(file_path:Union[str, bytes], rotation_max_size:int, rotation_max_file_count:int, tee_to_stdout:bool, tee_to_stderr:bool)->None: ...
 
     @staticmethod
-    def redirect_stderr(file_path:Union[str,bytes], rotation_max_size:int, rotation_max_file_count:int, tee_to_stdout:bool, tee_to_stderr:bool)->None: ...
+    def redirect_stderr(file_path:Union[str, bytes], rotation_max_size:int, rotation_max_file_count:int, tee_to_stdout:bool, tee_to_stderr:bool)->None: ...
 
-_L = TypeVar("_L",bound=Language)
+_L = TypeVar("_L",bound="Language")
 class Language:
 
     def __init__(self, lang:int)->None: ... # from __cinit__
@@ -924,9 +922,9 @@ class Language:
 
     def __reduce__(self:_L)->tuple[type[_L],tuple[int]]: ...
 
-    PYTHON:Language
-    CPP:Language
-    JAVA:Language
+    PYTHON:"Language"
+    CPP:"Language"
+    JAVA:"Language"
 
 
 class GcsClient:
@@ -949,9 +947,9 @@ class GcsClient:
 
 # Note this deletes keys with prefix `RAY{key_prefix}@`
 # Example: with key_prefix = `default`, we remove all `RAYdefault@...` keys.
-def del_key_prefix_from_storage(host:Union[str,bytes], port:int, username:Union[str,bytes], password:Union[str,bytes], use_ssl:bool, key_prefix:Union[str,bytes])->bool: ...
+def del_key_prefix_from_storage(host:Union[str, bytes], port:int, username:Union[str, bytes], password:Union[str, bytes], use_ssl:bool, key_prefix:Union[str, bytes])->bool: ...
 
-def get_session_key_from_storage(host:Union[str,bytes], port:int, username:Union[str,bytes], password:Union[str,bytes], use_ssl:bool, config:Union[str,bytes], key:Union[str,bytes])->bool:
+def get_session_key_from_storage(host:Union[str, bytes], port:int, username:Union[str, bytes], password:Union[str, bytes], use_ssl:bool, config:Union[str, bytes], key:Union[str, bytes])->bool:
     """
     Get the session key from the storage.
     Intended to be used for session_name only.
@@ -989,7 +987,7 @@ def raise_sys_exit_with_custom_error_message(
 class _GcsSubscriber:
     """Cython wrapper class of C++ `ray::gcs::PythonGcsSubscriber`."""
 
-    def _construct(self, address:str, channel:int, worker_id:Optional[str|bytes])->None: ...
+    def _construct(self, address:str, channel:int, worker_id:Optional[Union[str, bytes]])->None: ...
 
     def subscribe(self)->None:
         """Registers a subscription for the subscriber's channel type.
@@ -1028,9 +1026,9 @@ class GcsErrorSubscriber(_GcsSubscriber):
         subscriber.close()
     """
 
-    def __init__(self, address:str, worker_id:Optional[str|bytes]=None): ...
+    def __init__(self, address:str, worker_id:Optional[Union[str, bytes]]=None): ...
 
-    def poll(self, timeout:Optional[int | float]=None)->tuple[None,None]|tuple[bytes,GcsErrorPollDict]:
+    def poll(self, timeout:Optional[Union[int, float]]=None)->Union[tuple[None,None], tuple[bytes,GcsErrorPollDict]]:
         """Polls for new error messages.
 
         Returns:
@@ -1057,9 +1055,9 @@ class GcsLogSubscriber(_GcsSubscriber):
         subscriber.close()
     """
 
-    def __init__(self, address:str, worker_id:Optional[str|bytes]=None)->None: ...
+    def __init__(self, address:str, worker_id:Optional[Union[str, bytes]]=None)->None: ...
 
-    def poll(self, timeout:Optional[int | float]=None)->GcsLogPollDict:
+    def poll(self, timeout:Optional[Union[int, float]]=None)->GcsLogPollDict:
         """Polls for new log messages.
 
         Returns:
@@ -1114,7 +1112,7 @@ class StreamingGeneratorExecutionContext:
 
     def is_initialized(self)->bool: ...
 
-def _get_actor_serialized_owner_address_or_none(actor_table_data: bytes)->bytes|None: ...
+def _get_actor_serialized_owner_address_or_none(actor_table_data: bytes)->Optional[bytes]: ...
 
 def compute_task_id(object_ref:ObjectRef)->TaskID: ...
 

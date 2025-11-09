@@ -1,6 +1,6 @@
 # source: serialization.pxi
 import contextlib
-from typing import Any, Callable, Generator, Sequence, TypeVar, Union
+from typing import Any, Callable, Generator, Optional, Sequence, TypeVar, Union
 
 from ray._raylet import ObjectRef
 from ray.includes.buffer import Buffer
@@ -45,7 +45,7 @@ class MessagePackSerializer(object):
     def dumps(o:_O, python_serializer:Union[Callable[[_O],Any],None]=None)->bytes: ...
 
     @classmethod
-    def loads(cls, s:_Buffer, python_deserializer:Union[Callable,None]=None)->object: ...
+    def loads(cls, s:_Buffer, python_deserializer:Optional[Callable]=None)->object: ...
 
 class Pickle5Writer:
 
@@ -84,7 +84,7 @@ class Pickle5SerializedObject(SerializedObject):
 class MessagePackSerializedObject(SerializedObject):
 
     def __init__(self, metadata:bytes, msgpack_data:bytes, contained_object_refs:Sequence[ObjectRef],
-                 nest_serialized_object:Union[SerializedObject,None]=None)->None: ...
+                 nest_serialized_object:Optional[SerializedObject]=None)->None: ...
 
     def to_bytes(self)->bytes: ...
 

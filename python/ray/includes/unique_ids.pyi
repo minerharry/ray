@@ -1,24 +1,24 @@
 # source: unique_ids.pxi
 from __future__ import annotations
 
-from typing import Tuple, TypeVar
+from typing import Tuple, TypeVar, Union
 
 # backwards compatibility. Luckily circular references are fine in type stubs
-from ray._raylet import ObjectRef
+from ray._raylet import ObjectRef  # stub-testing: remove
 
-ObjectID = ObjectRef
+ObjectID = ObjectRef # stub-testing: remove
 
 # implementations are in unique_ids.pxi
 def check_id(b:bytes, size:int=...)->None: ...
 
-_BID = TypeVar("_BID",bound=BaseID)
+_BID = TypeVar("_BID",bound="BaseID")
 class BaseID:
 
     @classmethod
     def from_binary(cls:type[_BID], id_bytes:bytes)->_BID: ...
 
     @classmethod
-    def from_hex(cls:type[_BID], hex_id:str|bytes)->_BID: ...
+    def from_hex(cls:type[_BID], hex_id:Union[str, bytes])->_BID: ...
 
     def binary(self)->bytes: ...
 
@@ -48,7 +48,7 @@ class BaseID:
     def redis_shard_hash(self)->int: ...
 
 
-_UID = TypeVar("_UID",bound=UniqueID)
+_UID = TypeVar("_UID",bound="UniqueID")
 class UniqueID(BaseID):
 
     def __init__(self, id:bytes)->None: ...
@@ -60,7 +60,7 @@ class UniqueID(BaseID):
     def from_random(cls:type[_UID])->_UID: ...
 
 
-_TID = TypeVar("_TID",bound=TaskID)
+_TID = TypeVar("_TID",bound="TaskID")
 class TaskID(BaseID):
 
     def __init__(self, id:bytes)->None: ...
@@ -91,7 +91,7 @@ class TaskID(BaseID):
 
 class NodeID(UniqueID): ...
 
-_JID = TypeVar("_JID",bound=JobID)
+_JID = TypeVar("_JID",bound="JobID")
 class JobID(BaseID):
 
     def __init__(self, id:bytes)->None: ...
@@ -108,7 +108,7 @@ class JobID(BaseID):
 class WorkerID(UniqueID): ...
 
 # TODO: Make ActorID generic? see CoreWorker.get_actor_handle; ActorHandle
-_AID = TypeVar("_AID",bound=ActorID)
+_AID = TypeVar("_AID",bound="ActorID")
 class ActorID(BaseID):
 
     def __init__(self, id:bytes)->None: ...
@@ -133,7 +133,7 @@ class ActorClassID(UniqueID): ...
 class ClusterID(UniqueID): ...
 
 
-_PGID = TypeVar("_PGID",bound=PlacementGroupID)
+_PGID = TypeVar("_PGID",bound="PlacementGroupID")
 class PlacementGroupID(BaseID):
 
     def __init__(self, id:bytes)->None: ...
@@ -146,18 +146,3 @@ class PlacementGroupID(BaseID):
 
     @classmethod
     def nil(cls:type[_PGID])->_PGID: ...
-
-
-_ID_TYPES = [
-    ActorClassID,
-    ActorID,
-    NodeID,
-    JobID,
-    WorkerID,
-    FunctionID,
-    ObjectID,
-    TaskID,
-    UniqueID,
-    PlacementGroupID,
-    ClusterID,
-]
